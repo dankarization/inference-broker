@@ -26,10 +26,10 @@ PROFILES = {
                         request_timeout_seconds=900),
     "openclaw-gemma4": Profile("openclaw-gemma4", "gemma4:12b", 262_144, 16_384, 300,
                                request_timeout_seconds=900, max_images=16),
-    # Conservative GPU/KV-cache budget for the larger Gemma route; callers may
-    # request smaller contexts/outputs without changing the existing 12b lane.
-    "openclaw-gemma4-26b": Profile("openclaw-gemma4-26b", "gemma4:26b", 32_768, 8_192, 300,
-                                   request_timeout_seconds=900, max_images=16),
+    # Native metadata ceiling, not a claim of validated occupied context.
+    # Bound long-prefill attempts to one hour; other model lanes are unchanged.
+    "openclaw-gemma4-26b": Profile("openclaw-gemma4-26b", "gemma4:26b", 262_144, 8_192, 300,
+                                   request_timeout_seconds=3600, max_images=16),
     "openclaw-qwen3-vl": Profile("openclaw-qwen3-vl", "qwen3-vl:30b", 212_992, 16_384, 300,
                                 request_timeout_seconds=900, max_images=16),
     "openclaw-nemotron3": Profile("openclaw-nemotron3", "nemotron3:33b", 131_072, 8_192, 300,

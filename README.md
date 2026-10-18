@@ -387,7 +387,7 @@ Wire model обязан совпадать с одним из девяти serve
 | Wire model | Broker profile | Context/output | Image |
 | --- | --- | --- | --- |
 | `gemma4:12b` | `openclaw-gemma4` | 262144/16384 | yes |
-| `gemma4:26b` | `openclaw-gemma4-26b` | 32768/8192 | yes |
+| `gemma4:26b` | `openclaw-gemma4-26b` | 262144/8192 | yes |
 | `qwen3-vl:30b` | `openclaw-qwen3-vl` | 212992/16384 | yes |
 | `nemotron3:33b` | `openclaw-nemotron3` | 131072/8192 | yes |
 | `qwen3.8:ad-iq2-xs` | `openclaw` (legacy queue compatibility) | 131072/16384 | no |
@@ -397,11 +397,13 @@ Wire model обязан совпадать с одним из девяти serve
 | `gpt-oss:20b` | `openclaw-gpt-oss` | 131072/16384 | no |
 
 The original eight profiles retain their configured limits and modalities.
-`gemma4:26b` uses a conservative 32768-token context and 8192-token output
-ceiling to bound GPU/KV-cache use; smaller `num_ctx`/`num_predict` requests
+`gemma4:26b` admits the native 262144-token context ceiling and 8192-token output
+ceiling; these are limits, not measured occupied context or a quality claim.
+Smaller `num_ctx`/`num_predict` requests
 (including 8192/512 with `think=false`) are preserved. Each profile pins
 model, keepalive 300 s and executor
-timeout 900 s. Admission preserves up to 512 messages and 128 tools. Text JSON
+timeout 900 s, except Gemma 26B: 3600 s for bounded long prefill.
+Admission preserves up to 512 messages and 128 tools. Text JSON
 requests are limited to 2 MiB; vision requests to 32 MiB, at most 16 images
 and 24 MiB decoded images. Tools are limited to 512 KiB. Byte limits protect
 SQLite/HTTP and can narrow oversized image turns; exact token budget
@@ -421,8 +423,8 @@ header, не генерируется OpenClaw автоматически) пр�
 job и отвергает другое содержимое с HTTP 400. При отключении клиента без ключа
 queued job отменяется, running получает `cancel_requested` и освобождает GPU
 после возврата Ollama; с ключом durable job остаётся доступным для повторного
-ожидания. Время ожидания HTTP — 1800 s, затем HTTP 504 / NDJSON error; для
-keyed request job сохраняется. Для OpenClaw provider timeout нужен >1800 s,
+ожидания. Время ожидания HTTP — 1800 s (Gemma 26B: 3900 s), затем HTTP 504 / NDJSON error; для
+keyed request job сохраняется. Для OpenClaw provider timeout нужен >1800 s (>3900 s для Gemma 26B),
 а timeout выбранного cron agentTurn также должен покрывать очередь и inference.
 
 Перед rollout main/ops отдельно добавляет `openclaw` в **live** source policy с

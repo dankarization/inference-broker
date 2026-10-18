@@ -20,6 +20,12 @@ from .openclaw import (HEARTBEAT_SECONDS, MAX_OUTSTANDING, MAX_REQUEST_BYTES, MA
                        OpenClawRequestError, error_frame, heartbeat, normalize_request, terminal_frame)
 
 
+def openclaw_wait_seconds(profile):
+    # Keep the existing queue budget, with five minutes of admission/switch
+    # headroom for profiles whose execution budget exceeds the old waiter.
+    return max(MAX_WAIT_SECONDS, profile.request_timeout_seconds + 300)
+
+
 def serve(broker, host="127.0.0.1", port=8088, policy=None, storage_token=None):
     broker.use_source_policy(policy)
     openclaw_slots = threading.BoundedSemaphore(MAX_OUTSTANDING)
@@ -117,7 +123,7 @@ def serve(broker, host="127.0.0.1", port=8088, policy=None, storage_token=None):
                     self._json(429, {"error": str(error)})
                     return
                 streaming = request.get("stream", True)
-                deadline = time.monotonic() + MAX_WAIT_SECONDS
+                deadline = time.monotonic() + openclaw_wait_seconds(PROFILES[job["profile"]])
                 try:
                     if streaming:
                         self.send_response(200)

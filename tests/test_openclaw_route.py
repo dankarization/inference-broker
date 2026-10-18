@@ -9,7 +9,7 @@ from unittest.mock import patch
 from urllib.error import HTTPError
 from urllib.request import Request, ProxyHandler, build_opener
 
-from broker.http import serve
+from broker.http import openclaw_wait_seconds, serve
 from broker.openclaw import MODEL, normalize_request
 from broker.profiles import OPENCLAW_PROFILES_BY_MODEL, PROFILES
 from broker.service import Broker
@@ -150,7 +150,7 @@ class OpenClawRouteTests(unittest.TestCase):
     def test_all_configured_models_route_to_server_owned_profiles(self):
         cases = {
             "gemma4:12b": (262_144, 16_384, True),
-            "gemma4:26b": (32_768, 8_192, True),
+            "gemma4:26b": (262_144, 8_192, True),
             "qwen3-vl:30b": (212_992, 16_384, True),
             "nemotron3:33b": (131_072, 8_192, True),
             "qwen3.8:ad-iq2-xs": (131_072, 16_384, False),
@@ -210,8 +210,11 @@ class OpenClawRouteTests(unittest.TestCase):
             (False, {"num_ctx": 8192, "num_predict": 512},
              {"num_ctx": 8192, "num_predict": 512}),
             (True, {"num_ctx": 999999, "num_predict": 999999},
-             {"num_ctx": 32768, "num_predict": 8192}),
-            (True, {}, {"num_ctx": 32768, "num_predict": 8192}),
+             {"num_ctx": 262144, "num_predict": 8192}),
+            (True, {}, {"num_ctx": 262144, "num_predict": 8192}),
+            *((False, {"num_ctx": size, "num_predict": 512},
+               {"num_ctx": size, "num_predict": 512})
+              for size in (32768, 65536, 131072, 196608, 262144)),
         ):
             with self.subTest(think=think, options=requested):
                 body = {**self.sample(), "model": "gemma4:26b", "think": think,
@@ -237,6 +240,7 @@ class OpenClawRouteTests(unittest.TestCase):
                 self.assertEqual(request["messages"], body["messages"])
                 self.assertEqual(request["tools"], body["tools"])
                 self.assertEqual(request["keep_alive"], "300s")
+                self.assertEqual(request["_broker_timeout_seconds"], 3600)
         with self.assertRaises(HTTPError) as caught:
             self.opener.open(self.request({**body, "messages": [
                 {"role": "user", "content": "describe", "images": ["aGVsbG8="] * 17}]}))
@@ -286,7 +290,7 @@ class OpenClawRouteTests(unittest.TestCase):
         self.assertEqual(output["frames"][-1]["status"], 502)
         self.assertEqual(output["frames"][-1]["error"], "broker job failed")
 
-        with patch("broker.http.MAX_WAIT_SECONDS", .05), patch("broker.http.HEARTBEAT_SECONDS", .02):
+        with patch("broker.http.openclaw_wait_seconds", return_value=.05), patch("broker.http.HEARTBEAT_SECONDS", .02):
             with self.assertRaises(HTTPError) as caught:
                 self.opener.open(self.request(self.sample(), {"Idempotency-Key": "retry-turn"}),
                                  timeout=2)
@@ -311,10 +315,20 @@ class OpenClawRouteTests(unittest.TestCase):
             self.assertEqual(self.broker.db.execute(
                 "SELECT state FROM jobs WHERE source='openclaw' ORDER BY created DESC LIMIT 1"
             ).fetchone()[0], "cancelled")
-        with patch("broker.http.MAX_WAIT_SECONDS", .05), patch("broker.http.HEARTBEAT_SECONDS", .02):
+        with patch("broker.http.openclaw_wait_seconds", return_value=.05), patch("broker.http.HEARTBEAT_SECONDS", .02):
             with self.assertRaises(HTTPError) as caught:
                 self.opener.open(self.request(self.sample()), timeout=2)
             self.assertEqual(caught.exception.code, 504)
+
+
+class NativeWaitBudgetTests(unittest.TestCase):
+    def test_long_prefill_budget_is_narrow_and_waiter_outlives_execution(self):
+        for name, profile in PROFILES.items():
+            if name == "openclaw-gemma4-26b":
+                self.assertEqual(profile.request_timeout_seconds, 3600)
+                self.assertEqual(openclaw_wait_seconds(profile), 3900)
+            else:
+                self.assertEqual(openclaw_wait_seconds(profile), 1800)
 
 
 if __name__ == "__main__":
