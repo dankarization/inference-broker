@@ -382,11 +382,12 @@ Broker route `POST /openclaw/api/chat` реализует **нативный Oll
 Провайдер OpenClaw использует `api: "ollama"` и `baseUrl` вида
 `http://127.0.0.1:8088/openclaw`; OpenClaw добавляет `/api/chat`. Внутренний
 broker source остаётся `openclaw` при любом OpenClaw-facing provider key.
-Wire model обязан совпадать с одним из восьми server-owned профилей:
+Wire model обязан совпадать с одним из девяти server-owned профилей:
 
 | Wire model | Broker profile | Context/output | Image |
 | --- | --- | --- | --- |
 | `gemma4:12b` | `openclaw-gemma4` | 262144/16384 | yes |
+| `gemma4:26b` | `openclaw-gemma4-26b` | 32768/8192 | yes |
 | `qwen3-vl:30b` | `openclaw-qwen3-vl` | 212992/16384 | yes |
 | `nemotron3:33b` | `openclaw-nemotron3` | 131072/8192 | yes |
 | `qwen3.8:ad-iq2-xs` | `openclaw` (legacy queue compatibility) | 131072/16384 | no |
@@ -395,8 +396,11 @@ Wire model обязан совпадать с одним из восьми serve
 | `nemotron-3-nano:30b-a3b-q4_K_M` | `openclaw-nemotron-nano` | 262144/16384 | no |
 | `gpt-oss:20b` | `openclaw-gpt-oss` | 131072/16384 | no |
 
-Limits and modalities match the eight configured `ollama-main-pc` model entries
-at implementation time. Each profile pins model, keepalive 300 s and executor
+The original eight profiles retain their configured limits and modalities.
+`gemma4:26b` uses a conservative 32768-token context and 8192-token output
+ceiling to bound GPU/KV-cache use; smaller `num_ctx`/`num_predict` requests
+(including 8192/512 with `think=false`) are preserved. Each profile pins
+model, keepalive 300 s and executor
 timeout 900 s. Admission preserves up to 512 messages and 128 tools. Text JSON
 requests are limited to 2 MiB; vision requests to 32 MiB, at most 16 images
 and 24 MiB decoded images. Tools are limited to 512 KiB. Byte limits protect

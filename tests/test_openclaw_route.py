@@ -150,6 +150,7 @@ class OpenClawRouteTests(unittest.TestCase):
     def test_all_configured_models_route_to_server_owned_profiles(self):
         cases = {
             "gemma4:12b": (262_144, 16_384, True),
+            "gemma4:26b": (32_768, 8_192, True),
             "qwen3-vl:30b": (212_992, 16_384, True),
             "nemotron3:33b": (131_072, 8_192, True),
             "qwen3.8:ad-iq2-xs": (131_072, 16_384, False),
@@ -202,6 +203,43 @@ class OpenClawRouteTests(unittest.TestCase):
                     self.assertEqual(caught.exception.code, 400)
         with self.assertRaises(HTTPError) as caught:
             self.opener.open(self.request({**self.sample(), "model": "caller-chosen:bad"}))
+        self.assertEqual(caught.exception.code, 400)
+
+    def test_gemma4_26b_smoke_options_thinking_and_server_caps(self):
+        for think, requested, expected in (
+            (False, {"num_ctx": 8192, "num_predict": 512},
+             {"num_ctx": 8192, "num_predict": 512}),
+            (True, {"num_ctx": 999999, "num_predict": 999999},
+             {"num_ctx": 32768, "num_predict": 8192}),
+            (True, {}, {"num_ctx": 32768, "num_predict": 8192}),
+        ):
+            with self.subTest(think=think, options=requested):
+                body = {**self.sample(), "model": "gemma4:26b", "think": think,
+                        "options": requested}
+                body["messages"][2]["thinking"] = "Use the read tool"
+                result = {}
+                def client():
+                    with self.opener.open(self.request(body), timeout=5) as response:
+                        result["body"] = json.loads(response.read())
+                        result["id"] = response.headers["X-Broker-Job-Id"]
+                caller = threading.Thread(target=client)
+                caller.start(); self.wait_queued()
+                self.assertTrue(self.broker.dispatch_once(frozenset({"openclaw"})))
+                caller.join(timeout=2)
+                self.assertFalse(caller.is_alive())
+                self.assertEqual(result["body"]["model"], "gemma4:26b")
+                job = self.broker.status(result["id"])
+                self.assertEqual((job["profile"], job["source"], job["state"]),
+                                 ("openclaw-gemma4-26b", "openclaw", "completed"))
+                request = self.ollama.requests[-1][1]
+                self.assertEqual(request["options"], expected)
+                self.assertIs(request["think"], think)
+                self.assertEqual(request["messages"], body["messages"])
+                self.assertEqual(request["tools"], body["tools"])
+                self.assertEqual(request["keep_alive"], "300s")
+        with self.assertRaises(HTTPError) as caught:
+            self.opener.open(self.request({**body, "messages": [
+                {"role": "user", "content": "describe", "images": ["aGVsbG8="] * 17}]}))
         self.assertEqual(caught.exception.code, 400)
 
     def test_idempotency_queue_bound_and_failed_executor(self):
