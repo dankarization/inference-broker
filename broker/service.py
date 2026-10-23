@@ -16,6 +16,7 @@ from typing import Any
 from .analytics import analytics_snapshot, attempt_history, audit_history
 from .dashboard import snapshot as dashboard_snapshot
 from .compat import (CompatibilityError,
+                     validate_nextcloud_payload,
                      validate_olya_decision_payload,
                      validate_olya_vision_payload,
                      validate_shutterstock_canary_payload,
@@ -459,6 +460,12 @@ class Broker:
                 "AND external_id IS NOT NULL"
             )
 
+            self.db.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS jobs_nextcloud_external "
+                "ON jobs(source,external_id) WHERE source='nextcloud' "
+                "AND external_id IS NOT NULL"
+            )
+
     def _retire_priority_column(self) -> None:
         """Remove a legacy priority column only when new inserts need it gone.
 
@@ -587,6 +594,12 @@ class Broker:
         if kind not in {"chat", "generate"}:
             raise ValueError("kind must be chat or generate")
         source = source or profile
+        if source == "nextcloud" or profile == "nextcloud-qwen3-vl":
+            if (source, profile, kind) != ("nextcloud", "nextcloud-qwen3-vl", "generate"):
+                raise ValueError("Nextcloud requires its dedicated source/profile and generate")
+            if not external_id or not source_item_id:
+                raise ValueError("Nextcloud requires external_id and source_item_id")
+            payload = validate_nextcloud_payload(payload)
         if source == "openclaw" and profile not in OPENCLAW_PROFILE_NAMES:
             raise ValueError("source openclaw requires the OpenClaw profile")
         if profile in OPENCLAW_PROFILE_NAMES and (source != "openclaw" or kind != "chat"):
@@ -662,7 +675,7 @@ class Broker:
                         (source, external_id),
                     ).fetchone()
                     tombstone_is_idempotent = tombstone is not None and (
-                        source in {"olya-vision", "olya-decision", "syncopia-telegram-memory", "openclaw"}
+                        source in {"olya-vision", "olya-decision", "syncopia-telegram-memory", "openclaw", "nextcloud"}
                         or producer_storage is not None
                         or tombstone["producer_attempt_id"] is not None
                     )
@@ -691,7 +704,7 @@ class Broker:
                         or existing["result_storage_mode"] != "broker_temporary"
                     )
                     if (
-                        source in {"olya-vision", "olya-decision", "syncopia-telegram-memory", "openclaw"}
+                        source in {"olya-vision", "olya-decision", "syncopia-telegram-memory", "openclaw", "nextcloud"}
                         or producer_storage is not None
                         or existing_has_producer_storage
                     ):
@@ -718,12 +731,22 @@ class Broker:
                                 raise ValueError(
                                     "producer storage idempotency conflict for existing correlation"
                                 )
-                        if source == "openclaw" and (
+                        if source in {"openclaw", "nextcloud"} and (
                             existing["profile"] != profile or existing["kind"] != kind
                             or existing["input_hash"] != content_evidence(payload)[0]
                         ):
                             raise ValueError("idempotency key was used for another request")
+                        if source == "nextcloud" and existing["source_item_id"] != source_item_id:
+                            raise ValueError("Nextcloud correlation item conflict")
                         return self.status(existing["id"])
+            if source == "nextcloud":
+                if self.source_policy is None or source not in self.source_policy.snapshot()["sources"]:
+                    raise SourceAdmissionBlocked(source)
+                if self.db.execute(
+                    "SELECT count(*) FROM jobs WHERE source='nextcloud' "
+                    "AND state IN ('queued','running','cancel_requested')"
+                ).fetchone()[0] >= 2:
+                    raise SourceQueueFull("nextcloud has 2 outstanding jobs")
             storage_fields = self.storage.prepare_admission(source, payload, producer_storage)
             if self.source_policy is not None and not self.source_policy.admission_allowed(source):
                 self._audit(

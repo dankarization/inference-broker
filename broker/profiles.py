@@ -19,6 +19,10 @@ class Profile:
 # This is deliberately server-owned. Callers can select a profile, never a model
 # or unbounded generation parameters.
 PROFILES = {
+    "nextcloud-qwen3-vl": Profile(
+        "nextcloud-qwen3-vl", "qwen3-vl:30b", 16_384, 2_048, 300,
+        max_images=4, request_timeout_seconds=900,
+    ),
     "interactive": Profile("interactive", "nemotron3:33b", 16_384, 2_048, 180),
     "cron": Profile("cron", "nemotron3:33b", 8_192, 1_024, 120),
     # Preserve the original profile name for already-queued agent turns.

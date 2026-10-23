@@ -370,3 +370,35 @@ def _valid_messages(messages: Any) -> bool:
 
 def _frame(value: dict[str, Any]) -> bytes:
     return (json.dumps(value, separators=(",", ":")) + "\n").encode()
+
+
+def validate_nextcloud_payload(request):
+    """Bounded dedicated lane; accepts its own normalized replay shape."""
+    profile = PROFILES["nextcloud-qwen3-vl"]
+    if not isinstance(request, dict) or set(request) - {
+        "prompt", "images", "model", "stream", "options", "keep_alive",
+    }:
+        raise CompatibilityError("unsupported Nextcloud payload fields")
+    if request.get("model", profile.model) != profile.model:
+        raise CompatibilityError("Nextcloud requires qwen3-vl:30b")
+    prompt, images = request.get("prompt"), request.get("images")
+    if not isinstance(prompt, str) or not 1 <= len(prompt.encode()) <= 16_384:
+        raise CompatibilityError("Nextcloud prompt must be 1..16384 bytes")
+    if not isinstance(images, list) or not 1 <= len(images) <= profile.max_images:
+        raise CompatibilityError("Nextcloud requires 1..4 images")
+    for value in images:
+        if not isinstance(value, str) or not 1 <= len(value) <= 2_800_000:
+            raise CompatibilityError("Nextcloud image exceeds byte limit")
+        try:
+            decoded = base64.b64decode(value, validate=True)
+        except (ValueError, binascii.Error) as exc:
+            raise CompatibilityError("Nextcloud image must be base64") from exc
+        if not decoded or len(decoded) > 2_097_152:
+            raise CompatibilityError("Nextcloud image exceeds decoded byte limit")
+    options = {"num_ctx": profile.max_context, "num_predict": profile.max_output,
+               "temperature": 0}
+    if request.get("options", options) != options or request.get("stream", False) is not False:
+        raise CompatibilityError("Nextcloud options are server-owned")
+    if request.get("keep_alive", profile.keep_alive_seconds) != profile.keep_alive_seconds:
+        raise CompatibilityError("Nextcloud keep_alive is server-owned")
+    return {"prompt": prompt, "images": images, "stream": False, "options": options}
