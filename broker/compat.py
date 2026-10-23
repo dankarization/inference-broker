@@ -376,7 +376,7 @@ def validate_nextcloud_payload(request):
     """Bounded dedicated lane; accepts its own normalized replay shape."""
     profile = PROFILES["nextcloud-qwen3-vl"]
     if not isinstance(request, dict) or set(request) - {
-        "prompt", "images", "model", "stream", "options", "keep_alive",
+        "prompt", "images", "model", "stream", "options", "keep_alive", "think",
     }:
         raise CompatibilityError("unsupported Nextcloud payload fields")
     if request.get("model", profile.model) != profile.model:
@@ -395,10 +395,16 @@ def validate_nextcloud_payload(request):
             raise CompatibilityError("Nextcloud image must be base64") from exc
         if not decoded or len(decoded) > 2_097_152:
             raise CompatibilityError("Nextcloud image exceeds decoded byte limit")
-    options = {"num_ctx": profile.max_context, "num_predict": profile.max_output,
+    # Keep the exact v1 normalized payload for old submissions and replays.
+    # V2 is explicit thinking with a larger, still server-owned output budget.
+    if "think" in request and request["think"] is not True:
+        raise CompatibilityError("Nextcloud think must be true when supplied")
+    options = {"num_ctx": profile.max_context,
+               "num_predict": profile.max_output if "think" in request else 2_048,
                "temperature": 0}
     if request.get("options", options) != options or request.get("stream", False) is not False:
         raise CompatibilityError("Nextcloud options are server-owned")
     if request.get("keep_alive", profile.keep_alive_seconds) != profile.keep_alive_seconds:
         raise CompatibilityError("Nextcloud keep_alive is server-owned")
-    return {"prompt": prompt, "images": images, "stream": False, "options": options}
+    return {"prompt": prompt, "images": images, "stream": False, "options": options,
+            **({"think": True} if "think" in request else {})}

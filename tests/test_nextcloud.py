@@ -73,6 +73,30 @@ class NextcloudTests(unittest.TestCase):
         with self.assertRaises(SourceAdmissionBlocked):
             self.submit('version2')
 
+    def test_explicit_thinking_budget_is_bounded_and_legacy_replay_unchanged(self):
+        from broker.compat import validate_nextcloud_payload
+        legacy = validate_nextcloud_payload(self.payload)
+        self.assertEqual(legacy, {**self.payload, 'stream': False,
+            'options': {'num_ctx': 16384, 'num_predict': 2048, 'temperature': 0}})
+        old = self.submit('old-recipe')
+        self.broker.dispatch_once(policy=self.policy)
+        self.assertEqual(self.submit('old-recipe')['id'], old['id'])
+        new_payload = {**self.payload, 'think': True}
+        new = self.submit('new-recipe', new_payload)
+        self.broker.dispatch_once(policy=self.policy)
+        self.assertIs(self.gpu.requests[-1][1]['think'], True)
+        self.assertEqual(self.gpu.requests[-1][1]['options'],
+                         {**legacy['options'], 'num_predict': 8192})
+        self.assertEqual(self.submit('new-recipe', new_payload)['id'], new['id'])
+        for value in [False, None, 0, 1, 'true', 'max', {}, []]:
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                self.submit('bad', {**self.payload, 'think': value})
+        with self.assertRaisesRegex(ValueError, 'another request'):
+            self.submit('old-recipe', new_payload)
+        with self.assertRaisesRegex(ValueError, 'another request'):
+            self.submit('new-recipe', self.payload)
+        self.assertNotIn('think', self.gpu.requests[0][1])
+
     def test_identity_bidirectional_and_caps(self):
         for changes in ({'source': 'openclaw'}, {'source': 'olya-vision'}, {'kind': 'chat'},
                         {'profile': 'interactive'}, {'external_id': None}, {'source_item_id': None}):

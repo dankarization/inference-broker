@@ -20,7 +20,7 @@ class Profile:
 # or unbounded generation parameters.
 PROFILES = {
     "nextcloud-qwen3-vl": Profile(
-        "nextcloud-qwen3-vl", "qwen3-vl:30b", 16_384, 2_048, 300,
+        "nextcloud-qwen3-vl", "qwen3-vl:30b", 16_384, 8_192, 300,
         max_images=4, request_timeout_seconds=900,
     ),
     "interactive": Profile("interactive", "nemotron3:33b", 16_384, 2_048, 180),
