@@ -149,6 +149,7 @@ class OpenClawRouteTests(unittest.TestCase):
 
     def test_all_configured_models_route_to_server_owned_profiles(self):
         cases = {
+            "nemotron-3.5-bolt:e4b": (65_536, 8_192, True),
             "gemma4:12b": (262_144, 16_384, True),
             "gemma4:26b": (262_144, 8_192, True),
             "qwen3-vl:30b": (212_992, 16_384, True),
@@ -173,6 +174,8 @@ class OpenClawRouteTests(unittest.TestCase):
                 if vision:
                     body["messages"] = [{"role": "user", "content": "describe",
                                          "images": ["aGVsbG8="]}]
+                if model == "nemotron-3.5-bolt:e4b":
+                    body["think"] = True
                 result = {}
                 def client():
                     with self.opener.open(self.request(body), timeout=5) as response:
@@ -207,6 +210,50 @@ class OpenClawRouteTests(unittest.TestCase):
         with self.assertRaises(HTTPError) as caught:
             self.opener.open(self.request({**self.sample(), "model": "caller-chosen:bad"}))
         self.assertEqual(caught.exception.code, 400)
+
+    def test_bolt_boolean_modes_context_ladder_and_dispatch(self):
+        for think in (None, False, True):
+            for context in (1024, 8192, 16384, 32768, 49152, 65536):
+                with self.subTest(think=think, context=context):
+                    body = {"model": "nemotron-3.5-bolt:e4b", "messages": [
+                        {"role": "user", "content": "unchanged probe", "images": ["aGVsbG8="] * 4}],
+                        "options": {"num_ctx": context, "num_predict": 512}}
+                    if think is not None:
+                        body["think"] = think
+                    job = self.broker.submit("openclaw-bolt-e4b", "chat",
+                                             normalize_request(body), source="openclaw")
+                    self.assertTrue(self.broker.dispatch_once(frozenset({"openclaw"})))
+                    sent = self.ollama.requests[-1][1]
+                    self.assertEqual(sent["model"], body["model"])
+                    self.assertEqual(sent["options"], body["options"])
+                    self.assertEqual(sent["messages"], body["messages"])
+                    self.assertIs(sent["truncate"], False)
+                    self.assertIs(sent["shift"], False)
+                    self.assertEqual(sent["_broker_timeout_seconds"], 1800)
+                    if think is None:
+                        self.assertNotIn("think", sent)
+                    else:
+                        self.assertIs(sent["think"], think)
+                    self.assertEqual(self.broker.status(job["id"])["state"], "completed")
+
+    def test_bolt_rejects_unsupported_controls_and_out_of_range_probes(self):
+        body = {"model": "nemotron-3.5-bolt:e4b", "messages": [
+            {"role": "user", "content": "probe"}]}
+        for patch in (
+            *({"think": v} for v in ("low", "medium", "high", "max", 0, 1, None, [], {})),
+            *({"options": {"num_ctx": v}} for v in (None, 0, -1, True, 65537, 262144)),
+            *({"options": {"num_predict": v}} for v in (None, 0, -1, True, 8193)),
+            {"options": {"thinking_budget": 128}}, {"reasoning_budget": 128},
+            {"chat_template_kwargs": {"enable_thinking": True}},
+            {"truncate": True}, {"shift": True},
+            {"messages": [{"role": "user", "content": "x", "images": ["aGVsbG8="] * 5}]},
+        ):
+            with self.subTest(patch=patch), self.assertRaises(ValueError):
+                self.broker.submit("openclaw-bolt-e4b", "chat", {**body, **patch}, source="openclaw")
+        job = self.broker.submit("openclaw-bolt-e4b", "chat", normalize_request(body), source="openclaw")
+        self.assertTrue(self.broker.dispatch_once(frozenset({"openclaw"})))
+        self.assertEqual(self.ollama.requests[-1][1]["options"],
+                         {"num_ctx": 65536, "num_predict": 8192})
 
     def test_small_vlm_smoke_profiles_enforce_dispatch_and_image_bounds(self):
         # The executor is fake: these assertions verify broker admission and
@@ -380,6 +427,9 @@ class NativeWaitBudgetTests(unittest.TestCase):
             if name == "openclaw-gemma4-26b":
                 self.assertEqual(profile.request_timeout_seconds, 3600)
                 self.assertEqual(openclaw_wait_seconds(profile), 3900)
+            elif name == "openclaw-bolt-e4b":
+                self.assertEqual(profile.request_timeout_seconds, 1800)
+                self.assertEqual(openclaw_wait_seconds(profile), 2100)
             else:
                 self.assertEqual(openclaw_wait_seconds(profile), 1800)
 

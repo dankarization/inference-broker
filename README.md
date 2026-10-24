@@ -433,3 +433,8 @@ keyed request job сохраняется. Для OpenClaw provider timeout ну�
 policy или automations. Rollback: вернуть прежний provider/model routing,
 закрыть admission для `openclaw`, дождаться/отменить его
 jobs и вернуть прежний broker release; другие sources и SQLite не удалять.
+
+## Nemotron Bolt E4B (opt-in)
+
+Exact queue route, reasoning semantics, context ceiling and evaluation procedure:
+[docs/bolt-e4b.md](docs/bolt-e4b.md). No default/catalog changes.

@@ -104,6 +104,15 @@ def normalize_request(request: Any) -> dict:
         value = options.get(field)
         if value is not None and (isinstance(value, bool) or not isinstance(value, int) or value <= 0):
             raise OpenClawRequestError(f"{field} must be a positive integer")
+    # Probes must not silently dispatch at a different requested size.
+    # Existing routes retain their historical clamping behavior.
+    if profile_name == "openclaw-bolt-e4b":
+        for field, ceiling in (("num_ctx", profile.max_context),
+                               ("num_predict", profile.max_output)):
+            if field in options and options[field] is None:
+                raise OpenClawRequestError(f"{field} must be a positive integer")
+            if options.get(field, ceiling) > ceiling:
+                raise OpenClawRequestError(f"{field} exceeds Bolt E4B ceiling {ceiling}")
     for field, value in options.items():
         if field in {"num_ctx", "num_predict"}:
             continue
@@ -120,6 +129,8 @@ def normalize_request(request: Any) -> dict:
     think = request.get("think")
     if think is not None and think not in (True, False, "low", "medium", "high", "max"):
         raise OpenClawRequestError("unsupported thinking level")
+    if profile_name == "openclaw-bolt-e4b" and "think" in request and type(think) is not bool:
+        raise OpenClawRequestError("Bolt E4B think must be boolean; levels/budgets are unsupported")
     format_value = request.get("format")
     if format_value is not None and format_value != "json" and not isinstance(format_value, dict):
         raise OpenClawRequestError("format must be json or a JSON Schema")

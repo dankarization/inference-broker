@@ -46,6 +46,11 @@ PROFILES = {
                                       262_144, 16_384, 300, request_timeout_seconds=900),
     "openclaw-gpt-oss": Profile("openclaw-gpt-oss", "gpt-oss:20b", 131_072, 16_384, 300,
                                 request_timeout_seconds=900),
+    # Exact artifact metadata ceiling; not measured context/vision acceptance.
+    "openclaw-bolt-e4b": Profile(
+        "openclaw-bolt-e4b", "nemotron-3.5-bolt:e4b", 65_536, 8_192, 300,
+        request_timeout_seconds=1800, max_images=4,
+    ),
     # Opt-in bounded smoke lanes only. Admission does not establish executor
     # vision support or agent/tool compatibility for these model artifacts.
     "openclaw-qwen3-vl-2b": Profile(
@@ -112,7 +117,7 @@ PROFILES = {
 _OPENCLAW_PROFILE_NAMES = (
     "openclaw", "openclaw-gemma4", "openclaw-qwen3-vl", "openclaw-nemotron3",
     "openclaw-unc-rvn-iq2xxs", "openclaw-ministral3", "openclaw-nemotron-nano",
-    "openclaw-gpt-oss", "openclaw-gemma4-26b",
+    "openclaw-gpt-oss", "openclaw-gemma4-26b", "openclaw-bolt-e4b",
     "openclaw-qwen3-vl-2b", "openclaw-smolvlm2-2b", "openclaw-smolvlm2-500m",
 )
 OPENCLAW_PROFILES_BY_MODEL = {
