@@ -158,6 +158,9 @@ class OpenClawRouteTests(unittest.TestCase):
             "frob/ministral-3:14b-thinking-q4_K_M": (262_144, 16_384, True),
             "nemotron-3-nano:30b-a3b-q4_K_M": (262_144, 16_384, False),
             "gpt-oss:20b": (131_072, 16_384, False),
+            "qwen3-vl:2b-instruct-q4_K_M": (8_192, 2_048, True),
+            "hf.co/ggml-org/SmolVLM2-2.2B-Instruct-GGUF:Q4_K_M": (8_192, 2_048, True),
+            "hf.co/ggml-org/SmolVLM2-500M-Video-Instruct-GGUF:Q8_0": (8_192, 2_048, True),
         }
         self.assertEqual(set(OPENCLAW_PROFILES_BY_MODEL), set(cases))
         for model, (context, output, vision) in cases.items():
@@ -204,6 +207,56 @@ class OpenClawRouteTests(unittest.TestCase):
         with self.assertRaises(HTTPError) as caught:
             self.opener.open(self.request({**self.sample(), "model": "caller-chosen:bad"}))
         self.assertEqual(caught.exception.code, 400)
+
+    def test_small_vlm_smoke_profiles_enforce_dispatch_and_image_bounds(self):
+        # The executor is fake: these assertions verify broker admission and
+        # dispatch, not the artifacts' vision or agent/tool capabilities.
+        for model, profile_name in (
+            ("qwen3-vl:2b-instruct-q4_K_M", "openclaw-qwen3-vl-2b"),
+            ("hf.co/ggml-org/SmolVLM2-2.2B-Instruct-GGUF:Q4_K_M", "openclaw-smolvlm2-2b"),
+            ("hf.co/ggml-org/SmolVLM2-500M-Video-Instruct-GGUF:Q8_0", "openclaw-smolvlm2-500m"),
+        ):
+            with self.subTest(model=model):
+                self.assertEqual(OPENCLAW_PROFILES_BY_MODEL[model], profile_name)
+                self.assertEqual(PROFILES[profile_name].max_images, 4)
+                for options, expected in (
+                    ({}, {"num_ctx": 8192, "num_predict": 2048}),
+                    ({"num_ctx": 999999, "num_predict": 999999},
+                     {"num_ctx": 8192, "num_predict": 2048}),
+                    ({"num_ctx": 2048, "num_predict": 128},
+                     {"num_ctx": 2048, "num_predict": 128}),
+                ):
+                    body = {"model": model, "messages": [
+                        {"role": "user", "content": "describe", "images": ["aGVsbG8="] * 4}],
+                        "options": options}
+                    job = self.broker.submit(profile_name, "chat", normalize_request(body),
+                                             source="openclaw")
+                    self.assertTrue(self.broker.dispatch_once(frozenset({"openclaw"})))
+                    request = self.ollama.requests[-1][1]
+                    self.assertEqual(request["model"], model)
+                    self.assertEqual(request["options"], expected)
+                    self.assertEqual(request["_broker_timeout_seconds"], 600)
+                    self.assertEqual(request["messages"], body["messages"])
+                    self.assertEqual(self.broker.status(job["id"])["state"], "completed")
+                for messages, error in (
+                    ([{"role": "user", "content": "x", "images": ["aGVsbG8="] * 5}],
+                     "too many images"),
+                    ([{"role": "user", "content": "x", "images": ["aGVsbG8="] * 3},
+                      {"role": "user", "content": "x", "images": ["aGVsbG8="] * 2}],
+                     "too many images"),
+                    ([{"role": "assistant", "content": "x", "images": ["aGVsbG8="]}],
+                     "images require"),
+                    ([{"role": "user", "content": "x", "images": ["not base64!"]}],
+                     "valid base64"),
+                ):
+                    with self.assertRaisesRegex(ValueError, error):
+                        self.broker.submit(profile_name, "chat", {"messages": messages},
+                                           source="openclaw")
+                with self.assertRaisesRegex(ValueError, "configured OpenClaw model"):
+                    normalize_request({"model": model + "-unknown", "messages": body["messages"]})
+                with self.assertRaisesRegex(ValueError, "requires source openclaw"):
+                    self.broker.submit(profile_name, "generate", normalize_request(body),
+                                       source="openclaw")
 
     def test_gemma4_26b_smoke_options_thinking_and_server_caps(self):
         for think, requested, expected in (

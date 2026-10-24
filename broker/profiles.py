@@ -46,6 +46,20 @@ PROFILES = {
                                       262_144, 16_384, 300, request_timeout_seconds=900),
     "openclaw-gpt-oss": Profile("openclaw-gpt-oss", "gpt-oss:20b", 131_072, 16_384, 300,
                                 request_timeout_seconds=900),
+    # Opt-in bounded smoke lanes only. Admission does not establish executor
+    # vision support or agent/tool compatibility for these model artifacts.
+    "openclaw-qwen3-vl-2b": Profile(
+        "openclaw-qwen3-vl-2b", "qwen3-vl:2b-instruct-q4_K_M", 8_192, 2_048, 300,
+        request_timeout_seconds=600, max_images=4,
+    ),
+    "openclaw-smolvlm2-2b": Profile(
+        "openclaw-smolvlm2-2b", "hf.co/ggml-org/SmolVLM2-2.2B-Instruct-GGUF:Q4_K_M",
+        8_192, 2_048, 300, request_timeout_seconds=600, max_images=4,
+    ),
+    "openclaw-smolvlm2-500m": Profile(
+        "openclaw-smolvlm2-500m", "hf.co/ggml-org/SmolVLM2-500M-Video-Instruct-GGUF:Q8_0",
+        8_192, 2_048, 300, request_timeout_seconds=600, max_images=4,
+    ),
     # Shutterstock photos stay on cloud/OmniRoute and deliberately have no
     # broker profile. Only the local video workload may acquire MAIN-PC.
     # The video lane is multimodal: one chunk arrives as base64 frames plus a
@@ -99,6 +113,7 @@ _OPENCLAW_PROFILE_NAMES = (
     "openclaw", "openclaw-gemma4", "openclaw-qwen3-vl", "openclaw-nemotron3",
     "openclaw-unc-rvn-iq2xxs", "openclaw-ministral3", "openclaw-nemotron-nano",
     "openclaw-gpt-oss", "openclaw-gemma4-26b",
+    "openclaw-qwen3-vl-2b", "openclaw-smolvlm2-2b", "openclaw-smolvlm2-500m",
 )
 OPENCLAW_PROFILES_BY_MODEL = {
     PROFILES[name].model: name for name in _OPENCLAW_PROFILE_NAMES
