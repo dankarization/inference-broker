@@ -19,6 +19,11 @@ class Profile:
 # This is deliberately server-owned. Callers can select a profile, never a model
 # or unbounded generation parameters.
 PROFILES = {
+    # Opt-in independent visual verification. Qualification belongs to caller.
+    "nextcloud-verify-gemma26": Profile(
+        "nextcloud-verify-gemma26", "gemma4:26b", 16_384, 4_096, 300,
+        max_images=4, request_timeout_seconds=900,
+    ),
     # Worker004 generate lane, distinct from isolated pilot image-chat evaluation.
     "nextcloud-eval-qwen": Profile(
         "nextcloud-eval-qwen", "qwen3-vl:30b", 16_384, 8_192, 300,

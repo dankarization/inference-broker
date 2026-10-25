@@ -5,6 +5,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import sqlite3
 import threading
 import time
@@ -15,7 +16,7 @@ from typing import Any
 
 from .analytics import analytics_snapshot, attempt_history, audit_history
 from .dashboard import snapshot as dashboard_snapshot
-from .compat import (CompatibilityError, NEXTCLOUD_PROFILES,
+from .compat import (CompatibilityError, NEXTCLOUD_PROFILES, GEMMA26_CONTRACT,
                      validate_nextcloud_payload,
                      validate_olya_decision_payload,
                      validate_olya_vision_payload,
@@ -605,6 +606,10 @@ class Broker:
                 raise ValueError("Nextcloud requires its dedicated source/profile and generate")
             if not external_id or not source_item_id:
                 raise ValueError("Nextcloud requires external_id and source_item_id")
+            if profile == "nextcloud-verify-gemma26":
+                if (not isinstance(external_id, str) or re.fullmatch(r"[A-Za-z0-9_.:/-]{1,160}", external_id) is None
+                    or not isinstance(source_item_id, str) or re.fullmatch(r"[0-9]{1,128}", source_item_id) is None):
+                    raise ValueError("Gemma26 requires bounded exact correlation/file identities")
             payload = validate_nextcloud_payload(payload, profile)
         if source == "openclaw" and profile not in OPENCLAW_PROFILE_NAMES:
             raise ValueError("source openclaw requires the OpenClaw profile")
@@ -753,7 +758,7 @@ class Broker:
                     "AND state IN ('queued','running','cancel_requested')"
                 ).fetchone()[0] >= 2:
                     raise SourceQueueFull("nextcloud has 2 outstanding jobs")
-                if profile == "nextcloud-eval-qwen":
+                if profile in {"nextcloud-eval-qwen", "nextcloud-verify-gemma26"}:
                     outstanding = self.db.execute(
                         "SELECT count(*),coalesce(sum(input_bytes),0) FROM jobs WHERE source='nextcloud' "
                         "AND state IN ('queued','running','cancel_requested')"
@@ -940,6 +945,9 @@ class Broker:
                 options=dict(num_ctx=16384, num_predict=8192, temperature=0),
                 keep_alive=300, stream=False,
             )
+        if job.get("profile") == "nextcloud-verify-gemma26":
+            result["request_contract"] = {**GEMMA26_CONTRACT,
+                "options": dict(GEMMA26_CONTRACT["options"])}
         raw = job.get("result")
         if isinstance(raw, dict):
             # Scalars only: malformed nested values must never tunnel reasoning
