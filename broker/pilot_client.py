@@ -41,7 +41,9 @@ class PilotClient:
             if len(raw)>MAX_RESPONSE_BYTES:raise PilotUncertain('pilot response byte bound')
             return json.loads(raw)
         except HTTPError as error:
-            if body is not None and error.code in {400,403,409,413,429}:raise PilotRejected(error.code) from None
+            status=error.code
+            error.close()
+            if body is not None and status in {400,403,409,413,429}:raise PilotRejected(status) from None
             raise PilotUncertain('pilot HTTP outcome unknown; reconcile exact key') from None
         except (URLError,OSError,ValueError):
             raise PilotUncertain('pilot transport/response unknown; reconcile exact key') from None
