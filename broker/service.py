@@ -22,7 +22,9 @@ from .compat import (CompatibilityError,
                      validate_shutterstock_canary_payload,
                      validate_shutterstock_video_payload,
                      validate_syncopia_memory_payload)
-from .profiles import OPENCLAW_PROFILE_NAMES, PROFILES
+from .profiles import EVALUATION_PROFILE_NAMES, OPENCLAW_PROFILE_NAMES, PROFILES
+from .evaluation import normalize_request as normalize_evaluation_request
+from .evaluation import validate_result as validate_evaluation_result
 from .openclaw import (MAX_OUTSTANDING, normalize_request as normalize_openclaw_request,
                        validate_result as validate_openclaw_result)
 from .policy import (
@@ -594,6 +596,10 @@ class Broker:
         if kind not in {"chat", "generate"}:
             raise ValueError("kind must be chat or generate")
         source = source or profile
+        if profile in EVALUATION_PROFILE_NAMES:
+            if source != "pilot-mainpc" or kind != "chat" or producer_storage is not None:
+                raise ValueError("Evaluation requires source pilot-mainpc and inline chat")
+            payload = normalize_evaluation_request(payload, profile)
         if source == "nextcloud" or profile == "nextcloud-qwen3-vl":
             if (source, profile, kind) != ("nextcloud", "nextcloud-qwen3-vl", "generate"):
                 raise ValueError("Nextcloud requires its dedicated source/profile and generate")
@@ -1832,6 +1838,8 @@ class Broker:
             raise RuntimeError("Ollama returned a non-object response")
         if row["profile"] in OPENCLAW_PROFILE_NAMES:
             validate_openclaw_result(result, profile.model)
+        if row["profile"] in EVALUATION_PROFILE_NAMES:
+            validate_evaluation_result(result, profile.model)
         result_json = json.dumps(result)
         with self.lock, self.db:
             state = self.db.execute("SELECT state FROM jobs WHERE id=?", (row["id"],)).fetchone()[0]

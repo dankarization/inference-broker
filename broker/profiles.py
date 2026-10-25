@@ -19,6 +19,15 @@ class Profile:
 # This is deliberately server-owned. Callers can select a profile, never a model
 # or unbounded generation parameters.
 PROFILES = {
+    # Explicit opt-in technical-document evaluation; never an OpenClaw route.
+    "eval-qwen3-vl-2b": Profile(
+        "eval-qwen3-vl-2b", "qwen3-vl:2b-instruct-q4_K_M", 8_192, 2_048, 300,
+        request_timeout_seconds=900, max_images=4,
+    ),
+    "eval-qwen3-vl-30b": Profile(
+        "eval-qwen3-vl-30b", "qwen3-vl:30b", 8_192, 2_048, 300,
+        request_timeout_seconds=900, max_images=4,
+    ),
     "nextcloud-qwen3-vl": Profile(
         "nextcloud-qwen3-vl", "qwen3-vl:30b", 16_384, 8_192, 300,
         max_images=4, request_timeout_seconds=900,
@@ -124,3 +133,5 @@ OPENCLAW_PROFILES_BY_MODEL = {
     PROFILES[name].model: name for name in _OPENCLAW_PROFILE_NAMES
 }
 OPENCLAW_PROFILE_NAMES = frozenset(OPENCLAW_PROFILES_BY_MODEL.values())
+
+EVALUATION_PROFILE_NAMES = frozenset({"eval-qwen3-vl-2b", "eval-qwen3-vl-30b"})
