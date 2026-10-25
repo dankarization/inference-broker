@@ -15,7 +15,7 @@ from typing import Any
 
 from .analytics import analytics_snapshot, attempt_history, audit_history
 from .dashboard import snapshot as dashboard_snapshot
-from .compat import (CompatibilityError,
+from .compat import (CompatibilityError, NEXTCLOUD_PROFILES,
                      validate_nextcloud_payload,
                      validate_olya_decision_payload,
                      validate_olya_vision_payload,
@@ -600,12 +600,12 @@ class Broker:
             if source != "pilot-mainpc" or kind != "chat" or producer_storage is not None:
                 raise ValueError("Evaluation requires source pilot-mainpc and inline chat")
             payload = normalize_evaluation_request(payload, profile)
-        if source == "nextcloud" or profile == "nextcloud-qwen3-vl":
-            if (source, profile, kind) != ("nextcloud", "nextcloud-qwen3-vl", "generate"):
+        if source == "nextcloud" or profile in NEXTCLOUD_PROFILES:
+            if source != "nextcloud" or profile not in NEXTCLOUD_PROFILES or kind != "generate":
                 raise ValueError("Nextcloud requires its dedicated source/profile and generate")
             if not external_id or not source_item_id:
                 raise ValueError("Nextcloud requires external_id and source_item_id")
-            payload = validate_nextcloud_payload(payload)
+            payload = validate_nextcloud_payload(payload, profile)
         if source == "openclaw" and profile not in OPENCLAW_PROFILE_NAMES:
             raise ValueError("source openclaw requires the OpenClaw profile")
         if profile in OPENCLAW_PROFILE_NAMES and (source != "openclaw" or kind != "chat"):
@@ -748,11 +748,18 @@ class Broker:
             if source == "nextcloud":
                 if self.source_policy is None or source not in self.source_policy.snapshot()["sources"]:
                     raise SourceAdmissionBlocked(source)
-                if self.db.execute(
+                if profile == "nextcloud-qwen3-vl" and self.db.execute(
                     "SELECT count(*) FROM jobs WHERE source='nextcloud' "
                     "AND state IN ('queued','running','cancel_requested')"
                 ).fetchone()[0] >= 2:
                     raise SourceQueueFull("nextcloud has 2 outstanding jobs")
+                if profile == "nextcloud-eval-qwen":
+                    outstanding = self.db.execute(
+                        "SELECT count(*),coalesce(sum(input_bytes),0) FROM jobs WHERE source='nextcloud' "
+                        "AND state IN ('queued','running','cancel_requested')"
+                    ).fetchone()
+                    if outstanding[0] >= 256 or outstanding[1] + content_evidence(payload)[1] > 256 * 1024**2:
+                        raise SourceQueueFull("nextcloud evaluation budget: 256 jobs / 256 MiB")
             storage_fields = self.storage.prepare_admission(source, payload, producer_storage)
             if self.source_policy is not None and not self.source_policy.admission_allowed(source):
                 self._audit(
@@ -914,6 +921,43 @@ class Broker:
         with self.lock:
             row = self.db.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
             return self._job(row) if row else self.storage.tombstone_status(job_id)
+
+    @staticmethod
+    def nextcloud_projection(job: dict | None) -> dict | None:
+        """Opt-in final-only wire contract: no payload, thinking or raw errors."""
+        if job is None:
+            return None
+        if job.get("source") != "nextcloud" or job.get("profile") not in NEXTCLOUD_PROFILES:
+            raise ValueError("projection requires a dedicated Nextcloud job")
+        result = {name: job.get(name) for name in (
+            "id", "source", "profile", "kind", "external_id", "source_item_id", "state",
+            "created", "queued_at", "started", "finished", "input_hash", "input_bytes",
+        )}
+        result["projection"] = "nextcloud-final-v1"
+        if job.get("profile") == "nextcloud-eval-qwen":
+            result["request_contract"] = dict(
+                schema="nextcloud-eval-qwen-v1", model="qwen3-vl:30b", think=True,
+                options=dict(num_ctx=16384, num_predict=8192, temperature=0),
+                keep_alive=300, stream=False,
+            )
+        raw = job.get("result")
+        if isinstance(raw, dict):
+            # Scalars only: malformed nested values must never tunnel reasoning
+            # or raw errors through an otherwise allowlisted result field.
+            projected = {}
+            for name in ("model", "response"):
+                value = raw.get(name)
+                projected[name] = value if isinstance(value, str) else None
+            projected["done"] = raw.get("done") is True
+            reason = raw.get("done_reason")
+            projected["done_reason"] = reason if reason in ("stop", "length") else "unknown"
+            for name in ("eval_count", "total_duration", "load_duration", "prompt_eval_count",
+                         "prompt_eval_duration", "eval_duration"):
+                value = raw.get(name)
+                projected[name] = value if type(value) is int and 0 <= value <= 10**15 else None
+            projected["error"] = bool(raw.get("error"))
+            result["result"] = projected
+        return result
 
     def compact_status(self, job_id: str) -> dict | None:
         return self.storage.compact_status(job_id) or self.storage.tombstone_status(job_id)

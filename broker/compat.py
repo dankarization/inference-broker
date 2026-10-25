@@ -372,9 +372,14 @@ def _frame(value: dict[str, Any]) -> bytes:
     return (json.dumps(value, separators=(",", ":")) + "\n").encode()
 
 
-def validate_nextcloud_payload(request):
+NEXTCLOUD_PROFILES = frozenset({"nextcloud-qwen3-vl", "nextcloud-eval-qwen"})
+
+
+def validate_nextcloud_payload(request, profile_name="nextcloud-qwen3-vl"):
     """Bounded dedicated lane; accepts its own normalized replay shape."""
-    profile = PROFILES["nextcloud-qwen3-vl"]
+    if profile_name not in NEXTCLOUD_PROFILES:
+        raise CompatibilityError("not a Nextcloud profile")
+    profile = PROFILES[profile_name]
     if not isinstance(request, dict) or set(request) - {
         "prompt", "images", "model", "stream", "options", "keep_alive", "think",
     }:
@@ -397,11 +402,19 @@ def validate_nextcloud_payload(request):
             raise CompatibilityError("Nextcloud image exceeds decoded byte limit")
     # Keep the exact v1 normalized payload for old submissions and replays.
     # V2 is explicit thinking with a larger, still server-owned output budget.
+    if profile_name == "nextcloud-eval-qwen" and request.get("think") is not True:
+        raise CompatibilityError("Nextcloud evaluation requires think=true")
     if "think" in request and request["think"] is not True:
         raise CompatibilityError("Nextcloud think must be true when supplied")
     options = {"num_ctx": profile.max_context,
                "num_predict": profile.max_output if "think" in request else 2_048,
                "temperature": 0}
+    if profile_name == "nextcloud-eval-qwen":
+        supplied = request.get("options", options)
+        if (not isinstance(supplied, dict) or type(supplied.get("num_ctx")) is not int
+                or type(supplied.get("num_predict")) is not int
+                or type(supplied.get("temperature")) not in (int, float)):
+            raise CompatibilityError("Nextcloud evaluation options require exact numeric types")
     if request.get("options", options) != options or request.get("stream", False) is not False:
         raise CompatibilityError("Nextcloud options are server-owned")
     if request.get("keep_alive", profile.keep_alive_seconds) != profile.keep_alive_seconds:

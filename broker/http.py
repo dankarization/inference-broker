@@ -192,10 +192,14 @@ def serve(broker, host="127.0.0.1", port=8088, policy=None, storage_token=None):
                 ):
                     return
                 try:
-                    self._json(202, broker.submit(body["profile"], body["kind"], body.get("payload", {}),
-                                                  body.get("source"), body.get("source_item_id"),
-                                                  body.get("external_id"),
-                                                  body.get("producer_storage")))
+                    if not isinstance(body, dict): raise ValueError("request body must be JSON object")
+                    projection = parse_qs(urlsplit(self.path).query, keep_blank_values=True).get("projection")
+                    if projection is not None and (projection != ["nextcloud-final-v1"] or body.get("source") != "nextcloud"):
+                        raise ValueError("unsupported projection")
+                    result = broker.submit(body["profile"], body["kind"], body.get("payload", {}),
+                                           body.get("source"), body.get("source_item_id"),
+                                           body.get("external_id"), body.get("producer_storage"))
+                    self._json(202, broker.nextcloud_projection(result) if projection else result)
                 except SourceAdmissionBlocked as error: self._admission_blocked(error)
                 except SourceQueueFull as error: self._json(429, {"error": str(error)})
                 except (KeyError, TypeError, ValueError, StorageContractError) as e: self._json(400, {"error": str(e)})
@@ -563,7 +567,15 @@ def serve(broker, host="127.0.0.1", port=8088, policy=None, storage_token=None):
                 job_id = path.split("/")[3]
                 if broker.producer_storage_job(job_id) and not self._storage_authorized():
                     return
-                result=broker.status(job_id); self._json(200 if result else 404, result or {"error":"not found"})
+                try:
+                    result = broker.status(job_id)
+                    projection = parse_qs(urlsplit(self.path).query, keep_blank_values=True).get("projection")
+                    if projection is not None:
+                        if projection != ["nextcloud-final-v1"]: raise ValueError("unsupported projection")
+                        result = broker.nextcloud_projection(result)
+                    self._json(200 if result else 404, result or {"error":"not found"})
+                except ValueError as error:
+                    self._json(400, {"error": str(error)})
             else: self._json(404, {"error":"not found"})
         def log_message(self, *_): pass
     return ThreadingHTTPServer((host, port), Handler)

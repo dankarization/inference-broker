@@ -19,6 +19,11 @@ class Profile:
 # This is deliberately server-owned. Callers can select a profile, never a model
 # or unbounded generation parameters.
 PROFILES = {
+    # Worker004 generate lane, distinct from isolated pilot image-chat evaluation.
+    "nextcloud-eval-qwen": Profile(
+        "nextcloud-eval-qwen", "qwen3-vl:30b", 16_384, 8_192, 300,
+        max_images=4, request_timeout_seconds=900,
+    ),
     # Explicit opt-in technical-document evaluation; never an OpenClaw route.
     "eval-qwen3-vl-2b": Profile(
         "eval-qwen3-vl-2b", "qwen3-vl:2b-instruct-q4_K_M", 8_192, 2_048, 300,
