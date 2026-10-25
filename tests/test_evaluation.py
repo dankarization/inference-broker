@@ -108,7 +108,7 @@ class EvaluationTests(unittest.TestCase):
                 self.submit(profile, producer_storage={})
         for model, profile in OPENCLAW_PROFILES_BY_MODEL.items():
             self.assertNotIn(profile, EVALUATION_PROFILE_NAMES)
-            with self.assertRaisesRegex(ValueError, "source openclaw and kind chat"):
+            with self.assertRaisesRegex(ValueError, "dedicated evaluation profile"):
                 self.submit(profile)
         self.assertEqual(OPENCLAW_PROFILES_BY_MODEL["qwen3-vl:30b"], "openclaw-qwen3-vl")
         self.assertEqual(OPENCLAW_PROFILES_BY_MODEL["qwen3-vl:2b-instruct-q4_K_M"],
@@ -166,6 +166,7 @@ class EvaluationTests(unittest.TestCase):
 
     def test_http_route_admits_only_when_pilot_policy_allows_without_inference(self):
         server = serve(self.broker, port=0, policy=self.policy)
+        server.daemon_threads = False  # Join actual handlers before SQLite cleanup, even on timeout.
         self.addCleanup(server.server_close)
         opener = build_opener(ProxyHandler({}))
         def post(profile):

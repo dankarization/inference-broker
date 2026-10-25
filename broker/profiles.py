@@ -19,6 +19,14 @@ class Profile:
 # This is deliberately server-owned. Callers can select a profile, never a model
 # or unbounded generation parameters.
 PROFILES = {
+    "eval-gemma4-12b": Profile(
+        "eval-gemma4-12b", "gemma4:12b", 8_192, 2_048, 300,
+        request_timeout_seconds=900, max_images=4,
+    ),
+    "eval-gemma4-26b": Profile(
+        "eval-gemma4-26b", "gemma4:26b", 8_192, 2_048, 300,
+        request_timeout_seconds=900, max_images=4,
+    ),
     # Opt-in independent visual verification. Qualification belongs to caller.
     "nextcloud-verify-gemma26": Profile(
         "nextcloud-verify-gemma26", "gemma4:26b", 16_384, 4_096, 300,
@@ -144,4 +152,6 @@ OPENCLAW_PROFILES_BY_MODEL = {
 }
 OPENCLAW_PROFILE_NAMES = frozenset(OPENCLAW_PROFILES_BY_MODEL.values())
 
-EVALUATION_PROFILE_NAMES = frozenset({"eval-qwen3-vl-2b", "eval-qwen3-vl-30b"})
+EVALUATION_PROFILE_NAMES = frozenset({
+    "eval-qwen3-vl-2b", "eval-qwen3-vl-30b", "eval-gemma4-12b", "eval-gemma4-26b",
+})

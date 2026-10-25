@@ -6,6 +6,16 @@ import base64
 from .openclaw import normalize_request as normalize_chat, validate_result as validate_chat
 from .profiles import EVALUATION_PROFILE_NAMES, PROFILES
 
+# Independent pilot admission budget, NOT the Nextcloud256 budget.
+PILOT_MAX_ACTIVE_JOBS = 512
+PILOT_MAX_ACTIVE_INPUT_BYTES = 512 * 1024**2
+PILOT_MODEL_DIGESTS = {
+    "eval-qwen3-vl-2b": "sha256:afc393e3572c07db0bc84aa460d928a16c75f3fbb9ca9e0dccc4fbd2dafb573e",
+    "eval-qwen3-vl-30b": "sha256:eda0be1008774ea4e575187712b9a3b1201f3e66e7ecff899cc295db1cf00248",
+    "eval-gemma4-12b": "sha256:4eb23ef187e2c5462566d6a1d3bbbc2f1346d0b4327cbb66d58fffbcc9b2b05c",
+    "eval-gemma4-26b": "sha256:001e5dafc3c77684c2307ebc6ab8e336e10c9b18eca52acf547d72fc83c3ca8c",
+}
+
 
 def normalize_request(request: dict, profile_name: str) -> dict:
     if profile_name not in EVALUATION_PROFILE_NAMES:

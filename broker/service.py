@@ -597,6 +597,8 @@ class Broker:
         if kind not in {"chat", "generate"}:
             raise ValueError("kind must be chat or generate")
         source = source or profile
+        if source == "pilot-mainpc" and profile not in EVALUATION_PROFILE_NAMES:
+            raise ValueError("pilot-mainpc requires a dedicated evaluation profile")
         if profile in EVALUATION_PROFILE_NAMES:
             if source != "pilot-mainpc" or kind != "chat" or producer_storage is not None:
                 raise ValueError("Evaluation requires source pilot-mainpc and inline chat")
@@ -686,7 +688,7 @@ class Broker:
                         (source, external_id),
                     ).fetchone()
                     tombstone_is_idempotent = tombstone is not None and (
-                        source in {"olya-vision", "olya-decision", "syncopia-telegram-memory", "openclaw", "nextcloud"}
+                        source in {"olya-vision", "olya-decision", "syncopia-telegram-memory", "openclaw", "nextcloud", "pilot-mainpc"}
                         or producer_storage is not None
                         or tombstone["producer_attempt_id"] is not None
                     )
@@ -715,7 +717,7 @@ class Broker:
                         or existing["result_storage_mode"] != "broker_temporary"
                     )
                     if (
-                        source in {"olya-vision", "olya-decision", "syncopia-telegram-memory", "openclaw", "nextcloud"}
+                        source in {"olya-vision", "olya-decision", "syncopia-telegram-memory", "openclaw", "nextcloud", "pilot-mainpc"}
                         or producer_storage is not None
                         or existing_has_producer_storage
                     ):
@@ -742,14 +744,26 @@ class Broker:
                                 raise ValueError(
                                     "producer storage idempotency conflict for existing correlation"
                                 )
-                        if source in {"openclaw", "nextcloud"} and (
+                        if source in {"openclaw", "nextcloud", "pilot-mainpc"} and (
                             existing["profile"] != profile or existing["kind"] != kind
                             or existing["input_hash"] != content_evidence(payload)[0]
                         ):
                             raise ValueError("idempotency key was used for another request")
-                        if source == "nextcloud" and existing["source_item_id"] != source_item_id:
-                            raise ValueError("Nextcloud correlation item conflict")
+                        if source in {"nextcloud", "pilot-mainpc"} and existing["source_item_id"] != source_item_id:
+                            raise ValueError("source correlation item conflict")
                         return self.status(existing["id"])
+            if source == "pilot-mainpc":
+                from .evaluation import PILOT_MAX_ACTIVE_JOBS, PILOT_MAX_ACTIVE_INPUT_BYTES
+                entry = (self.source_policy.snapshot()["sources"].get(source)
+                         if self.source_policy is not None else None)
+                if not entry or not entry["enabled"] or not entry["admission_allowed"]:
+                    raise SourceAdmissionBlocked(source)
+                outstanding = self.db.execute(
+                    "SELECT count(*),coalesce(sum(input_bytes),0) FROM jobs WHERE source='pilot-mainpc' "
+                    "AND state IN ('queued','running','cancel_requested')"
+                ).fetchone()
+                if outstanding[0] >= PILOT_MAX_ACTIVE_JOBS or outstanding[1] + content_evidence(payload)[1] > PILOT_MAX_ACTIVE_INPUT_BYTES:
+                    raise SourceQueueFull("pilot-mainpc budget: 512 active jobs / 512 MiB")
             if source == "nextcloud":
                 if self.source_policy is None or source not in self.source_policy.snapshot()["sources"]:
                     raise SourceAdmissionBlocked(source)
@@ -1009,6 +1023,10 @@ class Broker:
         data.pop("priority", None)  # inert historic column is never public
         for field in LEGACY_HIDDEN_STORAGE_FIELDS:
             data.pop(field, None)
+        if data["source"] == "pilot-mainpc":
+            # Exact durable client correlation survives terminal payload cleanup.
+            data["input_hash"] = row["input_hash"]
+            data["input_bytes"] = row["input_bytes"]
         data["payload"] = json.loads(data["payload"])
         if data.get("result_json") is not None:
             data["result"] = json.loads(data.pop("result_json"))

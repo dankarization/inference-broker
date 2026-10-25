@@ -1,6 +1,6 @@
 # Opt-in technical-document evaluation
 
-Two dedicated `/v1/jobs` profiles accept only inline `kind: chat` requests with
+Four dedicated `/v1/jobs` profiles accept only inline `kind: chat` requests with
 `source: pilot-mainpc`. They do not alter `/openclaw/api/chat`, its model mapping,
 its history/tool contract, or any existing profile/source guard.
 
@@ -8,8 +8,10 @@ its history/tool contract, or any existing profile/source guard.
 | --- | --- |
 | `eval-qwen3-vl-2b` | `qwen3-vl:2b-instruct-q4_K_M` |
 | `eval-qwen3-vl-30b` | `qwen3-vl:30b` |
+| `eval-gemma4-12b` | `gemma4:12b` |
+| `eval-gemma4-26b` | `gemma4:26b` |
 
-Both profiles use context 8192, output ceiling 2048, temperature 0, `think: false`,
+All four profiles use context 8192, output ceiling 2048, temperature 0, `think: false`,
 `stream: false`, keep-alive 300 seconds and a 900-second executor timeout. Missing
 options receive those server-owned values; conflicting values are rejected,
 not clamped. Tools, assistant/tool history and producer-storage references are
@@ -27,7 +29,7 @@ semantic correctness, non-truncation, or model capability.
 
 The following stdlib command reads the frozen matrix and image without changing
 them, then prints a runnable request to stdout. Set `task_index` to 0 or 1 and
-select either of the two profiles. It does not perform inference.
+select one of the four profiles. It does not perform inference.
 
 ```sh
 python3 - <<'PY' > request.json
@@ -61,8 +63,14 @@ curl --fail-with-body -H 'Content-Type: application/json' \
 
 Use the returned job ID to poll `/v1/jobs/ID` and `/v1/jobs/ID/attempts`.
 Do not blindly retry uncertain admissions: reconcile by source/external ID at
-`/v1/correlations` first. Existing pilot idempotency/retention semantics remain
-unchanged. The frozen `run-comparison.py` still names OpenClaw profiles; it must
+`/v1/correlations` first. Keyed pilot replay now requires identical profile/kind, normalized input
+hash and source item ID; retained identical jobs return before admission gates.
+Changed requests conflict. Expired tombstones cannot recreate a job. Anonymous
+legacy pilot submissions remain supported but do not provide durable DOC100 keys.
+The stdlib `broker.pilot_client.PilotClient` never automatically replays an unknown
+POST; an empty correlation search is not proof that admission never happened.
+Pilot job responses additionally expose input hash/bytes for exact recovery after
+terminal payload cleanup. Other sources' legacy serialization is unchanged. The frozen `run-comparison.py` still names OpenClaw profiles; it must
 not be run unchanged. A separately owned evaluator must use these new profile
 names, keep source `pilot-mainpc`, and reconcile prior admissions separately.
 
