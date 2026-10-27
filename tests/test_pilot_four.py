@@ -21,7 +21,7 @@ class FourPilotTests(unittest.TestCase):
     def test_real_client_four_profiles_replay_restart_recover_and_distinct_models(self):
         client=self.client();ids=[]
         for profile in sorted(EVALUATION_PROFILE_NAMES):
-            key='doc100-fixture-'+profile;item='synthetic-doc-1';payload=self.payload()
+            key='doc100-fixture-'+profile;item='synthetic-doc-1';payload=self.payload(profile)
             job=client.submit(key,item,profile,payload);ids.append(job['id'])
             self.assertEqual(client.submit(key,item,profile,payload)['id'],job['id'])
             self.assertEqual(client.recover(key,item,profile,payload)['id'],job['id'])
@@ -38,13 +38,13 @@ class FourPilotTests(unittest.TestCase):
         finally:other.db.close()
         self.policy.set_admission_allowed('pilot-mainpc',False)
         for profile in EVALUATION_PROFILE_NAMES:
-            self.assertIsNotNone(client.recover('doc100-fixture-'+profile,'synthetic-doc-1',profile,self.payload()))
+            self.assertIsNotNone(client.recover('doc100-fixture-'+profile,'synthetic-doc-1',profile,self.payload(profile)))
         with self.assertRaises(PilotRejected) as caught:
-            client.submit('new','doc','eval-gemma4-12b',self.payload())
+            client.submit('new','doc','eval-gemma4-12b',self.payload('eval-gemma4-12b'))
         self.assertEqual(caught.exception.status,403)
     def test_pilot_count_bytes_disk_backpressure_and_replay_at_cap(self):
         self.assertEqual((PILOT_MAX_ACTIVE_JOBS,PILOT_MAX_ACTIVE_INPUT_BYTES),(512,512*1024**2))
-        client=self.client();profile='eval-gemma4-26b';p=self.payload()
+        client=self.client();p=self.payload('eval-gemma4-26b');profile='eval-gemma4-26b'
         first=client.submit('cap','doc',profile,p)
         # Synthetic occupancy fixture, not512 claimed admissions; preserve real cap path.
         row=dict(self.broker.db.execute('SELECT * FROM jobs WHERE id=?',(first['id'],)).fetchone())
@@ -65,7 +65,7 @@ class FourPilotTests(unittest.TestCase):
             with self.assertRaises(PilotRejected) as caught:client.submit('disk','doc',profile,p)
         self.assertEqual(caught.exception.status,400) # existing storage contract, not a fake global429
     def test_unknown_post_is_not_replayed_and_recovery_checks_identity(self):
-        client=self.client();p=self.payload();profile='eval-gemma4-12b'
+        client=self.client();p=self.payload('eval-gemma4-12b');profile='eval-gemma4-12b'
         for bad in (' padded','x'*257,'line\nfeed'):
             with self.assertRaises(ValueError):client.submit(bad,'doc',profile,p)
         original=client._request;calls=[]
@@ -110,7 +110,7 @@ class FourPilotTests(unittest.TestCase):
         client=self.client();ids=[]
         for doc in range(100):
             for profile in sorted(EVALUATION_PROFILE_NAMES):
-                ids.append(client.submit(f'doc100-{doc}-{profile}',f'fixture-doc-{doc}',profile,self.payload())['id'])
+                ids.append(client.submit(f'doc100-{doc}-{profile}',f'fixture-doc-{doc}',profile,self.payload(profile))['id'])
         self.assertEqual(len(set(ids)),400)
         self.assertEqual(self.broker.db.execute("SELECT count(*) FROM jobs WHERE source='pilot-mainpc' AND state='queued'").fetchone()[0],400)
         self.assertEqual(self.ollama.requests,[])

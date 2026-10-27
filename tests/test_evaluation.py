@@ -52,15 +52,16 @@ class EvaluationTests(unittest.TestCase):
                              source_policy=self.policy)
         self.addCleanup(self.broker.db.close)
 
-    def payload(self):
+    def payload(self, profile="eval-qwen3-vl-2b"):
+        prof = PROFILES[profile]
         return {"messages": [{"role": "user", "content": "Read visible labels only",
                               "images": [base64.b64encode(b'image fixture').decode()]}],
-                "options": {"num_ctx": 8192, "num_predict": 2048, "temperature": 0},
+                "options": {"num_ctx": prof.max_context, "num_predict": prof.max_output, "temperature": 0},
                 "think": False, "stream": False,
                 "format": {"type": "object", "properties": {"labels": {"type": "array"}}}}
 
     def submit(self, profile, payload=None, **kwargs):
-        return self.broker.submit(profile, "chat", self.payload() if payload is None else payload,
+        return self.broker.submit(profile, "chat", self.payload(profile) if payload is None else payload,
                                   source="pilot-mainpc", **kwargs)
 
     def count(self):
@@ -69,7 +70,7 @@ class EvaluationTests(unittest.TestCase):
     def test_both_profiles_real_admission_dispatch_and_terminal_cleanup(self):
         for profile in sorted(EVALUATION_PROFILE_NAMES):
             with self.subTest(profile=profile):
-                original = self.payload()
+                original = self.payload(profile)
                 original["model"] = PROFILES[profile].model
                 job = self.submit(profile, original)
                 self.assertEqual(job["source"], "pilot-mainpc")
@@ -94,7 +95,7 @@ class EvaluationTests(unittest.TestCase):
             for field in ("options", "think", "stream"):
                 body.pop(field)
             job = self.submit(profile, body)
-            self.assertEqual(job["payload"]["options"], self.payload()["options"])
+            self.assertEqual(job["payload"]["options"], self.payload(profile)["options"])
             self.assertIs(job["payload"]["think"], False)
 
     def test_source_kind_storage_and_old_openclaw_guards(self):
@@ -129,8 +130,8 @@ class EvaluationTests(unittest.TestCase):
             {"messages": [{"role": "user", "content": "x"}] * 17},
             {"format": []}, {"format": "xml"}, {"format": {"description": "x" * 65536}},
         ]
-        for key, values in {"num_ctx": [8193, 8191, 0, -1, True, None, 8192.0],
-                            "num_predict": [2049, 2047, 0, True, None],
+        for key, values in {"num_ctx": [16385, 8193, 8191, 0, -1, True, None, 16384.0],
+                            "num_predict": [8193, 2049, 2047, 0, True, None],
                             "temperature": [1, True, None, float("nan")],
                             "num_gpu": [1]}.items():
             changes.extend({"options": {key: value}} for value in values)
@@ -138,7 +139,7 @@ class EvaluationTests(unittest.TestCase):
             for change in changes:
                 with self.subTest(profile=profile, change=str(change)[:100]):
                     with self.assertRaises(ValueError):
-                        self.submit(profile, {**self.payload(), **change})
+                        self.submit(profile, {**self.payload(profile), **change})
             with self.assertRaises(ValueError):
                 self.submit(profile, [])
             with patch("broker.openclaw.MAX_IMAGE_BYTES", 1):
@@ -172,7 +173,7 @@ class EvaluationTests(unittest.TestCase):
         def post(profile):
             request = Request(f"http://127.0.0.1:{server.server_port}/v1/jobs",
                               data=json.dumps({"profile": profile, "kind": "chat",
-                                               "source": "pilot-mainpc", "payload": self.payload()}).encode(),
+                                               "source": "pilot-mainpc", "payload": self.payload(profile)}).encode(),
                               headers={"Content-Type": "application/json"})
             thread = threading.Thread(target=server.handle_request)
             thread.start()

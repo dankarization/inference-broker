@@ -43,7 +43,7 @@ PROFILES = {
         request_timeout_seconds=900, max_images=4,
     ),
     "eval-qwen3-vl-30b": Profile(
-        "eval-qwen3-vl-30b", "qwen3-vl:30b", 8_192, 2_048, 300,
+        "eval-qwen3-vl-30b", "qwen3-vl:30b", 16_384, 8_192, 300,
         request_timeout_seconds=900, max_images=4,
     ),
     "nextcloud-qwen3-vl": Profile(
