@@ -16,6 +16,9 @@ from typing import Any
 
 from .analytics import analytics_snapshot, attempt_history, audit_history
 from .dashboard import snapshot as dashboard_snapshot
+from .qwen_budget import (PROFILE as QWEN64_PROFILE, CONTRACT as QWEN64_CONTRACT,
+                          snapshot as qwen64_snapshot, evidence as qwen64_evidence,
+                          project as project_qwen64_evidence)
 from .compat import (CompatibilityError, NEXTCLOUD_PROFILES, GEMMA26_CONTRACT,
                      validate_nextcloud_payload,
                      validate_olya_decision_payload,
@@ -772,7 +775,7 @@ class Broker:
                     "AND state IN ('queued','running','cancel_requested')"
                 ).fetchone()[0] >= 2:
                     raise SourceQueueFull("nextcloud has 2 outstanding jobs")
-                if profile in {"nextcloud-eval-qwen", "nextcloud-verify-gemma26"}:
+                if profile in {"nextcloud-eval-qwen", "nextcloud-verify-gemma26", QWEN64_PROFILE}:
                     outstanding = self.db.execute(
                         "SELECT count(*),coalesce(sum(input_bytes),0) FROM jobs WHERE source='nextcloud' "
                         "AND state IN ('queued','running','cancel_requested')"
@@ -959,11 +962,15 @@ class Broker:
                 options=dict(num_ctx=16384, num_predict=8192, temperature=0),
                 keep_alive=300, stream=False,
             )
+        if job.get("profile") == QWEN64_PROFILE:
+            result["request_contract"] = {**QWEN64_CONTRACT, "options": dict(QWEN64_CONTRACT["options"])}
         if job.get("profile") == "nextcloud-verify-gemma26":
             result["request_contract"] = {**GEMMA26_CONTRACT,
                 "options": dict(GEMMA26_CONTRACT["options"])}
         raw = job.get("result")
         if isinstance(raw, dict):
+            if job.get("profile") == QWEN64_PROFILE:
+                result["execution_evidence"] = project_qwen64_evidence(raw.get("_broker_execution_evidence"))
             # Scalars only: malformed nested values must never tunnel reasoning
             # or raw errors through an otherwise allowlisted result field.
             projected = {}
@@ -1023,7 +1030,7 @@ class Broker:
         data.pop("priority", None)  # inert historic column is never public
         for field in LEGACY_HIDDEN_STORAGE_FIELDS:
             data.pop(field, None)
-        if data["source"] == "pilot-mainpc":
+        if data["source"] == "pilot-mainpc" or data["profile"] == QWEN64_PROFILE:
             # Exact durable client correlation survives terminal payload cleanup.
             data["input_hash"] = row["input_hash"]
             data["input_bytes"] = row["input_bytes"]
@@ -1783,7 +1790,7 @@ class Broker:
             # recovered while its bounded executor call is still active.
             lease_seconds = max(
                 float(self.lease_seconds),
-                float(PROFILES[row["profile"]].request_timeout_seconds) + 15.0,
+                float(PROFILES[row["profile"]].request_timeout_seconds) + (315.0 if row["profile"] == QWEN64_PROFILE else 15.0),
             )
             lease_until = now + lease_seconds
             decision = dict(self._last_scheduler_decision or {})
@@ -1895,6 +1902,7 @@ class Broker:
             )
         if not ready:
             raise RuntimeError("target model did not become ready")
+        qwen64_before = qwen64_snapshot(self.ollama) if row["profile"] == QWEN64_PROFILE else None
         payload = json.loads(row["payload"])
         options = dict(payload.get("options", {}))
         options["num_ctx"] = min(int(options.get("num_ctx", profile.max_context)), profile.max_context)
@@ -1906,6 +1914,10 @@ class Broker:
         result = self.ollama.run(row["kind"], request)
         if not isinstance(result, dict):
             raise RuntimeError("Ollama returned a non-object response")
+        if row["profile"] == QWEN64_PROFILE:
+            after = qwen64_snapshot(self.ollama, effective=True)
+            result = dict(result, _broker_execution_evidence=qwen64_evidence(qwen64_before, after, sampled_at=self.clock()))
+            self._loaded_models_cache = [after]
         if row["profile"] in OPENCLAW_PROFILE_NAMES:
             validate_openclaw_result(result, profile.model)
         if row["profile"] in EVALUATION_PROFILE_NAMES:

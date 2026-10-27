@@ -8,6 +8,7 @@ import binascii
 from typing import Any
 
 from .profiles import PROFILES
+from .qwen_budget import PROFILE as QWEN64_PROFILE
 
 
 class CompatibilityError(ValueError):
@@ -379,7 +380,8 @@ GEMMA26_CONTRACT = dict(
     options=dict(num_ctx=16384, num_predict=4096, temperature=0),
     keep_alive=300, stream=False,
 )
-NEXTCLOUD_PROFILES = frozenset({"nextcloud-qwen3-vl", "nextcloud-eval-qwen", "nextcloud-verify-gemma26"})
+QWEN_EVAL_PROFILES = frozenset({"nextcloud-eval-qwen", QWEN64_PROFILE})
+NEXTCLOUD_PROFILES = frozenset({"nextcloud-qwen3-vl", "nextcloud-verify-gemma26"}) | QWEN_EVAL_PROFILES
 
 
 def validate_nextcloud_payload(request, profile_name="nextcloud-qwen3-vl"):
@@ -423,14 +425,14 @@ def validate_nextcloud_payload(request, profile_name="nextcloud-qwen3-vl"):
                 "options": dict(GEMMA26_CONTRACT["options"]), "think": False}
     # Keep the exact v1 normalized payload for old submissions and replays.
     # V2 is explicit thinking with a larger, still server-owned output budget.
-    if profile_name == "nextcloud-eval-qwen" and request.get("think") is not True:
+    if profile_name in QWEN_EVAL_PROFILES and request.get("think") is not True:
         raise CompatibilityError("Nextcloud evaluation requires think=true")
     if "think" in request and request["think"] is not True:
         raise CompatibilityError("Nextcloud think must be true when supplied")
     options = {"num_ctx": profile.max_context,
                "num_predict": profile.max_output if "think" in request else 2_048,
                "temperature": 0}
-    if profile_name == "nextcloud-eval-qwen":
+    if profile_name in QWEN_EVAL_PROFILES:
         supplied = request.get("options", options)
         if (not isinstance(supplied, dict) or type(supplied.get("num_ctx")) is not int
                 or type(supplied.get("num_predict")) is not int

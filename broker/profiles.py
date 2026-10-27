@@ -19,6 +19,10 @@ class Profile:
 # This is deliberately server-owned. Callers can select a profile, never a model
 # or unbounded generation parameters.
 PROFILES = {
+    "nextcloud-eval-qwen-64k-v1": Profile(
+        "nextcloud-eval-qwen-64k-v1", "qwen3-vl:30b", 65_536, 16_384, 300,
+        max_images=4, request_timeout_seconds=1800,
+    ),
     "eval-gemma4-12b": Profile(
         "eval-gemma4-12b", "gemma4:12b", 8_192, 2_048, 300,
         request_timeout_seconds=900, max_images=4,
