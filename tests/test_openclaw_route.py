@@ -431,10 +431,12 @@ class NativeWaitBudgetTests(unittest.TestCase):
                 self.assertEqual(profile.request_timeout_seconds, 1800)
                 self.assertEqual(openclaw_wait_seconds(profile), 2100)
             elif name in {
+                "nextcloud-eval-qwen-64k-v1",
                 "telegram-nightly-qwen38-v1", "telegram-nightly-gemma12-v1",
                 "telegram-nightly-gemma26-v1", "telegram-nightly-nemotron-nano-v1",
             }:
-                # Additive async-only profiles, not new OpenClaw model routes.
+                # Async-only profiles, including the unchanged deployed Qwen64
+                # baseline, are not new OpenClaw model routes.
                 self.assertEqual(profile.request_timeout_seconds, 1800)
                 self.assertEqual(openclaw_wait_seconds(profile), 2100)
             else:
