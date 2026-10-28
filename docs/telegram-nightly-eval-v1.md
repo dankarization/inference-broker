@@ -138,7 +138,7 @@ exactly two modes. Boolean example **only if native metadata supports both**:
 
 ```json
 {"schema":"telegram-nightly-matrix-v2","source":"telegram-nightly-eval-20261028-v1","models":[
- {"profile":"telegram-nightly-qwen38-v1","modes":[
+ {"profile":"telegram-nightly-gemma12-v1","modes":[
   {"label":"off","think":false,"supported":true},
   {"label":"on","think":true,"supported":true}
  ]}
@@ -234,7 +234,8 @@ original keys and remain readable; do not rewrite them as v2 or reset/rebind a
 journal. A new v2 frozen hash cannot reuse an old journal. This correction does
 not create a new source, expand the source lifetime cap or authorize make-up
 calls. Main's current source-only preparation had no frozen admission journal;
-any future unknown-to-known change needs main review, not automatic replacement. No content from HTTP errors/native thinking/
+any future unknown-to-known change needs main review, not automatic replacement.
+No content from HTTP errors/native thinking/
 reasoning fields is persisted or printed, including nested malformed metadata.
 Broker storage itself is final-only for the new lane, not merely CLI filtering.
 Inline reasoning channel markers in purported final content fail closed.

@@ -281,7 +281,8 @@ def load_frozen(path):
         if not isinstance(observations, dict) or set(observations) != set(lane.MODEL_DIGESTS):
             raise Closed('frozen native observations changed')
         for model, item in observations.items():
-            if item.get('model') != model or validate_observation(item) != frozen['native'][model]:
+            if (not isinstance(item, dict) or item.get('model') != model
+                    or validate_observation(item) != frozen['native'][model]):
                 raise Closed('frozen known/unknown observation changed')
     else:
         for item in frozen['native'].values():

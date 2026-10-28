@@ -584,6 +584,13 @@ class NightlyTests(unittest.TestCase):
             new_json(path, altered)
             with self.assertRaises(Closed):
                 load_frozen(path)
+        for i, malformed in enumerate((None, [], SECRET)):
+            altered = copy.deepcopy(plan)
+            altered['native_observations'][PROFILES[P].model] = malformed
+            path = self.root/('malformed-observation-'+str(i)+'.json')
+            new_json(path, altered)
+            with self.assertRaises(Closed):
+                load_frozen(path)
         altered = copy.deepcopy(plan)
         altered['native_observations'][PROFILES[P].model]['thinking'] = BOOL
         new_json(self.root/'invented-controls.json', altered)
