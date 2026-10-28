@@ -145,6 +145,20 @@ PROFILES = {
     ),
 }
 
+# Separate text-only comparison lane; never borrow an existing producer source.
+NIGHTLY_PROFILE_NAMES = frozenset({
+    "telegram-nightly-qwen38-v1", "telegram-nightly-gemma12-v1",
+    "telegram-nightly-gemma26-v1", "telegram-nightly-nemotron-nano-v1",
+})
+for _name, _model in (
+    ("telegram-nightly-qwen38-v1", "qwen3.8:ad-iq2-xs"),
+    ("telegram-nightly-gemma12-v1", "gemma4:12b"),
+    ("telegram-nightly-gemma26-v1", "gemma4:26b"),
+    ("telegram-nightly-nemotron-nano-v1", "nemotron-3-nano:30b-a3b-q4_K_M"),
+):
+    PROFILES[_name] = Profile(_name, _model, 32_768, 8_192, 300,
+                             request_timeout_seconds=1800)
+
 _OPENCLAW_PROFILE_NAMES = (
     "openclaw", "openclaw-gemma4", "openclaw-qwen3-vl", "openclaw-nemotron3",
     "openclaw-unc-rvn-iq2xxs", "openclaw-ministral3", "openclaw-nemotron-nano",

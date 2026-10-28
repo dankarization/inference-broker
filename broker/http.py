@@ -484,6 +484,9 @@ def serve(broker, host="127.0.0.1", port=8088, policy=None, storage_token=None):
                     503 if dashboard["observation"]["state"] == "unavailable" else 200,
                     dashboard, headers,
                 )
+            elif path == "/v1/nightly-eval/contract":
+                from .nightly_eval import contract
+                self._json(200, contract())
             elif path == "/healthz": self._json(200, broker.health())
             elif path == "/v1/metrics": self._json(200, broker.metrics())
             elif path == "/v1/storage/health": self._json(200, broker.storage_health())

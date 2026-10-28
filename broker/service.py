@@ -27,6 +27,8 @@ from .compat import (CompatibilityError, NEXTCLOUD_PROFILES, GEMMA26_CONTRACT,
                      validate_shutterstock_video_payload,
                      validate_syncopia_memory_payload)
 from .profiles import EVALUATION_PROFILE_NAMES, OPENCLAW_PROFILE_NAMES, PROFILES
+from . import nightly_eval
+from .profiles import NIGHTLY_PROFILE_NAMES
 from .evaluation import normalize_request as normalize_evaluation_request
 from .evaluation import validate_result as validate_evaluation_result
 from .openclaw import (MAX_OUTSTANDING, normalize_request as normalize_openclaw_request,
@@ -600,6 +602,13 @@ class Broker:
         if kind not in {"chat", "generate"}:
             raise ValueError("kind must be chat or generate")
         source = source or profile
+        if source == nightly_eval.SOURCE or profile in NIGHTLY_PROFILE_NAMES:
+            if (source != nightly_eval.SOURCE or profile not in NIGHTLY_PROFILE_NAMES
+                    or kind != "chat" or producer_storage is not None):
+                raise ValueError("nightly requires dedicated source/profile and inline chat")
+            if not external_id or not source_item_id:
+                raise ValueError("nightly requires durable external_id and source_item_id")
+            payload = nightly_eval.normalize_request(payload, profile)
         if source == "pilot-mainpc" and profile not in EVALUATION_PROFILE_NAMES:
             raise ValueError("pilot-mainpc requires a dedicated evaluation profile")
         if profile in EVALUATION_PROFILE_NAMES:
@@ -691,7 +700,7 @@ class Broker:
                         (source, external_id),
                     ).fetchone()
                     tombstone_is_idempotent = tombstone is not None and (
-                        source in {"olya-vision", "olya-decision", "syncopia-telegram-memory", "openclaw", "nextcloud", "pilot-mainpc"}
+                        source in {"olya-vision", "olya-decision", "syncopia-telegram-memory", "openclaw", "nextcloud", "pilot-mainpc", nightly_eval.SOURCE}
                         or producer_storage is not None
                         or tombstone["producer_attempt_id"] is not None
                     )
@@ -720,7 +729,7 @@ class Broker:
                         or existing["result_storage_mode"] != "broker_temporary"
                     )
                     if (
-                        source in {"olya-vision", "olya-decision", "syncopia-telegram-memory", "openclaw", "nextcloud", "pilot-mainpc"}
+                        source in {"olya-vision", "olya-decision", "syncopia-telegram-memory", "openclaw", "nextcloud", "pilot-mainpc", nightly_eval.SOURCE}
                         or producer_storage is not None
                         or existing_has_producer_storage
                     ):
@@ -747,14 +756,29 @@ class Broker:
                                 raise ValueError(
                                     "producer storage idempotency conflict for existing correlation"
                                 )
-                        if source in {"openclaw", "nextcloud", "pilot-mainpc"} and (
+                        if source in {"openclaw", "nextcloud", "pilot-mainpc", nightly_eval.SOURCE} and (
                             existing["profile"] != profile or existing["kind"] != kind
                             or existing["input_hash"] != content_evidence(payload)[0]
                         ):
                             raise ValueError("idempotency key was used for another request")
-                        if source in {"nextcloud", "pilot-mainpc"} and existing["source_item_id"] != source_item_id:
+                        if source in {"nextcloud", "pilot-mainpc", nightly_eval.SOURCE} and existing["source_item_id"] != source_item_id:
                             raise ValueError("source correlation item conflict")
                         return self.status(existing["id"])
+            if source == nightly_eval.SOURCE:
+                entry = (self.source_policy.snapshot()["sources"].get(source)
+                         if self.source_policy is not None else None)
+                if not entry or not entry["enabled"] or not entry["admission_allowed"]:
+                    raise SourceAdmissionBlocked(source)
+                total = self.db.execute(
+                    "SELECT count(*) FROM (SELECT id FROM jobs WHERE source=? UNION "
+                    "SELECT job_id FROM job_retention_tombstones WHERE source=?)", (source, source),
+                ).fetchone()[0]
+                active = self.db.execute(
+                    "SELECT count(*) FROM jobs WHERE source=? AND state IN "
+                    "('queued','running','cancel_requested')", (source,),
+                ).fetchone()[0]
+                if total >= nightly_eval.MAX_CALLS or active:
+                    raise SourceQueueFull("nightly: at most 32 lifetime cells and one outstanding job")
             if source == "pilot-mainpc":
                 from .evaluation import PILOT_MAX_ACTIVE_JOBS, PILOT_MAX_ACTIVE_INPUT_BYTES
                 entry = (self.source_policy.snapshot()["sources"].get(source)
@@ -881,6 +905,8 @@ class Broker:
     ) -> dict[str, Any]:
         """Requeue only failed jobs while retaining attempts and audit history."""
         source = self._bulk_source(source)
+        if source == nightly_eval.SOURCE:
+            raise ValueError("nightly evaluation never retries/requeues")
         now = self.clock()
         with self.lock, self.db:
             rows = list(self.db.execute(
@@ -1030,7 +1056,7 @@ class Broker:
         data.pop("priority", None)  # inert historic column is never public
         for field in LEGACY_HIDDEN_STORAGE_FIELDS:
             data.pop(field, None)
-        if data["source"] == "pilot-mainpc" or data["profile"] == QWEN64_PROFILE:
+        if data["source"] in {"pilot-mainpc", nightly_eval.SOURCE} or data["profile"] == QWEN64_PROFILE:
             # Exact durable client correlation survives terminal payload cleanup.
             data["input_hash"] = row["input_hash"]
             data["input_bytes"] = row["input_bytes"]
@@ -1041,7 +1067,7 @@ class Broker:
             data.pop("result_json", None)
         if data["state"] == "queued":
             data["queue_position"] = self._position(row)
-        return data
+        return nightly_eval.projection(data) if data["source"] == nightly_eval.SOURCE else data
 
     def _position(self, row):
         before = self.db.execute("SELECT count(*) FROM jobs WHERE state='queued' AND "
@@ -1093,6 +1119,8 @@ class Broker:
                 ).fetchone() is not None:
                     raise ValueError("job retry retention has expired")
                 return None
+            if row["source"] == nightly_eval.SOURCE:
+                raise ValueError("nightly evaluation never retries/requeues")
             if row["state"] not in {"failed", "cancelled"}:
                 raise ValueError("only failed or cancelled jobs may be retried")
             if row["compaction_state"] != "full":
@@ -1845,7 +1873,8 @@ class Broker:
         except Exception as exc:
             with self.lock, self.db:
                 finished = self.clock()
-                error_summary = bounded_error_summary(exc)
+                error_summary = ("nightly execution failed; no raw executor detail retained"
+                                 if row["source"] == nightly_eval.SOURCE else bounded_error_summary(exc))
                 self._complete_time_batch(finished)
                 self.db.execute("UPDATE jobs SET state='failed',finished=?,lease_until=NULL,error=? WHERE id=?", (finished, error_summary, row["id"]))
                 self.storage.record_terminal_retention(
@@ -1868,6 +1897,13 @@ class Broker:
     def _execute(self, row):
         profile = PROFILES[row["profile"]]
         self.wol.wake()
+        nightly_evidence = None
+        if row["profile"] in NIGHTLY_PROFILE_NAMES:
+            payload = json.loads(row["payload"])
+            nightly_eval.normalize_request(payload, row["profile"])
+            nightly_evidence = nightly_eval.native_contract(self.ollama, row["profile"], payload["think"])
+            if nightly_evidence["native_thinking"] != payload["native_thinking"]:
+                raise ValueError("native thinking metadata changed since freeze")
         models = self.ollama.ps().get("models", [])
         self._loaded_models_cache = [dict(model) for model in models if isinstance(model, dict)]
         loaded = [m.get("name") for m in models]
@@ -1908,6 +1944,8 @@ class Broker:
         options["num_ctx"] = min(int(options.get("num_ctx", profile.max_context)), profile.max_context)
         options["num_predict"] = min(int(options.get("num_predict", profile.max_output)), profile.max_output)
         request = {k: v for k, v in payload.items() if k not in {"model", "keep_alive"}}
+        if nightly_evidence is not None:
+            request.pop("native_thinking", None)
         request.update({"model": profile.model, "stream": False, "options": options,
                         "keep_alive": f"{profile.keep_alive_seconds}s"})
         request["_broker_timeout_seconds"] = profile.request_timeout_seconds
@@ -1922,6 +1960,11 @@ class Broker:
             validate_openclaw_result(result, profile.model)
         if row["profile"] in EVALUATION_PROFILE_NAMES:
             validate_evaluation_result(result, profile.model)
+        if nightly_evidence is not None:
+            context = nightly_eval.resident_context(self.ollama, profile.model)
+            result = nightly_eval.project_result(result, profile.model)
+            result["execution_evidence"] = nightly_eval.project_evidence(
+                dict(nightly_evidence, runtime_context_length=context))
         result_json = json.dumps(result)
         with self.lock, self.db:
             state = self.db.execute("SELECT state FROM jobs WHERE id=?", (row["id"],)).fetchone()[0]

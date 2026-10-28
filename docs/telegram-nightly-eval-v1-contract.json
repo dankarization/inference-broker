@@ -1,0 +1,75 @@
+{
+  "contract": {
+    "schema": "telegram-nightly-eval-v1",
+    "source": "telegram-nightly-eval-20261028-v1",
+    "max_calls": 32,
+    "max_outstanding": 1,
+    "profiles": [
+      {
+        "profile": "telegram-nightly-gemma12-v1",
+        "model": "gemma4:12b",
+        "model_digest": "4eb23ef187e2c5462566d6a1d3bbbc2f1346d0b4327cbb66d58fffbcc9b2b05c",
+        "options": {
+          "num_ctx": 32768,
+          "num_predict": 8192,
+          "temperature": 0
+        },
+        "kind": "chat",
+        "max_images": 0,
+        "format": "freeform",
+        "timeout_seconds": 1800
+      },
+      {
+        "profile": "telegram-nightly-gemma26-v1",
+        "model": "gemma4:26b",
+        "model_digest": "001e5dafc3c77684c2307ebc6ab8e336e10c9b18eca52acf547d72fc83c3ca8c",
+        "options": {
+          "num_ctx": 32768,
+          "num_predict": 8192,
+          "temperature": 0
+        },
+        "kind": "chat",
+        "max_images": 0,
+        "format": "freeform",
+        "timeout_seconds": 1800
+      },
+      {
+        "profile": "telegram-nightly-nemotron-nano-v1",
+        "model": "nemotron-3-nano:30b-a3b-q4_K_M",
+        "model_digest": "b725f11174073334edd0c2ff396b8d4e66d7dab22a5a63717ccad5a08a270cf1",
+        "options": {
+          "num_ctx": 32768,
+          "num_predict": 8192,
+          "temperature": 0
+        },
+        "kind": "chat",
+        "max_images": 0,
+        "format": "freeform",
+        "timeout_seconds": 1800
+      },
+      {
+        "profile": "telegram-nightly-qwen38-v1",
+        "model": "qwen3.8:ad-iq2-xs",
+        "model_digest": "b6f02c5a32addd8a6b03ae205617bec9472903d9755e116084376fd429d100b9",
+        "options": {
+          "num_ctx": 32768,
+          "num_predict": 8192,
+          "temperature": 0
+        },
+        "kind": "chat",
+        "max_images": 0,
+        "format": "freeform",
+        "timeout_seconds": 1800
+      }
+    ]
+  },
+  "source_proposal": {
+    "telegram-nightly-eval-20261028-v1": {
+      "enabled": false,
+      "admission_allowed": false,
+      "weight": 1
+    }
+  },
+  "policy_action": "main merges one entry only after acceptance; no replacement of existing sources",
+  "native_metadata": "required from exact local /api/show before freeze; unknown until captured"
+}
