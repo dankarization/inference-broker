@@ -21,7 +21,9 @@ from . import nightly_eval as lane
 from .profiles import NIGHTLY_PROFILE_NAMES, PROFILES
 from .storage import canonical_json_bytes, content_evidence
 
-FROZEN_SCHEMA = "telegram-nightly-frozen-v1"
+FROZEN_SCHEMA = "telegram-nightly-frozen-v2"
+LEGACY_FROZEN_SCHEMA = "telegram-nightly-frozen-v1"
+NATIVE_SCHEMA = "telegram-nightly-native-v2"
 MAX_FILE = 4 * 1024**2
 ASTRA_SCHEMA = "telegram-nightly-model-screen-fixtures-v1"
 ASTRA_MANIFEST_SHA256 = "5f8046556912ad1e7c09239717c315eb4cde39f889e1640dfb72fca6f7cad0e8"
@@ -119,26 +121,104 @@ def accepted_cases(cases_path):
     return cases, digest
 
 
+def observed_thinking(raw):
+    """Project native show metadata, never infer controls from capability/name."""
+    if not isinstance(raw, dict):
+        raise Closed('native show response must be an object')
+    capabilities = raw.get('capabilities')
+    capability = ('thinking' in capabilities if isinstance(capabilities, list)
+                  and all(isinstance(v, str) for v in capabilities) else None)
+    try:
+        metadata = lane.thinking_metadata(raw)
+    except ValueError:
+        return dict(metadata_state='unknown', thinking=None, thinking_capability=capability,
+                    unknown_reason='thinking_object_missing' if 'thinking' not in raw
+                    else 'thinking_metadata_invalid')
+    return dict(metadata_state='known', thinking=metadata, thinking_capability=capability,
+                unknown_reason=None)
+
+
+def validate_observation(item):
+    if not isinstance(item, dict) or set(item) != {
+            'model', 'digest', 'metadata_state', 'thinking', 'thinking_capability', 'unknown_reason'}:
+        raise Closed('exact versioned native observation required')
+    model = item['model']
+    if model not in lane.MODEL_DIGESTS or item['digest'] != lane.MODEL_DIGESTS[model]:
+        raise Closed('native metadata exact model/digest mismatch')
+    if item['thinking_capability'] is not None and type(item['thinking_capability']) is not bool:
+        raise Closed('invalid observed capability scalar')
+    if item['metadata_state'] == 'known':
+        metadata = lane.thinking_metadata(item)
+        if item['thinking'] != metadata or item['unknown_reason'] is not None:
+            raise Closed('known metadata must be projected exactly')
+        return metadata
+    if (item['metadata_state'] != 'unknown' or item['thinking'] is not None
+            or item['unknown_reason'] not in {'thinking_object_missing', 'thinking_metadata_invalid'}):
+        raise Closed('unknown metadata must not invent values/defaults')
+    return None
+
+
+def cell_contract(case, profile, think, metadata, schema):
+    if not lane.think_value(think):
+        raise Closed('native boolean/level proposal required')
+    label = mode_label(think)
+    cell_id = case['case_id'] + '.' + profile + '.' + label
+    supported = None if metadata is None else lane.supports(metadata, think)
+    expected = dict(cell_id=cell_id, case_id=case['case_id'], profile=profile, mode=label,
+                    think=think, supported=supported)
+    if schema == FROZEN_SCHEMA:
+        expected['status'] = ('blocked_native_metadata' if metadata is None else
+                              'supported' if supported else 'unsupported_native_mode')
+    if metadata is None:
+        # A blocked planning row is NOT a payload, idempotency key or admission.
+        expected.update(external_id=None, source_item_id=None, input_hash=None, input_bytes=None)
+        return expected, None
+    messages, digest = read_messages(case['messages_path'])
+    if digest != case['sha256']:
+        raise Closed('frozen case bytes changed')
+    metadata = lane.thinking_metadata({'thinking': metadata})
+    payload = dict(messages=messages, think=think, native_thinking=metadata,
+                   options=dict(lane.OPTIONS), truncate=False, shift=False)
+    if supported:
+        payload = lane.normalize_request(payload, profile)
+    input_hash, input_bytes = content_evidence(payload)
+    identity = dict(schema=schema, source=lane.SOURCE, cell_id=cell_id,
+                    input_hash=input_hash, profile=profile, native=metadata)
+    expected.update(external_id='tn-v1-' + sha(encode(identity)), input_hash=input_hash,
+                    input_bytes=input_bytes, source_item_id='tn-v1-' + case['case_id'])
+    return expected, dict(source=lane.SOURCE, profile=profile, kind='chat', payload=payload,
+                         external_id=expected['external_id'], source_item_id=expected['source_item_id'])
+
+
 def freeze_plan(cases_path, matrix_path, native_path):
     frozen_cases, cases_hash = accepted_cases(cases_path)
     matrix, matrix_hash = read_json(matrix_path)
     native, native_hash = read_json(native_path)
-    if (not isinstance(matrix, dict) or matrix.get('schema') != 'telegram-nightly-matrix-v1'
+    if (not isinstance(matrix, dict) or matrix.get('schema') not in {
+            'telegram-nightly-matrix-v1', 'telegram-nightly-matrix-v2'}
             or matrix.get('source') != lane.SOURCE):
         raise Closed('accepted dedicated source matrix schema required')
     models = matrix.get('models')
     if (not isinstance(models, list) or len(models) != 4
             or {m.get('profile') for m in models if isinstance(m, dict)} != NIGHTLY_PROFILE_NAMES):
         raise Closed('exactly four independent cases and four dedicated profiles required')
-    if (not isinstance(native, dict) or native.get('schema') != 'telegram-nightly-native-v1'
+    if (not isinstance(native, dict) or native.get('schema') not in {
+            'telegram-nightly-native-v1', NATIVE_SCHEMA}
             or not isinstance(native.get('models'), list) or len(native['models']) != 4):
         raise Closed('main-approved native metadata for four models required')
-    metadata = {}
+    metadata, observations = {}, {}
     for item in native['models']:
         model = item.get('model') if isinstance(item, dict) else None
         if model not in lane.MODEL_DIGESTS or item.get('digest') != lane.MODEL_DIGESTS[model] or model in metadata:
             raise Closed('native metadata exact model/digest mismatch')
-        metadata[model] = lane.thinking_metadata(item)
+        if native['schema'] == NATIVE_SCHEMA:
+            metadata[model] = validate_observation(item)
+            observations[model] = item
+        else:
+            # Legacy v1 meant fully known controls; missing/invalid stays fatal.
+            metadata[model] = lane.thinking_metadata(item)
+            observations[model] = dict(model=model, digest=item['digest'],
+                metadata_state='known', thinking=metadata[model], thinking_capability=None, unknown_reason=None)
     cells = []
     for item in models:
         profile = item['profile']
@@ -146,57 +226,66 @@ def freeze_plan(cases_path, matrix_path, native_path):
         modes = item.get('modes')
         if not isinstance(modes, list) or len(modes) != 2:
             raise Closed('exactly two explicit modes per model required')
-        if not any(isinstance(mode, dict) and lane.supports(metadata[model], mode.get('think')) for mode in modes):
-            raise Closed('at least one genuinely supported mode per model required')
+        if metadata[model] is None:
+            if matrix['schema'] != 'telegram-nightly-matrix-v2':
+                raise Closed('unknown controls require explicit v2 planning rows')
+        elif not any(isinstance(mode, dict) and lane.supports(metadata[model], mode.get('think')) for mode in modes):
+            raise Closed('at least one genuinely supported mode per known model required')
         labels = set()
         for mode in modes:
             think = mode.get('think') if isinstance(mode, dict) else None
             if not lane.think_value(think) or mode.get('label') != mode_label(think):
                 raise Closed('native labels must be off/on/level-N; low is never off')
-            label = mode['label']
-            if label in labels:
+            if mode['label'] in labels:
                 raise Closed('duplicate mode')
-            labels.add(label)
-            supported = lane.supports(metadata[model], think)
-            if type(mode.get('supported')) is not bool or mode['supported'] is not supported:
-                raise Closed('mode support must match accepted native metadata exactly')
+            labels.add(mode['label'])
+            supported = None if metadata[model] is None else lane.supports(metadata[model], think)
+            if 'supported' not in mode or not lane.same_value(mode['supported'], supported):
+                raise Closed('support must match native metadata: null means unknown, not unsupported')
             for case in frozen_cases:
-                messages, _ = read_messages(case['messages_path'])
-                # Unsupported off cells remain explicit but never get a payload/POST.
-                if supported:
-                    payload = lane.normalize_request(dict(messages=messages, think=think,
-                        native_thinking=metadata[model]), profile)
-                else:
-                    payload = dict(messages=messages, think=think, native_thinking=metadata[model],
-                                   options=dict(lane.OPTIONS), truncate=False, shift=False)
-                input_hash, input_bytes = content_evidence(payload)
-                cell_id = case['case_id'] + '.' + profile + '.' + label
-                identity = dict(schema=FROZEN_SCHEMA, source=lane.SOURCE, cell_id=cell_id,
-                                input_hash=input_hash, profile=profile, native=metadata[model])
-                key = 'tn-v1-' + sha(encode(identity))
-                cells.append(dict(cell_id=cell_id, case_id=case['case_id'], profile=profile,
-                    mode=label, think=think, supported=supported, external_id=key,
-                    source_item_id='tn-v1-' + case['case_id'], input_hash=input_hash, input_bytes=input_bytes))
+                cell, _ = cell_contract(case, profile, think, metadata[model], FROZEN_SCHEMA)
+                cells.append(cell)
     if len(cells) != lane.MAX_CALLS:
         raise Closed('bounded 4x2x4 plan required')
     return dict(schema=FROZEN_SCHEMA, contract=lane.contract(), cases_sha256=cases_hash,
                 cases_manifest_path=str(Path(cases_path).resolve()),
                 matrix_sha256=matrix_hash, native_sha256=native_hash, native=metadata,
-                cases=frozen_cases, cells=cells)
+                native_observations=observations, cases=frozen_cases, cells=cells)
+
+
+def validate_cell(frozen, cell):
+    case = next((c for c in frozen['cases'] if c['case_id'] == cell['case_id']), None)
+    if case is None or cell['profile'] not in NIGHTLY_PROFILE_NAMES:
+        raise Closed('frozen case/profile missing')
+    model = PROFILES[cell['profile']].model
+    expected, request = cell_contract(case, cell['profile'], cell['think'],
+                                      frozen['native'][model], frozen['schema'])
+    if any(k not in cell or not lane.same_value(cell[k], v) for k, v in expected.items()):
+        raise Closed('frozen payload/identity/support changed')
+    return request
 
 
 def load_frozen(path):
     frozen, digest = read_json(path)
-    if (not isinstance(frozen, dict) or frozen.get('schema') != FROZEN_SCHEMA
+    if (not isinstance(frozen, dict) or frozen.get('schema') not in {FROZEN_SCHEMA, LEGACY_FROZEN_SCHEMA}
             or frozen.get('contract') != lane.contract() or len(frozen.get('cells', [])) != 32
             or len(frozen.get('cases', [])) != 4):
         raise Closed('frozen schema/local contract mismatch')
     cases, cases_hash = accepted_cases(frozen['cases_manifest_path'])
     if cases != frozen['cases'] or cases_hash != frozen['cases_sha256']:
         raise Closed('frozen cases differ from exact accepted Astra fixture root')
-    # An edited frozen file must still be exactly four models x two modes x four cases.
     if not isinstance(frozen.get('native'), dict) or set(frozen['native']) != set(lane.MODEL_DIGESTS):
         raise Closed('frozen native models changed')
+    if frozen['schema'] == FROZEN_SCHEMA:
+        observations = frozen.get('native_observations')
+        if not isinstance(observations, dict) or set(observations) != set(lane.MODEL_DIGESTS):
+            raise Closed('frozen native observations changed')
+        for model, item in observations.items():
+            if item.get('model') != model or validate_observation(item) != frozen['native'][model]:
+                raise Closed('frozen known/unknown observation changed')
+    else:
+        for item in frozen['native'].values():
+            lane.thinking_metadata({'thinking': item})
     case_ids = {c['case_id'] for c in cases}
     for profile in NIGHTLY_PROFILE_NAMES:
         cells = [c for c in frozen['cells'] if c['profile'] == profile]
@@ -204,39 +293,22 @@ def load_frozen(path):
         if len(cells) != 8 or len(modes) != 2 or any(
                 {c['case_id'] for c in cells if c['mode'] == mode} != case_ids for mode in modes):
             raise Closed('frozen 4x2x4 matrix changed')
-    # Recheck payloads, keys and modes instead of trusting editable cell metadata.
     seen = set()
     for cell in frozen['cells']:
-        if (cell['cell_id'] in seen or cell['profile'] not in NIGHTLY_PROFILE_NAMES
-                or cell['cell_id'] != cell['case_id'] + '.' + cell['profile'] + '.' + cell['mode']):
+        if cell['cell_id'] in seen:
             raise Closed('frozen cell identity mismatch')
         seen.add(cell['cell_id'])
-        request_for(frozen, cell)
+        validate_cell(frozen, cell)
     return frozen, digest
 
 
 def request_for(frozen, cell):
-    case = next((c for c in frozen['cases'] if c['case_id'] == cell['case_id']), None)
-    if case is None:
-        raise Closed('frozen case missing')
-    messages, digest = read_messages(case['messages_path'])
-    if digest != case['sha256']:
-        raise Closed('frozen case bytes changed')
-    model = PROFILES[cell['profile']].model
-    payload = dict(messages=messages, think=cell['think'], native_thinking=frozen['native'][model],
-                   options=dict(lane.OPTIONS), truncate=False, shift=False)
-    if cell['supported']:
-        payload = lane.normalize_request(payload, cell['profile'])
-    metadata = lane.thinking_metadata({'thinking': frozen['native'][model]})
-    identity = dict(schema=FROZEN_SCHEMA, source=lane.SOURCE, cell_id=cell['cell_id'],
-                    input_hash=content_evidence(payload)[0], profile=cell['profile'], native=metadata)
-    expected = dict(external_id='tn-v1-' + sha(encode(identity)), input_hash=content_evidence(payload)[0],
-                    input_bytes=content_evidence(payload)[1], mode=mode_label(cell['think']),
-                    supported=lane.supports(metadata, cell['think']), source_item_id='tn-v1-' + case['case_id'])
-    if digest != case['sha256'] or any(not lane.same_value(cell[k], v) for k, v in expected.items()):
-        raise Closed('frozen payload/identity/support changed')
-    return dict(source=lane.SOURCE, profile=cell['profile'], kind='chat', payload=payload,
-                external_id=cell['external_id'], source_item_id=cell['source_item_id'])
+    request = validate_cell(frozen, cell)
+    if request is None:
+        raise Closed('blocked_native_metadata: no payload or POST')
+    if cell['supported'] is not True:
+        raise Closed('native mode unsupported: no request or POST')
+    return request
 
 
 class NoRedirect(HTTPRedirectHandler):
@@ -363,8 +435,6 @@ def identity(raw, cell):
 
 
 def admit(frozen, cell, journal, transport):
-    if not cell['supported']:
-        raise Closed('native mode unsupported: no POST')
     request = request_for(frozen, cell)
     if journal.row(cell) is not None:
         raise Closed('cell already has durable intent; GET reconcile/collect only')
@@ -458,9 +528,11 @@ def main(argv=None):
             if args.command == 'freeze':
                 new_json(args.out, frozen)
             print(json.dumps(dict(planned_cells=len(frozen['cells']),
-                supported_cells=sum(c['supported'] for c in frozen['cells']), max_posts=32,
-                unsupported_modes=sorted({c['profile'] + ':' + c['mode'] for c in frozen['cells'] if not c['supported']}),
-                off_unsupported_models=sorted(m for m, v in frozen['native'].items() if not lane.supports(v, False)))))
+                supported_cells=sum(c['supported'] is True for c in frozen['cells']), max_posts=32,
+                blocked_native_metadata_cells=sum(c.get('status') == 'blocked_native_metadata' for c in frozen['cells']),
+                unsupported_modes=sorted({c['profile'] + ':' + c['mode'] for c in frozen['cells'] if c['supported'] is False}),
+                off_unsupported_models=sorted(m for m, v in frozen['native'].items() if v is not None and not lane.supports(v, False)),
+                unknown_native_models=sorted(m for m, v in frozen['native'].items() if v is None))))
             return 0
         frozen, digest = load_frozen(args.frozen)
         cells = [c for c in frozen['cells'] if c['cell_id'] == args.cell]
@@ -468,8 +540,6 @@ def main(argv=None):
             raise Closed('one exact recorded cell required')
         cell = cells[0]
         if args.command == 'request':
-            if not cell['supported']:
-                raise Closed('unsupported mode: no request')
             new_json(args.out, request_for(frozen, cell))
             print(json.dumps(dict(cell_id=cell['cell_id'], input_hash=cell['input_hash'])))
             return 0

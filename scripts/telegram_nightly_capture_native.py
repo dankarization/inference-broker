@@ -2,16 +2,17 @@
 """Main-only metadata capture: GET tags/version + 4 POST show; NEVER load/infer.
 
 Not executed by source preparation. No templates, raw responses or credentials
-are retained. Unknown native thinking metadata blocks freeze rather than guessing.
+are retained. Unknown native thinking metadata is recorded explicitly, never guessed.
 """
 import argparse
 import json
 import os
 import re
 import sys
+from pathlib import Path
 from urllib.request import Request, build_opener, ProxyHandler
-from broker.nightly_client import NoRedirect, new_json, Closed
-from broker.nightly_eval import MODEL_DIGESTS, thinking_metadata
+from broker.nightly_client import NoRedirect, new_json, Closed, NATIVE_SCHEMA, observed_thinking
+from broker.nightly_eval import MODEL_DIGESTS
 
 BASE = 'http://192.168.2.5:11434'
 
@@ -34,8 +35,8 @@ def capture(request):
     result = []
     for model, digest in seen.items():
         raw = request('/api/show', {'model': model})
-        result.append(dict(model=model, digest=digest, thinking=thinking_metadata(raw)))
-    return dict(schema='telegram-nightly-native-v1', ollama_version=version, models=result)
+        result.append(dict(model=model, digest=digest, **observed_thinking(raw)))
+    return dict(schema=NATIVE_SCHEMA, ollama_version=version, models=result)
 
 
 def main(argv=None):
@@ -53,9 +54,13 @@ def main(argv=None):
         return json.loads(raw)
     os.umask(0o077)
     try:
+        destination = Path(args.out)
+        if destination.exists() or destination.is_symlink() or not destination.parent.is_dir():
+            raise Closed('exclusive output in an existing directory required')
         result = capture(request)
         new_json(args.out, result)
-        print('captured native controls for four exact installed models; no inference')
+        print(json.dumps(dict(models=4, known=sum(r['metadata_state'] == 'known' for r in result['models']),
+                              unknown=sum(r['metadata_state'] == 'unknown' for r in result['models']), inference=0)))
         return 0
     except Exception:
         print('native metadata capture blocked; no raw response/error retained', file=sys.stderr)

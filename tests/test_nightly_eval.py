@@ -516,6 +516,190 @@ class NightlyTests(unittest.TestCase):
         self.assertNotIn(SECRET, json.dumps(result))
         self.assertEqual({p for p, _ in calls}, {'/api/tags', '/api/version', '/api/show'})
 
+    def partial_plan(self):
+        self.frozen()
+        native = json.loads((self.root/'native.json').read_text())
+        native['schema'] = client.NATIVE_SCHEMA
+        for row in native['models']:
+            raw = dict(thinking=BOOL, capabilities=['thinking'])
+            if row['model'] == PROFILES[P].model:
+                raw = dict(capabilities=['thinking'], template=SECRET)
+            row.update(client.observed_thinking(raw))
+        (self.root/'native.json').write_text(json.dumps(native))
+        matrix = json.loads((self.root/'matrix.json').read_text())
+        matrix['schema'] = 'telegram-nightly-matrix-v2'
+        for row in matrix['models']:
+            if row['profile'] == P:
+                for mode in row['modes']:
+                    mode['supported'] = None
+        (self.root/'matrix.json').write_text(json.dumps(matrix))
+        plan = freeze_plan(self.root/'cases.json', self.root/'matrix.json', self.root/'native.json')
+        new_json(self.root/'partial-frozen.json', plan)
+        return load_frozen(self.root/'partial-frozen.json')
+
+    def test_partial_native_32_planned_24_requests_8_blocked_and_no_qwen_post(self):
+        plan, digest = self.partial_plan()
+        supported = [c for c in plan['cells'] if c['supported'] is True]
+        blocked = [c for c in plan['cells'] if c['status'] == 'blocked_native_metadata']
+        self.assertEqual((len(plan['cells']), len(supported), len(blocked)), (32, 24, 8))
+        self.assertEqual({c['profile'] for c in blocked}, {P})
+        self.assertEqual({request_for(plan, c)['profile'] for c in supported}, set(NIGHTLY_PROFILE_NAMES)-{P})
+        transport = Transport('http://127.0.0.1:1')
+        journal = self.journal(digest, transport)
+        with patch.object(transport, 'request') as request:
+            for cell in blocked:
+                self.assertIsNone(cell['supported'])  # not a claim of unsupported off/on
+                for key in ('external_id', 'source_item_id', 'input_hash', 'input_bytes'):
+                    self.assertIsNone(cell[key])
+                with self.assertRaisesRegex(Closed, 'blocked_native_metadata'):
+                    request_for(plan, cell)
+                with self.assertRaisesRegex(Closed, 'blocked_native_metadata'):
+                    admit(plan, cell, journal, transport)
+                self.assertIsNone(journal.row(cell))
+            request.assert_not_called()
+        self.assertEqual(journal.db.execute('SELECT count(*) FROM cells').fetchone()[0], 0)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), patch('socket.socket') as network:
+            self.assertEqual(main(['dry-run', '--cases', str(self.root/'cases.json'),
+                '--matrix', str(self.root/'matrix.json'), '--native', str(self.root/'native.json')]), 0)
+            self.assertEqual(main(['request', '--frozen', str(self.root/'partial-frozen.json'),
+                '--cell', blocked[0]['cell_id'], '--out', str(self.root/'must-not-exist.json')]), 2)
+            network.assert_not_called()
+        summary = json.loads(out.getvalue())
+        self.assertEqual((summary['supported_cells'], summary['blocked_native_metadata_cells']), (24, 8))
+        self.assertEqual(summary['unknown_native_models'], [PROFILES[P].model])
+        self.assertEqual(summary['off_unsupported_models'], [])
+        self.assertEqual(summary['unsupported_modes'], [])
+        self.assertFalse((self.root/'must-not-exist.json').exists())
+
+    def test_partial_native_tampering_unknown_is_not_false_and_observation_drift_rejected(self):
+        plan, _ = self.partial_plan()
+        index = next(i for i, c in enumerate(plan['cells']) if c['profile'] == P)
+        changes = [dict(supported=True), dict(supported=False), dict(status='supported'),
+                   dict(status='unsupported_native_mode'), dict(external_id='invented'), dict(input_hash='invented')]
+        for i, change in enumerate(changes):
+            altered = copy.deepcopy(plan)
+            altered['cells'][index].update(change)
+            path = self.root/('tampered-'+str(i)+'.json')
+            new_json(path, altered)
+            with self.assertRaises(Closed):
+                load_frozen(path)
+        altered = copy.deepcopy(plan)
+        altered['native_observations'][PROFILES[P].model]['thinking'] = BOOL
+        new_json(self.root/'invented-controls.json', altered)
+        with self.assertRaises(Closed):
+            load_frozen(self.root/'invented-controls.json')
+        matrix = json.loads((self.root/'matrix.json').read_text())
+        qwen = next(r for r in matrix['models'] if r['profile'] == P)
+        qwen['modes'][0]['supported'] = False
+        (self.root/'matrix.json').write_text(json.dumps(matrix))
+        with self.assertRaisesRegex(Closed, 'null means unknown'):
+            freeze_plan(self.root/'cases.json', self.root/'matrix.json', self.root/'native.json')
+        unknown = client.observed_thinking(dict(capabilities=['thinking'], thinking=dict(values=[SECRET], default=SECRET)))
+        self.assertEqual(unknown['unknown_reason'], 'thinking_metadata_invalid')
+        self.assertIsNone(unknown['thinking'])
+        self.assertNotIn(SECRET, json.dumps(unknown))
+
+    def test_partial_native_known_models_admit_collect_and_broker_qwen_still_fails_closed(self):
+        plan, digest = self.partial_plan()
+        transport = self.client()
+        journal = self.journal(digest, transport)
+        original = transport.request
+        posts = []
+        def record(path, body=None):
+            if body is not None:
+                posts.append(body['profile'])
+            return original(path, body)
+        with patch.object(transport, 'request', side_effect=record):
+            for profile in sorted(NIGHTLY_PROFILE_NAMES-{P}):
+                cell = next(c for c in plan['cells'] if c['profile'] == profile)
+                receipt = admit(plan, cell, journal, transport)
+                self.run_job()
+                final = collect(plan, cell, journal, transport)
+                self.assertEqual((final['id'], final['state']), (receipt['job_id'], 'completed'))
+                self.assertEqual(final['execution_evidence']['runtime_context_length'], 32768)
+                self.assertEqual(final['execution_evidence']['request_options'], lane.OPTIONS)
+        self.assertEqual(set(posts), set(NIGHTLY_PROFILE_NAMES)-{P})
+        self.assertEqual(len(posts), 3)
+        self.assertNotIn(SECRET, '\n'.join(journal.db.iterdump()))
+        # A producer bypassing the helper still cannot turn capability into controls.
+        self.gpu.metadata = None
+        job = self.submit('direct-known-claim')
+        self.run_job()
+        self.assertEqual(self.broker.status(job['id'])['state'], 'failed')
+        self.assertEqual(len(self.gpu.requests), 3)  # no Qwen fake-inference call
+        self.assertNotIn(SECRET, '\n'.join(self.broker.db.iterdump()))
+
+    def test_partial_native_capture_saves_known_unknown_in_existing_directory_exclusively(self):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location('capture_partial_test',
+            Path(__file__).resolve().parents[1]/'scripts/telegram_nightly_capture_native.py')
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        directory = self.root/'existing-main-owned-directory'
+        directory.mkdir(mode=0o700)
+        marker = directory/'unrelated-state'
+        marker.write_bytes(b'unchanged')
+        calls = []
+        def metadata(path, body=None):
+            calls.append((path, body))
+            if path == '/api/tags':
+                return dict(models=[dict(name=m, digest=d) for m,d in lane.MODEL_DIGESTS.items()])
+            if path == '/api/version':
+                return dict(version='0.40.11')
+            self.assertEqual(path, '/api/show')
+            if body['model'] == PROFILES[P].model:
+                return dict(capabilities=['thinking'], template=SECRET, modelfile=SECRET)
+            return dict(thinking=BOOL, capabilities=['thinking'], template=SECRET)
+        class Opener:
+            def open(self, req, timeout):
+                body = json.loads(req.data) if req.data is not None else None
+                return io.BytesIO(json.dumps(metadata(req.full_url.removeprefix(module.BASE), body)).encode())
+        output = directory/'native-v2.json'
+        with patch.object(module, 'build_opener', return_value=Opener()), contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(module.main(['--out', str(output)]), 0)
+        raw = output.read_bytes()
+        native = json.loads(raw)
+        self.assertEqual(native['schema'], client.NATIVE_SCHEMA)
+        self.assertEqual(sum(r['metadata_state']=='known' for r in native['models']), 3)
+        unknown = next(r for r in native['models'] if r['metadata_state']=='unknown')
+        self.assertEqual(unknown['model'], PROFILES[P].model)
+        self.assertEqual(unknown['unknown_reason'], 'thinking_object_missing')
+        self.assertIs(unknown['thinking_capability'], True)
+        self.assertIsNone(unknown['thinking'])
+        self.assertNotIn(SECRET.encode(), raw)
+        self.assertEqual(marker.read_bytes(), b'unchanged')
+        self.assertEqual(len(calls), 6)
+        self.assertEqual(sum(body is not None for _,body in calls), 4)
+        with patch.object(module, 'build_opener') as opener:
+            self.assertEqual(module.main(['--out', str(output)]), 2)
+            opener.return_value.open.assert_not_called()
+        self.assertEqual(output.read_bytes(), raw)
+
+    def test_legacy_known_frozen_v1_keys_and_journal_binding_preserved(self):
+        plan, _ = self.frozen()
+        plan['schema'] = client.LEGACY_FROZEN_SCHEMA
+        plan.pop('native_observations')
+        plan['cells'] = [client.cell_contract(next(c for c in plan['cases'] if c['case_id']==cell['case_id']),
+            cell['profile'], cell['think'], plan['native'][PROFILES[cell['profile']].model],
+            client.LEGACY_FROZEN_SCHEMA)[0] for cell in plan['cells']]
+        new_json(self.root/'legacy-frozen.json', plan)
+        legacy, digest = load_frozen(self.root/'legacy-frozen.json')
+        cell = legacy['cells'][0]
+        request = request_for(legacy, cell)
+        expected_identity = dict(schema='telegram-nightly-frozen-v1', source=lane.SOURCE,
+            cell_id=cell['cell_id'], input_hash=cell['input_hash'], profile=cell['profile'],
+            native=legacy['native'][PROFILES[cell['profile']].model])
+        self.assertEqual(request['external_id'], 'tn-v1-'+client.sha(client.encode(expected_identity)))
+        transport = self.client()
+        journal = self.journal(digest, transport)
+        receipt = admit(legacy, cell, journal, transport)
+        self.assertEqual(journal.row(cell)['job_id'], receipt['job_id'])
+        with self.assertRaises(Closed):
+            Journal(self.root/'private'/'journal.sqlite3', 'new-v2-frozen-hash', transport.base)
+        with self.assertRaises(Closed):
+            admit(legacy, cell, journal, transport)
+
     def test_transport_has_no_redirect_retry_or_secret_error_body(self):
         from urllib.error import HTTPError
         transport = Transport('http://127.0.0.1:1', token='SYNTHETIC_AUTH')

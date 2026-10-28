@@ -71,7 +71,7 @@
     }
   },
   "policy_action": "main merges one entry only after acceptance; no replacement of existing sources",
-  "native_metadata": "required from exact local /api/show before freeze; unknown until captured",
+  "native_metadata": "native-v2 preserves known/unknown per exact model; unknown blocks only its rows; capability never substitutes values/default",
   "input_proposal": {
     "manifest_sha256": "5f8046556912ad1e7c09239717c315eb4cde39f889e1640dfb72fca6f7cad0e8",
     "model_facing_only": [
@@ -84,5 +84,21 @@
     "dereference_urls": false,
     "read_references_rubric_proofs": false,
     "generation_budget": "8192 total native generation tokens including thinking; final token count unknown unless backend reports it"
+  },
+  "runner_proposal": {
+    "native_schema": "telegram-nightly-native-v2",
+    "frozen_schema": "telegram-nightly-frozen-v2",
+    "partial_matrix_schema": "telegram-nightly-matrix-v2",
+    "unknown_status": "blocked_native_metadata",
+    "unknown_supported": null,
+    "unknown_payload_hash": null,
+    "unknown_external_id": null,
+    "legacy_known_frozen_v1_readable": true,
+    "main_observed_plan": {
+      "planned": 32,
+      "supported": 24,
+      "blocked_native_metadata": 8
+    },
+    "journal_rebinding": false
   }
 }

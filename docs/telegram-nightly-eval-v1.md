@@ -1,4 +1,4 @@
-# Telegram nightly text evaluation v1 (prepare-only)
+# Telegram nightly text evaluation — source v1 / partial metadata v2 (prepare-only)
 
 ## Ownership and immutable scope
 
@@ -45,11 +45,14 @@ Do not delete/reset its journal or create parallel journals to evade this rule.
 Observed GET-only tags are pinned in `broker.nightly_eval.MODEL_DIGESTS`.
 Do not infer thinking controls from model names, OpenClaw's permissive enum,
 a library's latest artifact or documentation alone. Native `/api/show` metadata
-must be collected by main for **these exact local artifacts** and accepted before
-freezing the matrix. `/api/show` is a read-only metadata operation but uses POST;
+must be collected by main for **these exact local artifacts** and accepted.
+A v2 freeze retains unknown models as blocked planning rows; only known controls
+can produce requests. `/api/show` is a read-only metadata operation but uses POST;
 this source-only task made no such POST. GET `/api/show?...` returned 405 on
-Ollama 0.40.11. Consequently this patch does **not** claim an observed on/off
-support table. Missing native metadata is a real pre-comparison gate.
+Ollama 0.40.11. Main subsequently observed boolean false/true controls for
+Gemma12, Gemma26 and Nano, but no thinking object for QwenAD despite a thinking
+capability. Capability is not a values/default contract. Missing metadata blocks
+only that model, not the other 24 known cells. No Qwen controls are invented.
 
 Official contracts: <https://docs.ollama.com/capabilities/thinking>,
 <https://docs.ollama.com/api/show>. `thinking.values` and `thinking.default` are
@@ -61,7 +64,8 @@ unsupported-off slot (which is never submitted) and one supported level. A matri
 with fewer than 32 supported cells is reported honestly, not padded/retried.
 
 Main may use `runner/capture-native.py` **once under its own metadata authority**
-to capture only model/digest/thinking metadata, tags/version GETs plus four
+to capture only model/digest and projected known/unknown thinking metadata,
+tags/version GETs plus four
 `/api/show` metadata POSTs. It never calls chat/generate/load/unload. Read the
 output, then select modes; do not assume the example below fits actual artifacts.
 Main's command (not run here):
@@ -107,19 +111,33 @@ export CASES='/media/dankar/Plex/for claw/telegram-nightly-model-evaluation-2026
 python3 "$RUNNER" verify-cases --cases "$CASES"
 ```
 
-`native.json` (four exact models; actual values only):
+`native-v2.json` contains all four exact model/digest records. Capture projects
+known records as `metadata_state:known` with exact values/default, and unknown
+records as `metadata_state:unknown, thinking:null` plus a fixed reason
+`thinking_object_missing` or `thinking_metadata_invalid`. Observed
+`thinking_capability` is a boolean or null; it never grants native mode support.
+Raw templates/modelfile/invalid values/errors are never saved. Unknown is not
+unsupported and does not borrow controls from another model.
 
 ```json
-{"schema":"telegram-nightly-native-v1","models":[
-  {"model":"EXACT_TAG","digest":"UNPREFIXED_TAG_DIGEST","thinking":{"values":[false,true],"default":true}}
+{"schema":"telegram-nightly-native-v2","models":[
+  {"model":"EXACT_TAG","digest":"UNPREFIXED_TAG_DIGEST","metadata_state":"known","thinking":{"values":[false,true],"default":true},"thinking_capability":true,"unknown_reason":null},
+  {"model":"QWEN_EXACT_TAG","digest":"QWEN_UNPREFIXED_DIGEST","metadata_state":"unknown","thinking":null,"thinking_capability":true,"unknown_reason":"thinking_object_missing"}
 ]}
 ```
 
-`matrix.json`: exactly four entries with the four new profile names. Each has
+These are record-shape examples, not a two-model input or guessed defaults.
+The native-v1 format remains accepted for fully known records only. Capture
+uses exclusive output in an existing directory, so an already-existing main-run
+folder is safe and an existing file/symlink is never replaced or read as auth.
+Transport/tag/digest failures still abort capture without an output; a valid
+show object lacking controls does not discard other models' metadata.
+
+`matrix-v2.json`: exactly four entries with the four new profile names. Each has
 exactly two modes. Boolean example **only if native metadata supports both**:
 
 ```json
-{"schema":"telegram-nightly-matrix-v1","source":"telegram-nightly-eval-20261028-v1","models":[
+{"schema":"telegram-nightly-matrix-v2","source":"telegram-nightly-eval-20261028-v1","models":[
  {"profile":"telegram-nightly-qwen38-v1","modes":[
   {"label":"off","think":false,"supported":true},
   {"label":"on","think":true,"supported":true}
@@ -129,7 +147,27 @@ exactly two modes. Boolean example **only if native metadata supports both**:
 
 A named mode uses e.g. `{"label":"level-low","think":"low","supported":true}`.
 An unsupported off slot is `{"label":"off","think":false,"supported":false}`.
-Support flags must exactly match the accepted native metadata or freeze fails.
+Known support flags must exactly match accepted native metadata or freeze fails.
+For a model with unknown metadata, both proposed mode slots use `supported:null`,
+not false, with ordinary proposal labels (off/on are proposals, not support claims):
+
+```json
+{"profile":"telegram-nightly-qwen38-v1","modes":[
+ {"label":"off","think":false,"supported":null},
+ {"label":"on","think":true,"supported":null}
+]}
+```
+
+Unknown models require matrix-v2; legacy matrix-v1 remains valid for fully known
+inputs only. A new freeze emits `telegram-nightly-frozen-v2`, with known/unknown
+observations, `supported:true/false/null` and statuses `supported`,
+`unsupported_native_mode` or `blocked_native_metadata`. Unknown rows have null
+payload hash/bytes/external key/item ID, never an executable request. With main's
+observations the result is **32 planned / 24 supported / 8 blocked**, not 8
+unsupported Qwen rows. Neither off_unsupported_models nor unsupported_modes
+includes the unknown model. Request/admit/reconcile/collect reject those rows
+before any HTTP call or journal intent. Broker dispatch still independently
+requires actual native controls and fails closed before load/run.
 There are exactly 4 models x 2 modes x 4 cases = 32 planned cells, never more.
 Model outputs never change the accepted plan or reviewer ground truth.
 
@@ -191,7 +229,12 @@ A new invocation is required for every status check and admission.
 
 `collect --out` creates a private allowlisted JSON artifact after durable journal
 storage; stdout prints only ID/state, never final text. The journal is bound to
-one frozen hash + broker endpoint. No content from HTTP errors/native thinking/
+one frozen hash + broker endpoint. Legacy frozen-v1 known plans retain their
+original keys and remain readable; do not rewrite them as v2 or reset/rebind a
+journal. A new v2 frozen hash cannot reuse an old journal. This correction does
+not create a new source, expand the source lifetime cap or authorize make-up
+calls. Main's current source-only preparation had no frozen admission journal;
+any future unknown-to-known change needs main review, not automatic replacement. No content from HTTP errors/native thinking/
 reasoning fields is persisted or printed, including nested malformed metadata.
 Broker storage itself is final-only for the new lane, not merely CLI filtering.
 Inline reasoning channel markers in purported final content fail closed.
