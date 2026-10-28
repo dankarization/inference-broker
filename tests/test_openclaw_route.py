@@ -430,6 +430,13 @@ class NativeWaitBudgetTests(unittest.TestCase):
             elif name == "openclaw-bolt-e4b":
                 self.assertEqual(profile.request_timeout_seconds, 1800)
                 self.assertEqual(openclaw_wait_seconds(profile), 2100)
+            elif name in {
+                "telegram-nightly-qwen38-v1", "telegram-nightly-gemma12-v1",
+                "telegram-nightly-gemma26-v1", "telegram-nightly-nemotron-nano-v1",
+            }:
+                # Additive async-only profiles, not new OpenClaw model routes.
+                self.assertEqual(profile.request_timeout_seconds, 1800)
+                self.assertEqual(openclaw_wait_seconds(profile), 2100)
             else:
                 self.assertEqual(openclaw_wait_seconds(profile), 1800)
 

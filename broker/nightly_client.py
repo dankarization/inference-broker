@@ -23,6 +23,14 @@ from .storage import canonical_json_bytes, content_evidence
 
 FROZEN_SCHEMA = "telegram-nightly-frozen-v1"
 MAX_FILE = 4 * 1024**2
+ASTRA_SCHEMA = "telegram-nightly-model-screen-fixtures-v1"
+ASTRA_MANIFEST_SHA256 = "5f8046556912ad1e7c09239717c315eb4cde39f889e1640dfb72fca6f7cad0e8"
+CASE_INPUTS = {
+    "case-01-porta": "782f3b71d0b8acb34f692efa61e6cd11e2fa3754594fea848a140f27c66d1574",
+    "case-02-kp": "61d0fd1bece24bbc88d3a0cbe9f59d28fb9a40b0f336b7015c7913496b3c144e",
+    "case-03-pm": "63a4c5e22f3971f93b3ed80c6d209fac9e4d699bc086cd8dd2ec537c4df81d87",
+    "case-04-s92": "f8fca9dcc93da68802bc9528aa7b310600b5a8641475cc270387704b3c6b040c",
+}
 
 
 class Closed(RuntimeError):
@@ -65,28 +73,61 @@ def new_json(path, value):
         os.close(descriptor)
 
 
-def identifier(value):
-    if not isinstance(value, str) or re.fullmatch(r'[A-Za-z0-9_.-]{1,64}', value) is None:
-        raise Closed('case/mode identity must be a bounded ASCII identifier')
-    return value
-
-
 def mode_label(think):
     return 'on' if think is True else 'off' if think is False else 'level-' + str(think)
 
 
+def read_messages(path):
+    raw, digest = read_json(path)
+    if not isinstance(raw, dict) or set(raw) != {'messages'}:
+        raise Closed('exact messages.json object required; no extra model-facing fields')
+    lane.validate_messages(raw['messages'])
+    return raw['messages'], digest
+
+
+def accepted_cases(cases_path):
+    """Read only manifest + four text messages files; never follow embedded URLs.
+
+    Do not open source documents, references, rubric, attachments or proof paths
+    from the manifest. Main/reviewer owns all those bytes, not this runner.
+    """
+    manifest_path = Path(cases_path).resolve()
+    manifest, digest = read_json(manifest_path)
+    if (digest != ASTRA_MANIFEST_SHA256 or not isinstance(manifest, dict)
+            or manifest.get('schema') != ASTRA_SCHEMA or manifest.get('case_count') != 4):
+        raise Closed('exact accepted Astra manifest required')
+    rows = manifest.get('cases')
+    if not isinstance(rows, list) or len(rows) != 4:
+        raise Closed('exact four accepted Astra cases required')
+    cases = []
+    seen = set()
+    for row in rows:
+        case = row.get('case_id') if isinstance(row, dict) else None
+        if case not in CASE_INPUTS or case in seen:
+            raise Closed('unexpected/duplicate Astra case')
+        seen.add(case)
+        relative = case + '/messages.json'
+        if row.get('runner_input') != relative or row.get('runner_input_sha256') != CASE_INPUTS[case]:
+            raise Closed('only pinned case-*/messages.json is model-facing')
+        path = manifest_path.parent / relative
+        if path.is_symlink() or path.parent.is_symlink() or path.resolve() != path:
+            raise Closed('model-facing input must remain inside accepted fixture root')
+        messages, message_hash = read_messages(path)
+        if message_hash != CASE_INPUTS[case]:
+            raise Closed('accepted case bytes changed')
+        cases.append(dict(case_id=case, messages_path=str(path), sha256=message_hash))
+    return cases, digest
+
+
 def freeze_plan(cases_path, matrix_path, native_path):
-    cases, cases_hash = read_json(cases_path)
+    frozen_cases, cases_hash = accepted_cases(cases_path)
     matrix, matrix_hash = read_json(matrix_path)
     native, native_hash = read_json(native_path)
-    if not isinstance(cases, dict) or cases.get('schema') != 'telegram-nightly-cases-v1':
-        raise Closed('accepted cases manifest schema required')
     if (not isinstance(matrix, dict) or matrix.get('schema') != 'telegram-nightly-matrix-v1'
             or matrix.get('source') != lane.SOURCE):
         raise Closed('accepted dedicated source matrix schema required')
-    rows = cases.get('cases')
     models = matrix.get('models')
-    if (not isinstance(rows, list) or len(rows) != 4 or not isinstance(models, list) or len(models) != 4
+    if (not isinstance(models, list) or len(models) != 4
             or {m.get('profile') for m in models if isinstance(m, dict)} != NIGHTLY_PROFILE_NAMES):
         raise Closed('exactly four independent cases and four dedicated profiles required')
     if (not isinstance(native, dict) or native.get('schema') != 'telegram-nightly-native-v1'
@@ -98,18 +139,6 @@ def freeze_plan(cases_path, matrix_path, native_path):
         if model not in lane.MODEL_DIGESTS or item.get('digest') != lane.MODEL_DIGESTS[model] or model in metadata:
             raise Closed('native metadata exact model/digest mismatch')
         metadata[model] = lane.thinking_metadata(item)
-    frozen_cases = []
-    seen = set()
-    seen_hash = set()
-    for row in rows:
-        case = identifier(row['case_id'])
-        path = (Path(cases_path).resolve().parent / row['messages_path']).resolve()
-        messages, digest = read_json(path)
-        if case in seen or digest in seen_hash or digest != row['sha256']:
-            raise Closed('case duplicate/changed input')
-        seen.add(case)
-        seen_hash.add(digest)
-        frozen_cases.append(dict(case_id=case, messages_path=str(path), sha256=digest))
     cells = []
     for item in models:
         profile = item['profile']
@@ -132,7 +161,7 @@ def freeze_plan(cases_path, matrix_path, native_path):
             if type(mode.get('supported')) is not bool or mode['supported'] is not supported:
                 raise Closed('mode support must match accepted native metadata exactly')
             for case in frozen_cases:
-                messages, _ = read_json(case['messages_path'])
+                messages, _ = read_messages(case['messages_path'])
                 # Unsupported off cells remain explicit but never get a payload/POST.
                 if supported:
                     payload = lane.normalize_request(dict(messages=messages, think=think,
@@ -151,6 +180,7 @@ def freeze_plan(cases_path, matrix_path, native_path):
     if len(cells) != lane.MAX_CALLS:
         raise Closed('bounded 4x2x4 plan required')
     return dict(schema=FROZEN_SCHEMA, contract=lane.contract(), cases_sha256=cases_hash,
+                cases_manifest_path=str(Path(cases_path).resolve()),
                 matrix_sha256=matrix_hash, native_sha256=native_hash, native=metadata,
                 cases=frozen_cases, cells=cells)
 
@@ -161,6 +191,19 @@ def load_frozen(path):
             or frozen.get('contract') != lane.contract() or len(frozen.get('cells', [])) != 32
             or len(frozen.get('cases', [])) != 4):
         raise Closed('frozen schema/local contract mismatch')
+    cases, cases_hash = accepted_cases(frozen['cases_manifest_path'])
+    if cases != frozen['cases'] or cases_hash != frozen['cases_sha256']:
+        raise Closed('frozen cases differ from exact accepted Astra fixture root')
+    # An edited frozen file must still be exactly four models x two modes x four cases.
+    if not isinstance(frozen.get('native'), dict) or set(frozen['native']) != set(lane.MODEL_DIGESTS):
+        raise Closed('frozen native models changed')
+    case_ids = {c['case_id'] for c in cases}
+    for profile in NIGHTLY_PROFILE_NAMES:
+        cells = [c for c in frozen['cells'] if c['profile'] == profile]
+        modes = {c['mode'] for c in cells}
+        if len(cells) != 8 or len(modes) != 2 or any(
+                {c['case_id'] for c in cells if c['mode'] == mode} != case_ids for mode in modes):
+            raise Closed('frozen 4x2x4 matrix changed')
     # Recheck payloads, keys and modes instead of trusting editable cell metadata.
     seen = set()
     for cell in frozen['cells']:
@@ -176,7 +219,7 @@ def request_for(frozen, cell):
     case = next((c for c in frozen['cases'] if c['case_id'] == cell['case_id']), None)
     if case is None:
         raise Closed('frozen case missing')
-    messages, digest = read_json(case['messages_path'])
+    messages, digest = read_messages(case['messages_path'])
     if digest != case['sha256']:
         raise Closed('frozen case bytes changed')
     model = PROFILES[cell['profile']].model
@@ -381,6 +424,8 @@ def collect(frozen, cell, journal, transport, reconcile=False):
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest='command', required=True)
+    p = sub.add_parser('verify-cases')
+    p.add_argument('--cases', required=True)
     for command in ('dry-run', 'freeze'):
         p = sub.add_parser(command)
         p.add_argument('--cases', required=True)
@@ -403,6 +448,11 @@ def main(argv=None):
     args = parser.parse_args(argv)
     os.umask(0o077)
     try:
+        if args.command == 'verify-cases':
+            cases, digest = accepted_cases(args.cases)
+            print(json.dumps(dict(case_count=len(cases), manifest_sha256=digest,
+                inputs=[dict(case_id=c['case_id'], sha256=c['sha256']) for c in cases], network_calls=0)))
+            return 0
         if args.command in ('freeze', 'dry-run'):
             frozen = freeze_plan(args.cases, args.matrix, args.native)
             if args.command == 'freeze':

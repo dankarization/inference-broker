@@ -49,6 +49,18 @@ def supports(metadata, think):
     return think_value(think) and any(same_value(think, v) for v in metadata["values"])
 
 
+def validate_messages(messages):
+    if not isinstance(messages, list) or not 1 <= len(messages) <= 16:
+        raise ValueError("nightly requires 1..16 system/user messages")
+    for message in messages:
+        if (not isinstance(message, dict) or set(message) != {"role", "content"}
+                or message["role"] not in {"system", "user"}
+                or not isinstance(message["content"], str)):
+            raise ValueError("nightly text-only system/user messages required")
+    if not any(m["role"] == "user" and m["content"].strip() for m in messages):
+        raise ValueError("nightly requires nonempty user input")
+
+
 def normalize_request(request, profile_name):
     if profile_name not in NIGHTLY_PROFILE_NAMES or not isinstance(request, dict):
         raise ValueError("dedicated nightly profile and object required")
@@ -69,15 +81,7 @@ def normalize_request(request, profile_name):
                    (k != "temperature" and type(options[k]) is not int) for k in OPTIONS)):
         raise ValueError("nightly requires exact 32768/8192/temperature 0")
     messages = request.get("messages")
-    if not isinstance(messages, list) or not 1 <= len(messages) <= 16:
-        raise ValueError("nightly requires 1..16 system/user messages")
-    for message in messages:
-        if (not isinstance(message, dict) or set(message) != {"role", "content"}
-                or message["role"] not in {"system", "user"}
-                or not isinstance(message["content"], str)):
-            raise ValueError("nightly text-only system/user messages required")
-    if not any(m["role"] == "user" and m["content"].strip() for m in messages):
-        raise ValueError("nightly requires nonempty user input")
+    validate_messages(messages)
     metadata = thinking_metadata({"thinking": request.get("native_thinking")})
     if not supports(metadata, request["think"]):
         raise ValueError("requested native mode unsupported in accepted metadata")

@@ -7,6 +7,8 @@ collection and blinded Astra review. This patch does not run a comparison,
 qualify a nightly pipeline, or choose/change a production model. Tests use
 synthetic contracts, not replacements for the four reviewer-owned real chats.
 No watcher, scheduler, background collector, download or cloud fallback exists.
+TEXT ONLY: document/photo/video/audio acquisition or analysis is outside this
+contract. URLs inside chat content stay literal text; no URL target is fetched.
 
 Dedicated source: `telegram-nightly-eval-20261028-v1`.
 Do not borrow, close or reopen `pilot-mainpc`, `nextcloud`,
@@ -34,6 +36,8 @@ identical profile/kind/item/hash and is checked before policy/budget gates.
 This lane refuses individual and bulk retries: failed/unknown/length outcomes
 consume the original cell; there is no make-up cell or automatic resubmission.
 The helper also commits one durable intent per cell and never POSTs it again.
+The 32-call budget includes native thinking within each 8192-token generation
+ceiling, not 8192 final tokens plus a separate hidden reasoning allowance.
 Do not delete/reset its journal or create parallel journals to evade this rule.
 
 ## Native metadata is a prerequisite, not a claimed result
@@ -67,29 +71,40 @@ python3 '/media/dankar/Plex/for claw/telegram-nightly-model-evaluation-20261028/
 ```
 
 Set PYTHONPATH to the accepted broker source first, as in the CLI section.
+Neither capture nor dispatch downloads or inspects documents/media/URL targets;
+only the four installed model control metadata records are requested.
 The broker repeats exact digest/native metadata checks at dispatch **before any
 load/run** and refuses metadata drift. After inference it verifies exclusive
 resident digest and effective context via GET `/api/ps` equals 32768.
 
 ## Main-owned input schemas
 
-Files can live outside Git, in the reviewer/main private fixture area. The runner
-only reads them and freezes their exact SHA-256 and absolute path; no case text
-is copied into its frozen manifest or journal. Four independent JSON arrays of
-`{"role":"system"|"user","content":"..."}` must already contain the accepted
-shared prompt plus chronological source bytes. Prepare the arrays once per case,
-not differently for each model. Ground truth/rubric are separate and never sent
-to candidate models by this helper.
+The runner accepts only Astra's exact immutable fixture manifest:
 
-`cases.json`:
+- Path: `/media/dankar/Plex/for claw/telegram-nightly-model-evaluation-20261028/fixtures/manifest.json`
+- SHA-256: `5f8046556912ad1e7c09239717c315eb4cde39f889e1640dfb72fca6f7cad0e8`
+- Four cases / four chats / 87 selected primary messages (not complete histories).
+- Model-facing paths, exclusively: `case-01-porta/messages.json`,
+  `case-02-kp/messages.json`, `case-03-pm/messages.json`,
+  `case-04-s92/messages.json`.
 
-```json
-{"schema":"telegram-nightly-cases-v1","cases":[
-  {"case_id":"support","messages_path":"support.messages.json","sha256":"EXACT_FILE_SHA256"},
-  {"case_id":"kp","messages_path":"kp.messages.json","sha256":"EXACT_FILE_SHA256"},
-  {"case_id":"pm","messages_path":"pm.messages.json","sha256":"EXACT_FILE_SHA256"},
-  {"case_id":"object","messages_path":"object.messages.json","sha256":"EXACT_FILE_SHA256"}
-]}
+Pass this manifest directly as `--cases`; do not translate it to a new cases.json.
+The manifest hash plus each message file hash are pinned in the helper. Every
+freeze/load revalidates them and rejects alternate/changed/symlinked inputs.
+Only the manifest and these four JSON objects `{"messages":[...]}` are opened;
+their `messages` arrays alone become model input. Reference/rubric,
+structured case.json, source files and proofs are not opened, copied or sent.
+There is no glob, attachment resolver, document analysis, URL dereference, or
+prompt reconstruction. Literal URLs remain in the original role/content text.
+Exactly the same parsed role/content bytes are used for all models and modes.
+The frozen plan records hashes + absolute paths, not chat text. Inputs/ground
+truth stay outside Git, under main/reviewer ownership. Do not edit the fixtures.
+
+Offline case-only validation (no native metadata, matrix or model calls needed):
+
+```sh
+export CASES='/media/dankar/Plex/for claw/telegram-nightly-model-evaluation-20261028/fixtures/manifest.json'
+python3 "$RUNNER" verify-cases --cases "$CASES"
 ```
 
 `native.json` (four exact models; actual values only):
@@ -128,6 +143,8 @@ Use private main-owned paths; no real auth, inputs, outputs or state in Git.
 export PYTHONPATH='/media/dankar/Plex/for claw/telegram-nightly-model-evaluation-20261028/broker-worktree'
 export RUNNER='/media/dankar/Plex/for claw/telegram-nightly-model-evaluation-20261028/runner/evaluate.py'
 umask 077
+export CASES='/media/dankar/Plex/for claw/telegram-nightly-model-evaluation-20261028/fixtures/manifest.json'
+python3 "$RUNNER" verify-cases --cases "$CASES"
 python3 "$RUNNER" dry-run --cases "$CASES" --matrix "$MATRIX" --native "$NATIVE"
 python3 "$RUNNER" freeze --cases "$CASES" --matrix "$MATRIX" --native "$NATIVE" --out "$FROZEN"
 python3 "$RUNNER" request --frozen "$FROZEN" --cell "$CELL" --out "$PRIVATE_REQUEST"
@@ -136,7 +153,7 @@ python3 "$RUNNER" request --frozen "$FROZEN" --cell "$CELL" --out "$PRIVATE_REQU
 These commands perform **zero network operations**. They validate the finite plan,
 print counts/hashes, and create exclusive (never overwrite) files. They do not
 send inputs or print content. `CELL` is e.g.
-`support.telegram-nightly-gemma12-v1.off`; it is listed in `FROZEN.cells`.
+`case-01-porta.telegram-nightly-gemma12-v1.off`; it is listed in `FROZEN.cells`.
 Request output is optional for human inspection, not a curl replay mechanism.
 
 After separately authorized activation, exact runtime contract readback, explicit

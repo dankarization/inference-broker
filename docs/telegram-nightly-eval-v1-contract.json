@@ -71,5 +71,18 @@
     }
   },
   "policy_action": "main merges one entry only after acceptance; no replacement of existing sources",
-  "native_metadata": "required from exact local /api/show before freeze; unknown until captured"
+  "native_metadata": "required from exact local /api/show before freeze; unknown until captured",
+  "input_proposal": {
+    "manifest_sha256": "5f8046556912ad1e7c09239717c315eb4cde39f889e1640dfb72fca6f7cad0e8",
+    "model_facing_only": [
+      "case-01-porta/messages.json",
+      "case-02-kp/messages.json",
+      "case-03-pm/messages.json",
+      "case-04-s92/messages.json"
+    ],
+    "text_only": true,
+    "dereference_urls": false,
+    "read_references_rubric_proofs": false,
+    "generation_budget": "8192 total native generation tokens including thinking; final token count unknown unless backend reports it"
+  }
 }

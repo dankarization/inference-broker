@@ -1,5 +1,7 @@
 """Synthetic contracts only: no model calls, WOL, remote policy or real chats."""
 import copy
+import contextlib
+import io
 import hashlib
 import json
 import os
@@ -13,8 +15,9 @@ from pathlib import Path
 from unittest.mock import patch
 
 from broker import nightly_eval as lane
+from broker import nightly_client as client
 from broker.nightly_client import (Closed, Uncertain, Transport, Journal, freeze_plan,
-    load_frozen, new_json, request_for, admit, collect, main)
+    load_frozen, new_json, request_for, admit, collect, main, accepted_cases)
 from broker.profiles import PROFILES, NIGHTLY_PROFILE_NAMES
 from broker.service import Broker, SourcePolicy, SourceAdmissionBlocked, SourceQueueFull
 from broker.http import serve
@@ -111,11 +114,21 @@ class NightlyTests(unittest.TestCase):
                           dict(label='on', think=True, supported=lane.supports(metadata, True))]
         cases = []
         for i in range(4):
-            path = self.root/f'case-{i}.json'
-            path.write_text(json.dumps([dict(role='user', content='synthetic distinct case '+str(i))]))
-            cases.append(dict(case_id='synthetic'+str(i), messages_path=path.name,
-                              sha256=hashlib.sha256(path.read_bytes()).hexdigest()))
-        (self.root/'cases.json').write_text(json.dumps(dict(schema='telegram-nightly-cases-v1', cases=cases)))
+            case = 'case-synthetic-'+str(i)
+            path = self.root/case/'messages.json'
+            path.parent.mkdir()
+            path.write_text(json.dumps(dict(messages=[dict(role='user', content='synthetic distinct case '+str(i))])))
+            cases.append(dict(case_id=case, runner_input=case+'/messages.json',
+                              runner_input_sha256=hashlib.sha256(path.read_bytes()).hexdigest()))
+        (self.root/'cases.json').write_text(json.dumps(dict(schema=client.ASTRA_SCHEMA, case_count=4, cases=cases)))
+        # Synthetic trust pins exist only inside this test process, never in CLI/env.
+        for name, value in (
+            ('ASTRA_MANIFEST_SHA256', hashlib.sha256((self.root/'cases.json').read_bytes()).hexdigest()),
+            ('CASE_INPUTS', {c['case_id']: c['runner_input_sha256'] for c in cases}),
+        ):
+            patcher = patch.object(client, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
         (self.root/'matrix.json').write_text(json.dumps(dict(schema='telegram-nightly-matrix-v1', source=lane.SOURCE,
             models=[dict(profile=p, modes=copy.deepcopy(modes)) for p in sorted(NIGHTLY_PROFILE_NAMES)])))
         (self.root/'native.json').write_text(json.dumps(dict(schema='telegram-nightly-native-v1', models=[
@@ -294,17 +307,23 @@ class NightlyTests(unittest.TestCase):
         self.assertEqual(result['state'], 'completed')
         self.assertNotIn(SECRET, '\n'.join(journal.db.iterdump()))
         self.assertEqual(journal.row(cell)['phase'], 'terminal')
-        # Exercise CLI as a subprocess, not merely its underlying functions.
+        # Exercise argparse/main with test-only trust pins; the unmodified child
+        # process must reject these synthetic fixtures under the real Astra pin.
         for command in ('dry-run', 'freeze'):
-            args = [sys.executable, '-m', 'broker.nightly_client', command,
-                    '--cases', str(self.root/'cases.json'), '--matrix', str(self.root/'matrix.json'),
+            args = [command, '--cases', str(self.root/'cases.json'), '--matrix', str(self.root/'matrix.json'),
                     '--native', str(self.root/'native.json')]
             if command == 'freeze':
                 args += ['--out', str(self.root/'cli-frozen.json')]
-            proc = subprocess.run(args, capture_output=True, text=True, timeout=10)
-            self.assertEqual(proc.returncode, 0, proc.stderr)
-            self.assertIn('"planned_cells": 32', proc.stdout)
-            self.assertNotIn('synthetic distinct', proc.stdout)
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                self.assertEqual(main(args), 0)
+            self.assertIn('"planned_cells": 32', stdout.getvalue())
+            self.assertNotIn('synthetic distinct', stdout.getvalue())
+        proc = subprocess.run([sys.executable, '-m', 'broker.nightly_client', 'dry-run',
+            '--cases', str(self.root/'cases.json'), '--matrix', str(self.root/'matrix.json'),
+            '--native', str(self.root/'native.json')], capture_output=True, text=True, timeout=10)
+        self.assertEqual(proc.returncode, 2)
+        self.assertNotIn('synthetic distinct', proc.stdout+proc.stderr)
         self.assertEqual(main(['request', '--frozen', str(self.root/'frozen.json'), '--cell', cell['cell_id'],
                                '--out', str(self.root/'request.json')]), 0)
         self.assertEqual(json.loads((self.root/'request.json').read_text()), request_for(plan, cell))
@@ -384,7 +403,7 @@ class NightlyTests(unittest.TestCase):
             Journal(self.root/'private'/'journal.sqlite3', 'changed', transport.base)
         with self.assertRaises(Closed):
             Journal(self.root/'private'/'journal.sqlite3', digest, 'http://localhost:3333')
-        (self.root/'case-0.json').write_text('[]')
+        (self.root/'case-synthetic-0'/'messages.json').write_text('[]')
         with self.assertRaises(Closed):
             load_frozen(self.root/'frozen.json')
         self.root.chmod(0o755)
@@ -409,6 +428,71 @@ class NightlyTests(unittest.TestCase):
         (self.root/'matrix.json').write_text(json.dumps(raw))
         with self.assertRaises(Closed):
             freeze_plan(self.root/'cases.json', self.root/'matrix.json', self.root/'native.json')
+
+    def test_exact_fixture_contract_never_opens_references_or_follows_literal_urls(self):
+        plan, _ = self.frozen()
+        original = client.read_json
+        reads = []
+        def bounded_read(path):
+            path = Path(path).resolve()
+            reads.append(path)
+            return original(path)
+        with patch.object(client, 'read_json', side_effect=bounded_read), patch('socket.socket') as network:
+            cases, _ = accepted_cases(self.root/'cases.json')
+            network.assert_not_called()
+        self.assertEqual(set(reads), {self.root/'cases.json'} | {
+            self.root/case['case_id']/'messages.json' for case in cases})
+        self.assertEqual(len(cases), 4)
+        stdout = io.StringIO()
+        with contextlib.redirect_stdout(stdout), patch('socket.socket') as network:
+            self.assertEqual(main(['verify-cases', '--cases', str(self.root/'cases.json')]), 0)
+            network.assert_not_called()
+        self.assertEqual(json.loads(stdout.getvalue())['case_count'], 4)
+        self.assertNotIn('synthetic distinct', stdout.getvalue())
+        # Path redirection is rejected independently of the accepted byte hash.
+        original_bytes = (self.root/'cases.json').read_bytes()
+        manifest = original(self.root/'cases.json')[0]
+        manifest['cases'][0]['runner_input'] = 'references/private.json'
+        (self.root/'cases.json').write_text(json.dumps(manifest))
+        with patch.object(client, 'ASTRA_MANIFEST_SHA256', hashlib.sha256((self.root/'cases.json').read_bytes()).hexdigest()):
+            with self.assertRaisesRegex(Closed, 'model-facing'):
+                accepted_cases(self.root/'cases.json')
+        (self.root/'cases.json').write_bytes(original_bytes)
+        # A forged frozen path cannot substitute another same-byte JSON file.
+        path = self.root/'forged-messages.json'
+        path.write_bytes((self.root/'case-synthetic-0'/'messages.json').read_bytes())
+        plan['cases'][0]['messages_path'] = str(path)
+        new_json(self.root/'forged.json', plan)
+        with self.assertRaises(Closed):
+            load_frozen(self.root/'forged.json')
+        source = self.root/'case-synthetic-0'/'messages.json'
+        source.unlink()
+        source.symlink_to(path)
+        with self.assertRaisesRegex(Closed, 'fixture root'):
+            accepted_cases(self.root/'cases.json')
+
+    def test_frozen_missing_model_cells_and_matrix_expansion_rejected(self):
+        plan, _ = self.frozen()
+        plan['cells'][0]['profile'] = plan['cells'][-1]['profile']
+        new_json(self.root/'missing-model.json', plan)
+        with self.assertRaisesRegex(Closed, '4x2x4'):
+            load_frozen(self.root/'missing-model.json')
+        plan['cells'].append(copy.deepcopy(plan['cells'][0]))
+        new_json(self.root/'expanded.json', plan)
+        with self.assertRaises(Closed):
+            load_frozen(self.root/'expanded.json')
+
+    def test_text_only_literal_urls_stay_text_without_network(self):
+        url_text = 'Literal only https://example.invalid/document.pdf image.jpg audio.ogg'
+        with patch('socket.socket') as network:
+            normalized = lane.normalize_request(self.payload() | dict(messages=[dict(role='user', content=url_text)]), P)
+            network.assert_not_called()
+        self.assertEqual(normalized['messages'][0]['content'], url_text)
+        for message in (dict(role='user', content=[dict(type='image_url', image_url='x')]),
+                        dict(role='user', content='caption', images=['x']),
+                        dict(role='user', content='caption', audio='x')):
+            with self.assertRaises(ValueError):
+                lane.normalize_request(self.payload() | dict(messages=[message]), P)
 
     def test_capture_native_filters_metadata_and_never_uses_inference_endpoints(self):
         import importlib.util
