@@ -165,7 +165,10 @@ class NightlyTests(unittest.TestCase):
         self.assertEqual(before, self.policy_path.read_bytes())
 
     def test_all_31_preexisting_profiles_are_unchanged(self):
-        old = {k: asdict(v) for k, v in PROFILES.items() if k not in NIGHTLY_PROFILE_NAMES}
+        # Additive daily capacity is not one of the immutable original 31 profiles.
+        from broker.syncopia_daily import PROFILE as DAILY_PROFILE
+        old = {k: asdict(v) for k, v in PROFILES.items()
+               if k not in NIGHTLY_PROFILE_NAMES and k != DAILY_PROFILE}
         self.assertEqual(len(old), 31)
         self.assertEqual(hashlib.sha256(json.dumps(old, sort_keys=True, separators=(',', ':')).encode()).hexdigest(),
                          'ddc9184d744685ed87969710c82a87cb53e7c7889780556b89b5e92824b611e2')

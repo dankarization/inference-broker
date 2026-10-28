@@ -27,7 +27,7 @@ from .compat import (CompatibilityError, NEXTCLOUD_PROFILES, GEMMA26_CONTRACT,
                      validate_shutterstock_video_payload,
                      validate_syncopia_memory_payload)
 from .profiles import EVALUATION_PROFILE_NAMES, OPENCLAW_PROFILE_NAMES, PROFILES
-from . import nightly_eval
+from . import nightly_eval, syncopia_daily
 from .profiles import NIGHTLY_PROFILE_NAMES
 from .evaluation import normalize_request as normalize_evaluation_request
 from .evaluation import validate_result as validate_evaluation_result
@@ -602,6 +602,12 @@ class Broker:
         if kind not in {"chat", "generate"}:
             raise ValueError("kind must be chat or generate")
         source = source or profile
+        if profile == syncopia_daily.PROFILE:
+            if source != syncopia_daily.SOURCE or kind != "chat":
+                raise ValueError("daily capacity requires its protected source/profile and chat")
+            if not external_id or not source_item_id or producer_storage is None:
+                raise ValueError("daily capacity requires correlation IDs and producer_storage")
+            payload = syncopia_daily.normalize_request(payload)
         if source == nightly_eval.SOURCE or profile in NIGHTLY_PROFILE_NAMES:
             if (source != nightly_eval.SOURCE or profile not in NIGHTLY_PROFILE_NAMES
                     or kind != "chat" or producer_storage is not None):
@@ -1896,6 +1902,11 @@ class Broker:
 
     def _execute(self, row):
         profile = PROFILES[row["profile"]]
+        if row["profile"] == syncopia_daily.PROFILE:
+            payload = json.loads(row["payload"])
+            if (row["source"] != syncopia_daily.SOURCE or row["kind"] != "chat"
+                    or syncopia_daily.normalize_request(payload) != payload):
+                raise ValueError("daily capacity persisted contract drift")
         self.wol.wake()
         nightly_evidence = None
         if row["profile"] in NIGHTLY_PROFILE_NAMES:

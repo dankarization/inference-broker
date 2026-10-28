@@ -333,6 +333,11 @@ Null/частичные format-поля не выбирают freeform mode. О�
 требует прежний bearer, canonical normalized input hash и ACK, без изменения
 storage identity или правил защиты.
 
+Отдельный opt-in full-day capacity proposal —
+[`syncopia-memory-qwen38-128k-v1`](docs/SYNCOPIA_DAILY_128K_V1.md):
+131072/8192/temp0/low через существующий protected source и producer storage.
+Это source-only контракт; старый64K и Astra16 не меняются, rollout не выполнен.
+
 ## Проверка и разработка
 
 Безопасная canary-проверка использует mock или staging задания `interactive`,

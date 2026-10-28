@@ -135,6 +135,11 @@ PROFILES = {
         max_concurrency=1, request_timeout_seconds=900,
         max_schema_bytes=65_536,
     ),
+    # Explicit full-day text opt-in; old 64K extraction/freeform jobs stay unchanged.
+    "syncopia-memory-qwen38-128k-v1": Profile(
+        "syncopia-memory-qwen38-128k-v1", "qwen3.8:ad-iq2-xs", 131_072, 8_192, 1_800,
+        max_concurrency=1, request_timeout_seconds=900,
+    ),
     "batch-video": Profile("batch-video", "nemotron3:33b", 8_192, 512, 120),
     # This is an intentionally separate source from the active Shutterstock
     # worker.  It is the only VLM/media contract eligible for a future canary.
