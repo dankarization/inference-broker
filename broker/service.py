@@ -1838,10 +1838,18 @@ class Broker:
 
     def dispatch_once(self, allowed_sources: frozenset[str] | None = None, policy: SourcePolicy | None = None) -> bool:
         with self.lock, self.db:
-            if self.db.execute("SELECT 1 FROM jobs WHERE state IN ('running','cancel_requested')").fetchone():
+            occupants = [r["profile"] for r in self.db.execute(
+                "SELECT profile FROM jobs WHERE state IN ('running','cancel_requested')"
+            )]
+            if occupants:
                 return False
             row = self._next(allowed_sources, policy)
             if not row: return False
+            # Hook for the measured occupancy policy; the single-worker guard
+            # above remains until concurrent execution/accounting is implemented.
+            from .occupancy import can_admit
+            if not can_admit(row["profile"], occupants, PROFILES):
+                return False
             now = self.clock()
             attempt_no = int(row["attempt_count"] or 0) + 1
             # A lease covers the server-owned remote deadline, not just a

@@ -15,6 +15,12 @@ class Profile:
     max_images: int = 0
     max_schema_bytes: int = 0
     executor: str = "ollama"
+    # Unknown occupancy is exclusive until a specific coexistence cohort is proven.
+    occupancy_class: str = "unknown"
+    occupancy_cohort: str | None = None
+    occupancy_max_jobs: int = 1
+    occupancy_peak_vram_bytes: int | None = None
+    occupancy_evidence: str | None = None
 
 
 # This is deliberately server-owned. Callers can select a profile, never a model
