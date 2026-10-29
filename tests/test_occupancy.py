@@ -3,6 +3,7 @@ from dataclasses import replace
 
 from broker.occupancy import Envelope, can_admit
 from broker.profiles import Profile
+from broker.service import Broker, SCHEDULING_HORIZON_SECONDS
 
 
 class OccupancyTest(unittest.TestCase):
@@ -41,6 +42,31 @@ class OccupancyTest(unittest.TestCase):
         self.profiles['voice'] = replace(self.profiles['voice'], occupancy_peak_vram_bytes=5)
         self.envelopes.clear()
         self.assertFalse(self.admit('voice', ['llm']))
+
+    def test_exclusive_or_unknown_blocks_all_other_occupants(self):
+        for active in ('unknown', 'exclusive'):
+            for candidate in self.profiles:
+                with self.subTest(active=active, candidate=candidate):
+                    self.assertFalse(self.admit(candidate, [active]))
+
+    def test_voice_weight_two_receives_half_weight_one_budget(self):
+        class Policy:
+            def weight(self, source):
+                return {'local-voice': 2, 'llm-source': 1}[source]
+
+            def snapshot(self):
+                return {'sources': {'local-voice': {'weight': 2}, 'llm-source': {'weight': 1}}}
+
+        broker = Broker.__new__(Broker)
+        available = {
+            ('local-voice', 'voice-model'): {'source': 'local-voice', 'queued_at': 1, 'created': 1},
+            ('llm-source', 'llm-model'): {'source': 'llm-source', 'queued_at': 1, 'created': 1},
+        }
+        cycle = broker._new_time_cycle(available, Policy(), 1)
+        voice = cycle['lanes'][('local-voice', 'voice-model')]['budget']
+        llm = cycle['lanes'][('llm-source', 'llm-model')]['budget']
+        self.assertAlmostEqual(voice, SCHEDULING_HORIZON_SECONDS / 3)
+        self.assertAlmostEqual(llm, 2 * voice)
 
 
 if __name__ == '__main__':
