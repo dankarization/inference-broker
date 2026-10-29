@@ -45,6 +45,8 @@ def normalize_source_policy(raw: Any) -> dict[str, dict[str, Any]]:
     """Validate a policy document and apply its documented defaults."""
     if not isinstance(raw, dict):
         raise SourcePolicyError("policy must contain an object 'sources'")
+    if not isinstance(raw.get("maintenance", False), bool):
+        raise SourcePolicyError("maintenance must be a boolean")
     sources = raw.get("sources")
     if not isinstance(sources, dict):
         raise SourcePolicyError("policy must contain an object 'sources'")

@@ -141,7 +141,8 @@ def snapshot(
             "scheduler": {
                 "enabled": configured.get("enabled") if isinstance(configured, dict) else (False if policy_active else None),
                 "dispatch_paused": (not configured.get("enabled", True)) if isinstance(configured, dict) else (True if policy_active else None),
-                "admission_allowed": configured.get("admission_allowed", True) if isinstance(configured, dict) else True,
+                "admission_allowed": (not (policy_snapshot or {}).get("maintenance", False) and
+                                      configured.get("admission_allowed", True)) if isinstance(configured, dict) else not policy_active,
                 "weight": configured.get("weight") if isinstance(configured, dict) else None,
                 "next_allowed": next_allowed,
             },
@@ -157,6 +158,7 @@ def snapshot(
     )]
     return {
         "timestamp": now,
+        "maintenance": bool((policy_snapshot or {}).get("maintenance", False)),
         "sources": sources,
         "active_jobs": active_jobs,
         "overall": {
@@ -235,7 +237,7 @@ def render(data: dict[str, Any]) -> bytes:
     def admission_cell(source: str, value: bool) -> str:
         source_attribute = html.escape(source, quote=True)
         return (f'<td data-sort-value="{1 if value else 0}"><form class="admission-form" data-source="{source_attribute}">'
-                f'<select name="admission" aria-label="Admission for {source_attribute}">'
+                f'<select name="admission" aria-label="Admission for {source_attribute}"{" disabled" if data.get("maintenance") else ""}>'
                 f'<option value="true"{" selected" if value else ""}>allowed</option>'
                 f'<option value="false"{" selected" if not value else ""}>blocked</option></select>'
                 '<span class="admission-feedback" aria-live="polite"></span></form></td>')
@@ -333,6 +335,7 @@ def render(data: dict[str, Any]) -> bytes:
 <meta http-equiv=refresh content=30><title>Ollama broker queue</title>
 <style>body{{font:14px system-ui,sans-serif;margin:2rem;color:#18212b}}table{{border-collapse:collapse;width:100%;margin:1rem 0}}th,td{{padding:.45rem;border:1px solid #ccd6df;text-align:right}}th:first-child,td:first-child{{text-align:left}}th{{background:#edf3f7}}.compact{{width:1%;white-space:nowrap}}code{{font-size:.9em}}.summary{{font-size:1.05rem}}.weight-form,.enabled-form,.admission-form{{display:flex;gap:.35rem;align-items:center;justify-content:flex-end}}.weight-feedback,.enabled-feedback,.admission-feedback,.bulk-feedback{{min-width:4rem;text-align:left}}.error{{color:#a00}}button{{margin:.15rem}}/* TABLE_SORT_CSS */</style>
 <h1>Ollama inference broker queue</h1><p>Snapshot timestamp: {timestamp_cell(data['timestamp'], tag='code')} · refreshes every 30 seconds.</p>
+{('<p class=error>Admission maintenance is active; new jobs and retries are blocked.</p>') if data.get('maintenance') else ''}
 {('<p class=error>Showing stale data: ' + html.escape(str(observation.get('reason', 'database observer read unavailable'))) + '.</p>') if observation['state'] == 'stale' else ''}
 <p class=summary>Completed: <b>{overall['states']['completed']}</b> total · <b>{overall['completed_last_hour']}</b> last hour · <b>{overall['completed_last_24_hours']}</b> last 24 hours.</p>
 <h2>Sources</h2><table><thead><tr>{sort_th('Source','source')}{sort_th('Dispatch','dispatch')}{sort_th('Admission','admission')}{sort_th('Weight','weight')}{sort_th('Queued','queued')}{sort_th('Running','running')}{sort_th('Lease','lease')}{sort_th('Retry','retry')}{sort_th('Delayed','delayed')}{sort_th('Failed','failed')}{sort_th('Cancelled','cancelled')}{sort_th('Completed total','completed')}{sort_th('Completed 1h','completed_1h')}{sort_th('Completed 24h','completed_24h')}{sort_th('Bulk actions','bulk')}</tr></thead><tbody>{''.join(rows) or '<tr data-sort-ignore><td colspan=15>None</td></tr>'}</tbody></table>

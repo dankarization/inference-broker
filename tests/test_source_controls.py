@@ -1,4 +1,5 @@
 import json
+import hashlib
 import os
 import tempfile
 import threading
@@ -61,15 +62,15 @@ class SourceControlsTests(unittest.TestCase):
         self.policy = SourcePolicy(self.policy_path)
         self.broker = Broker(self.database.name, FakeOllama(), FakeWol(), clock=lambda: 100)
         self.addCleanup(self.broker.db.close)
-        self.server = serve(self.broker, port=0, policy=self.policy)
+        self.server = serve(self.broker, port=0, policy=self.policy, storage_token='test-token')
         self.addCleanup(self.server.server_close)
 
-    def request(self, path, body=None):
+    def request(self, path, body=None, *, authenticated=True):
         data = None if body is None else json.dumps(body).encode()
         request = Request(
             f"http://127.0.0.1:{self.server.server_port}{path}",
             data=data,
-            headers={"Content-Type": "application/json"} if data is not None else {},
+            headers={**({"Authorization": "Bearer test-token"} if authenticated else {}), **({"Content-Type": "application/json"} if data is not None else {})},
             method="POST" if data is not None else "GET",
         )
         worker = threading.Thread(target=self.server.handle_request)
@@ -87,6 +88,76 @@ class SourceControlsTests(unittest.TestCase):
         return self.broker.submit(
             "interactive", "generate", {"prompt": prompt}, source=source
         )
+
+    def test_unregistered_source_and_retries_are_blocked_while_reads_remain(self):
+        existing = self.submit('alpha')
+        self.broker.cancel(existing['id'])
+        self.assertEqual(self.request('/v1/jobs', {'profile': 'interactive', 'kind': 'generate',
+            'source': 'unregistered', 'payload': {'prompt': 'synthetic'}})[0], 403)
+        self.policy.set_admission_allowed('alpha', False)
+        self.assertEqual(self.request('/v1/jobs/'+existing['id']+'/retry', {})[0], 403)
+        self.assertEqual(self.request('/v1/sources/alpha/failed/retry', {'confirm': True})[0], 403)
+        self.assertEqual(self.request('/v1/jobs/'+existing['id'])[0], 200)
+        self.assertEqual(self.broker.status(existing['id'])['state'], 'cancelled')
+
+    def test_declared_maintenance_blocks_all_submission_shapes_and_retains_replay(self):
+        with open(self.policy_path) as f: raw = json.load(f)
+        for name in ('local-voice', 'openclaw', 'shutterstock-canary', 'shutterstock-video',
+                     'olya-vision', 'olya-decision', 'syncopia-telegram-memory'):
+            raw['sources'][name] = {'enabled': True, 'weight': 2}
+        with open(self.policy_path, 'w') as f: json.dump(raw, f)
+        voice = {'filename': 'a.ogg', 'audio_base64': 'YQ=='}
+        first = self.broker.submit('voice-gigaam-v1', 'transcribe', voice,
+                                   source='local-voice', external_id='k', source_item_id='item')
+        with open(self.policy_path, 'rb') as f: checksum = hashlib.sha256(f.read()).hexdigest()
+        self.assertEqual(self.request('/v1/maintenance/admission', {'enabled': True, 'expected_sha256': checksum}), (200, {'maintenance': True}))
+        self.assertTrue(self.policy.snapshot()['maintenance'])
+        projected = self.broker.dashboard(self.policy)
+        alpha = next(row for row in projected['sources'] if row['source'] == 'alpha')
+        self.assertFalse(alpha['scheduler']['admission_allowed'])
+        from broker.dashboard import render
+        html = render(projected)
+        self.assertIn(b'Admission maintenance is active', html)
+        self.assertIn(b'<select name="admission" aria-label="Admission for alpha" disabled>', html)
+        self.assertEqual(self.broker.submit('voice-gigaam-v1', 'transcribe', voice,
+                         source='local-voice', external_id='k', source_item_id='item')['id'], first['id'])
+        from broker.openclaw import MODEL
+        media = {'prompt': 'test', 'images': ['YQ=='], 'format': {'type': 'object'}}
+        routes = [
+            ('/v1/jobs', {'profile': 'interactive', 'kind': 'generate', 'source': 'alpha', 'payload': {'prompt': 'x'}}),
+            ('/api/generate', {'profile': 'interactive', 'source': 'alpha', 'prompt': 'x', 'stream': False}),
+            ('/api/chat', {'profile': 'interactive', 'source': 'alpha', 'messages': [{'role': 'user', 'content': 'x'}], 'stream': False}),
+            ('/openclaw/api/chat', {'model': MODEL, 'messages': [{'role': 'user', 'content': 'x'}], 'stream': False}),
+            ('/v1/shutterstock-canary/generate', media),
+            ('/v1/shutterstock-video/generate', media),
+            ('/v1/olya-vision/generate', {**media, 'model': 'gemma4:12b'}),
+            ('/v1/olya-decision/generate', {'model': 'qwen3.8:ad-iq2-xs', 'prompt': 'x', 'format': {'type': 'object'}}),
+            ('/v1/syncopia-memory/extract', {'model': 'qwen3.8:ad-iq2-xs', 'messages': [{'role': 'system', 'content': 'x'}, {'role': 'user', 'content': 'x'}], 'tools': [], 'stream': False, 'response_format': {'type': 'json_object'}, 'format': {'type': 'object'}}),
+        ]
+        for path, body in routes:
+            with self.subTest(path=path):
+                status, response = self.request(path, body)
+                self.assertEqual((status, response.get('error', {}).get('code')), (403, 'source_admission_blocked'))
+        self.assertEqual(self.request('/v1/jobs/'+first['id'])[0], 200)
+        self.assertEqual(self.broker.db.execute('SELECT count(*) FROM jobs').fetchone()[0], 1)
+
+    def test_maintenance_requires_auth_and_compare_hash_and_waits_for_claim_lock(self):
+        with open(self.policy_path, 'rb') as f: checksum = hashlib.sha256(f.read()).hexdigest()
+        body = {'enabled': True, 'expected_sha256': checksum}
+        self.assertEqual(self.request('/v1/maintenance/admission', body, authenticated=False)[0], 401)
+        self.assertEqual(self.request('/v1/maintenance/admission', {**body, 'expected_sha256': '0'*64})[0], 400)
+        self.assertFalse(self.policy.snapshot()['maintenance'])
+        result = []
+        with self.broker.lock:
+            thread = threading.Thread(target=lambda: result.append(self.request('/v1/maintenance/admission', body)))
+            thread.start()
+            thread.join(0.1)
+            self.assertTrue(thread.is_alive())
+        thread.join(2)
+        self.assertEqual(result, [(200, {'maintenance': True})])
+        self.assertFalse(self.policy.admission_allowed('alpha'))
+        self.assertEqual(self.request('/v1/maintenance/admission', {'enabled': False, 'expected_sha256': checksum})[0], 400)
+        self.assertTrue(self.policy.snapshot()['maintenance'])
 
     def test_old_policy_defaults_admission_allowed_and_dashboard_reports_controls(self):
         self.assertTrue(self.policy.admission_allowed("alpha"))

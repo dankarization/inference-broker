@@ -489,6 +489,8 @@ vm.runInThisContext('{'+SCRIPT+'\n}');
         completed_recent = broker.submit("batch-video", "generate", {"prompt": "do-not-expose"}, source="dashboard-source")["id"]
         completed_old = broker.submit("batch-video", "generate", {"prompt": "also-private"}, source="dashboard-source")["id"]
         running = broker.submit("batch-video", "generate", {}, source="dashboard-source")["id"]
+        # An old persisted job remains visible even if its source is not registered.
+        broker.submit("batch-video", "generate", {}, source="omitted-source")
         with broker.db:
             broker.db.execute("UPDATE jobs SET state='completed',finished=? WHERE id=?", (99_000, completed_recent))
             broker.db.execute("UPDATE jobs SET state='completed',finished=? WHERE id=?", (10_000, completed_old))
@@ -538,12 +540,11 @@ vm.runInThisContext('{'+SCRIPT+'\n}');
         self.assertEqual(source["completed_last_hour"], 1)
         self.assertEqual(source["completed_last_24_hours"], 1)
         self.assertNotIn("payload", json.dumps(data))
-        broker.submit("batch-video", "generate", {}, source="omitted-source")
         data = broker.dashboard(policy)
         omitted = next(item for item in data["sources"] if item["source"] == "omitted-source")
         self.assertEqual(omitted["scheduler"], {
             "enabled": False, "dispatch_paused": True,
-            "admission_allowed": True, "weight": None, "next_allowed": None,
+            "admission_allowed": False, "weight": None, "next_allowed": None,
         })
         html, content_type = get("/dashboard")
         self.assertIn("text/html", content_type)

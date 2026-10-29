@@ -113,6 +113,7 @@ class SourcePolicy:
         self._lock = threading.RLock()
         self._signature: tuple[int, int, int] | None = None
         self._sources: dict[str, dict[str, Any]] = {}
+        self._maintenance = False
 
     def _load_locked(self) -> None:
         try:
@@ -136,6 +137,7 @@ class SourcePolicy:
             self._signature = signature
             return
         self._sources = normalized
+        self._maintenance = raw.get("maintenance", False)
         self._signature = signature
 
     def snapshot(self) -> dict[str, Any]:
@@ -144,6 +146,7 @@ class SourcePolicy:
             self._load_locked()
             return {
                 "path": str(self.path),
+                "maintenance": self._maintenance,
                 "sources": {name: dict(entry) for name, entry in self._sources.items()},
             }
 
@@ -161,11 +164,11 @@ class SourcePolicy:
             return entry["weight"] if entry else None
 
     def admission_allowed(self, source: str) -> bool:
-        """Default old policy entries and unknown sources to admission allowed."""
+        """Deny unregistered sources and all new work in maintenance mode."""
         with self._lock:
             self._load_locked()
             entry = self._sources.get(source)
-            return True if entry is None else entry["admission_allowed"]
+            return bool(entry is not None and not self._maintenance and entry["admission_allowed"])
 
     def storage_config(self, source: str) -> dict[str, Any]:
         """Return fail-closed producer-storage flags for one source."""
@@ -193,16 +196,22 @@ class SourcePolicy:
                 )
             }
 
-    def _mutate_source(self, source: str, field: str, value: Any) -> Any:
+    def _mutate_source(self, source: str | None, field: str, value: Any, expected_sha256: str | None = None) -> Any:
         """Serialize and durably atomically replace one source policy field."""
         with self._lock:
             try:
                 with source_policy_write_lock(self.path):
-                    raw = json.loads(self.path.read_text(encoding="utf-8"))
+                    raw_bytes = self.path.read_bytes()
+                    if expected_sha256 is not None and hashlib.sha256(raw_bytes).hexdigest() != expected_sha256:
+                        raise SourcePolicyError("policy checksum changed")
+                    raw = json.loads(raw_bytes)
                     normalized = normalize_source_policy(raw)
-                    if source not in normalized:
-                        raise SourcePolicyError(f"source {source!r} is not configured")
-                    raw["sources"][source][field] = value
+                    if source is None:
+                        raw[field] = value
+                    else:
+                        if source not in normalized:
+                            raise SourcePolicyError(f"source {source!r} is not configured")
+                        raw["sources"][source][field] = value
                     temporary: str | None = None
                     try:
                         mode = self.path.stat().st_mode & 0o7777
@@ -250,6 +259,13 @@ class SourcePolicy:
         if not isinstance(allowed, bool):
             raise SourcePolicyError("allowed must be a boolean")
         return self._mutate_source(source, "admission_allowed", allowed)
+
+    def set_maintenance(self, enabled: Any, expected_sha256: str) -> bool:
+        if not isinstance(enabled, bool):
+            raise SourcePolicyError("maintenance must be a boolean")
+        if not isinstance(expected_sha256, str) or re.fullmatch(r"[a-f0-9]{64}", expected_sha256) is None:
+            raise SourcePolicyError("expected_sha256 must be a sha256 hex digest")
+        return self._mutate_source(None, "maintenance", enabled, expected_sha256)
 
 
 class Broker:
@@ -922,6 +938,8 @@ class Broker:
             raise ValueError("nightly evaluation never retries/requeues")
         now = self.clock()
         with self.lock, self.db:
+            if self.source_policy is not None and not self.source_policy.admission_allowed(source):
+                raise SourceAdmissionBlocked(source)
             rows = list(self.db.execute(
                 "SELECT id,attempt_count,compaction_state," + PRODUCER_STORAGE_JOB_PREDICATE +
                 " AS producer_storage FROM jobs WHERE source=? AND state='failed' "
@@ -1138,6 +1156,8 @@ class Broker:
                 raise ValueError("only failed or cancelled jobs may be retried")
             if row["compaction_state"] != "full":
                 raise ValueError("job retry retention has expired")
+            if self.source_policy is not None and not self.source_policy.admission_allowed(row["source"]):
+                raise SourceAdmissionBlocked(row["source"])
             now = self.clock()
             self._audit(
                 "job.retry_requested", job_id=job_id, source=row["source"],

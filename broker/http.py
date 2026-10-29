@@ -223,6 +223,19 @@ def serve(broker, host="127.0.0.1", port=8088, policy=None, storage_token=None):
                     self._json(409, {"error": {"code": error.code, "message": str(error)}})
                 except StorageContractError as error:
                     self._json(400, {"error": str(error)})
+            elif path == "/v1/maintenance/admission":
+                if not self._storage_authorized():
+                    return
+                try:
+                    if policy is None or not isinstance(body, dict) or set(body) != {"enabled", "expected_sha256"}:
+                        raise SourcePolicyError("maintenance requires enabled, expected_sha256 and a source policy")
+                    # The same lock serializes every durable claim/requeue, so
+                    # a successful response is an admission barrier.
+                    with broker.lock:
+                        enabled = policy.set_maintenance(body["enabled"], body["expected_sha256"])
+                    self._json(200, {"maintenance": enabled})
+                except SourcePolicyError as error:
+                    self._json(400, {"error": str(error)})
             elif path == "/v1/maintenance/compact":
                 if not self._storage_authorized():
                     return
@@ -250,6 +263,7 @@ def serve(broker, host="127.0.0.1", port=8088, policy=None, storage_token=None):
                     return
                 try:
                     result=broker.retry(job_id); self._json(200 if result else 404, result or {"error":"not found"})
+                except SourceAdmissionBlocked as error: self._admission_blocked(error)
                 except ValueError as e: self._json(409, {"error":str(e)})
             elif path.startswith("/v1/sources/") and path.endswith("/weight"):
                 source = unquote(path[len("/v1/sources/"):-len("/weight")]).strip("/")
@@ -335,6 +349,8 @@ def serve(broker, host="127.0.0.1", port=8088, policy=None, storage_token=None):
                     ))
                 except StorageAuthorizationRequired:
                     self._storage_authorized()
+                except SourceAdmissionBlocked as error:
+                    self._admission_blocked(error)
                 except (SourcePolicyError, ValueError) as error:
                     self._json(400, {"error": str(error)})
             elif path in {"/api/chat", "/api/generate"}:
