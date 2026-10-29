@@ -175,8 +175,8 @@
       "max_text_payload_json_bytes": 2097152,
       "model": "qwen3-vl:30b",
       "options": {
-        "num_ctx": 8192,
-        "num_predict": 2048,
+        "num_ctx": 16384,
+        "num_predict": 8192,
         "temperature": 0
       },
       "producer_storage_references": false,

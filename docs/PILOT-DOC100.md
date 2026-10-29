@@ -10,8 +10,9 @@ Nemo profiles remain distinct. Helper verifier HEAD cb7a94a is unchanged.
 
 Pilot requires source `pilot-mainpc`, kind `chat`, and a dedicated one of the four
 evaluation profiles. Generic/native/Nextcloud profiles cannot borrow this lane.
-Server-owned ctx8192/output2048/temp0/thinkfalse/streamfalse apply to every pilot
-profile, unlike Nextcloud Gemma26 generate ctx16384/output4096. Four user images,
+Server-owned ctx8192/output2048 applies to the Qwen2B and Gemma pilot profiles;
+the deployed Qwen30 pilot profile retains ctx16384/output8192. All four use
+temp0/thinkfalse/streamfalse. Nextcloud Gemma26 generate uses ctx16384/output4096. Four user images,
 24MiB decoded total, 32MiB normalized image request JSON, 2MiB text-only JSON,
 16 system/user messages, no tools/history/producer refs. These bounds apply AFTER
 HTTP JSON parsing: `/v1/jobs` has no global preparse Content-Length hard cap.
