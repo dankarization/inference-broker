@@ -11,9 +11,9 @@ cancel-requested leases and check `can_admit` while claiming the next job under
 the same lock/transaction. It must retain a lease until the remote process has
 actually stopped, including cancellation, timeout, recovery and drain. Merely
 expiring a lease is not proof of GPU release. Multiple dispatcher processes need
-cross-process transaction serialization. Existing scheduler usage accounting
-tracks one active batch, so it must be extended to per-attempt accounting before
-concurrency is enabled; preserve reciprocal source weighting and non-preemption.
+cross-process transaction serialization. Scheduler usage accounting is keyed by
+attempt, but its behavior under real overlapping execution remains unproven;
+verify reciprocal source weighting and non-preemption before enabling concurrency.
 It must continue enforcing profile/source concurrency and FIFO semantics.
 
 ## Probe hook
