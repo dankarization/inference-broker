@@ -5,6 +5,8 @@ import tempfile
 import threading
 import unittest
 import http.server
+import io
+import wave
 from broker import voice
 from unittest.mock import patch
 from broker.service import Broker, SourcePolicy
@@ -72,6 +74,90 @@ class VoiceTests(unittest.TestCase):
                 release.set()
                 thread.join(5)
             self.assertEqual(self.broker.status(job)['state'], 'cancelled')
+
+    def test_multiple_streams_hold_one_lease_until_each_call_returns(self):
+        wav = io.BytesIO()
+        with wave.open(wav, 'wb') as audio:
+            audio.setparams((1, 2, 16000, 0, 'NONE', 'not compressed'))
+            audio.writeframes(b'\0\0' * 32)
+        payloads = {
+            'voice-wyoming-v1': {'filename': 'a.wav', 'audio_base64': base64.b64encode(wav.getvalue()).decode()},
+            'voice-whisper-gpu-v1': self.payload,
+        }
+        entered = [threading.Event() for _ in range(4)]
+        release = [threading.Event() for _ in range(4)]
+        calls, active = [], []
+        def run(profile, payload, timeout):
+            index = len(calls)
+            calls.append(profile)
+            active.append(profile)
+            entered[index].set()
+            try:
+                if not release[index].wait(5):
+                    raise RuntimeError('test timeout')
+                return {'text': profile}
+            finally:
+                active.remove(profile)
+
+        profiles = ['voice-wyoming-v1', 'voice-whisper-gpu-v1'] * 2
+        jobs = []
+        with patch('broker.voice.execute', side_effect=run):
+            for index, profile in enumerate(profiles):
+                jobs.append(self.broker.submit(profile, 'transcribe', payloads[profile], source='local-voice')['id'])
+                self.clock.advance(1)
+                if index == 0:
+                    worker = threading.Thread(target=lambda: self.broker.dispatch_once(policy=self.policy))
+                    worker.start()
+                    self.assertTrue(entered[0].wait(2))
+            try:
+                for index in range(4):
+                    if index:
+                        worker = threading.Thread(target=lambda: self.broker.dispatch_once(policy=self.policy))
+                        worker.start()
+                        self.assertTrue(entered[index].wait(2))
+                    running = [job for job in jobs if self.broker.status(job)['state'] == 'running']
+                    self.assertEqual(len(running), 1)
+                    self.assertEqual(len(active), 1)
+                    attempt = self.broker.attempts(running[0])[0]
+                    self.assertGreaterEqual(attempt['lease_until'], self.clock() + 1800)
+                    self.assertFalse(self.broker.dispatch_once(policy=self.policy))
+                    self.assertEqual(sum(len(self.broker.attempts(job)) for job in jobs), index + 1)
+                    release[index].set()
+                    worker.join(5)
+                    self.assertFalse(worker.is_alive())
+                    self.assertEqual(self.broker.status(running[0])['state'], 'completed')
+                self.assertCountEqual(calls, profiles)
+                self.assertTrue(all(self.broker.status(job)['state'] == 'completed' for job in jobs))
+            finally:
+                for event in release:
+                    event.set()
+                worker.join(5)
+
+    def test_low_priority_voice_coexists_with_light_model(self):
+        path = os.path.join(self.tmp.name, 'coexistence-policy')
+        with open(path, 'w') as f:
+            json.dump({'sources': {'local-voice': {'weight': 7}, 'openclaw': {'weight': 1}}}, f)
+        policy = SourcePolicy(path)  # Test-only policy; production voice remains weight 2.
+        voice_jobs = [self.voice() for _ in range(8)]
+        light_jobs = [self.broker.submit('openclaw-smolvlm2-500m', 'chat',
+                      {'messages': [{'role': 'user', 'content': str(i)}]}, source='openclaw')['id']
+                      for i in range(8)]
+        def transcribe(*args):
+            self.clock.advance(400)
+            return {'text': 'ok'}
+        with patch('broker.voice.execute', side_effect=transcribe):
+            # 400-second non-preemptive jobs overrun the 3,150-second light
+            # allocation by 50 seconds; the ninth selection is voice.
+            for index in range(9):
+                self.assertTrue(self.broker.dispatch_once(policy=policy))
+                if index == 0:
+                    light_jobs.append(self.broker.submit('openclaw-smolvlm2-500m', 'chat',
+                        {'messages': [{'role': 'user', 'content': 'extra'}]}, source='openclaw')['id'])
+        self.assertEqual(sum(self.broker.status(job)['state'] == 'completed' for job in light_jobs), 8)
+        self.assertEqual(sum(self.broker.status(job)['state'] == 'completed' for job in voice_jobs), 1)
+        self.assertTrue(any(isinstance(call, tuple) and call[0] == 'run' and
+                            call[2].get('model', '').startswith('hf.co/ggml-org/SmolVLM2-500M')
+                            for call in self.calls))
 
     def test_http_worker_wire_contract(self):
         received = {}
