@@ -9,6 +9,7 @@ from zoneinfo import ZoneInfo
 
 from .storage import PUBLIC_JOB_PREDICATE
 from .profiles import PROFILES
+from .table_sort import TABLE_SORT_CSS, TABLE_SORT_JS
 
 
 LOCAL_TIMEZONE = ZoneInfo("Asia/Tbilisi")
@@ -179,10 +180,22 @@ def render(data: dict[str, Any]) -> bytes:
 
     def timestamp_cell(value: float | None, *, tag: str = "td") -> str:
         display = local_timestamp(value)
+        sort_attr = (
+            f' data-sort-value="{html.escape(str(value), quote=True)}"'
+            if tag == "td" and value is not None else ""
+        )
         if display is None:
-            return f"<{tag}>—</{tag}>"
+            return f"<{tag}{sort_attr}>—</{tag}>"
         title = html.escape(timestamp_title(value) or "", quote=True)
-        return f'<{tag} title="{title}">{html.escape(display)}</{tag}>'
+        return f'<{tag}{sort_attr} title="{title}">{html.escape(display)}</{tag}>'
+
+    def sort_th(label: str, key: str, extra_class: str = "") -> str:
+        cls = f" class={extra_class}" if extra_class else ""
+        return (
+            f'<th data-sort-key="{html.escape(key)}"{cls}>'
+            f'<button type=button class=sort-btn>{html.escape(label)}'
+            f'<span class=sort-mark aria-hidden=true>↕</span></button></th>'
+        )
 
     if observation["state"] == "unavailable":
         reason = html.escape(str(observation.get("reason", "dashboard data unavailable")))
@@ -204,7 +217,7 @@ def render(data: dict[str, Any]) -> bytes:
         )
         source_attribute = html.escape(source, quote=True)
         return (
-            '<td><form class="weight-form" data-source="'
+            f'<td data-sort-value="{selected}"><form class="weight-form" data-source="'
             f'{source_attribute}"><select name="weight" aria-label="Weight for '
             f'{source_attribute}">{options}</select>'
             '<span class="weight-feedback" aria-live="polite"></span></form></td>'
@@ -213,7 +226,7 @@ def render(data: dict[str, Any]) -> bytes:
     def enabled_cell(source: str, value: bool | None) -> str:
         if value is None: return "<td>—</td>"
         source_attribute = html.escape(source, quote=True)
-        return (f'<td><form class="enabled-form" data-source="{source_attribute}">'
+        return (f'<td data-sort-value="{1 if value else 0}"><form class="enabled-form" data-source="{source_attribute}">'
                 f'<select name="enabled" aria-label="Dispatch enabled for {source_attribute}">'
                 f'<option value="true"{" selected" if value else ""}>running</option>'
                 f'<option value="false"{" selected" if not value else ""}>paused</option></select>'
@@ -221,7 +234,7 @@ def render(data: dict[str, Any]) -> bytes:
 
     def admission_cell(source: str, value: bool) -> str:
         source_attribute = html.escape(source, quote=True)
-        return (f'<td><form class="admission-form" data-source="{source_attribute}">'
+        return (f'<td data-sort-value="{1 if value else 0}"><form class="admission-form" data-source="{source_attribute}">'
                 f'<select name="admission" aria-label="Admission for {source_attribute}">'
                 f'<option value="true"{" selected" if value else ""}>allowed</option>'
                 f'<option value="false"{" selected" if not value else ""}>blocked</option></select>'
@@ -230,7 +243,7 @@ def render(data: dict[str, Any]) -> bytes:
     def bulk_cell(source: str, queued: int, failed: int) -> str:
         source_attribute = html.escape(source, quote=True)
         return (
-            f'<td><button class="bulk-action" data-source="{source_attribute}" '
+            f'<td data-sort-value="{queued:05d},{failed:05d}"><button class="bulk-action" data-source="{source_attribute}" '
             f'data-action="queued/cancel" data-count="{queued}"'
             f'{" disabled" if not queued else ""}>Cancel queued ({queued})</button> '
             f'<button class="bulk-action" data-source="{source_attribute}" '
@@ -274,11 +287,11 @@ def render(data: dict[str, Any]) -> bytes:
             f"<td>{cell(job['retry_count'])}</td>",
         )) + "</tr>"
         for job in active
-    ) or "<tr><td colspan=7>None</td></tr>"
+    ) or "<tr data-sort-ignore><td colspan=7>None</td></tr>"
     history_rows = "".join(
         f"<tr data-history-id='{cell(row['id'])}'><td class=compact>{cell(row['id'])}</td><td>{cell(row['source'])}</td><td>{cell(row['profile'])}</td><td>{cell(row['model'])}</td><td>{cell(row['state'])}</td><td>{cell(row['model_turn_display'])}</td><td class=compact>{cell(row['finished_display'])}</td><td class=compact>{cell(row['attempt_count'])}</td></tr>"
         for row in map(history_display, data.get("history", []))
-    ) or "<tr><td colspan=8>None</td></tr>"
+    ) or "<tr data-sort-ignore><td colspan=8>None</td></tr>"
     forecast = data.get("forecast")
     forecast_html = ""
     if forecast:
@@ -301,36 +314,43 @@ def render(data: dict[str, Any]) -> bytes:
                     f"<td>{cell(item['wait_seconds'])}s</td>",
                 )) + "</tr>"
                 for item in forecast.get("next_selections", [])
-            ) or "<tr><td colspan=8>None queued</td></tr>"
+            ) or "<tr data-sort-ignore><td colspan=8>None queued</td></tr>"
             forecast_html = (
                 "<h2>Forecast</h2>"
                 f"<p>Current model: <b>{current_model}</b> · Lower Weight gets more GPU time (reciprocal shares); "
                 "contiguous model batches, FIFO within a source. Active jobs are not interrupted.</p>"
-                "<table><thead><tr><th>Job</th><th>Source</th><th>Profile</th><th>Model</th>"
-                "<th>Weight</th><th>Mode</th><th class=compact>Reason</th><th>Wait</th></tr></thead>"
+                "<table><thead><tr>"
+                + sort_th("Job", "job") + sort_th("Source", "source")
+                + sort_th("Profile", "profile") + sort_th("Model", "model")
+                + sort_th("Weight", "weight") + sort_th("Mode", "mode")
+                + sort_th("Reason", "reason", "compact") + sort_th("Wait", "wait")
+                + "</tr></thead>"
                 f"<tbody>{selection_rows}</tbody></table>"
                 f"<p><small>{html.escape(forecast.get('contingency', ''))}.</small></p>"
             )
     overall = data["overall"]
     document = f"""<!doctype html><html lang=en><meta charset=utf-8>
 <meta http-equiv=refresh content=30><title>Ollama broker queue</title>
-<style>body{{font:14px system-ui,sans-serif;margin:2rem;color:#18212b}}table{{border-collapse:collapse;width:100%;margin:1rem 0}}th,td{{padding:.45rem;border:1px solid #ccd6df;text-align:right}}th:first-child,td:first-child{{text-align:left}}th{{background:#edf3f7}}.compact{{width:1%;white-space:nowrap}}code{{font-size:.9em}}.summary{{font-size:1.05rem}}.weight-form,.enabled-form,.admission-form{{display:flex;gap:.35rem;align-items:center;justify-content:flex-end}}.weight-feedback,.enabled-feedback,.admission-feedback,.bulk-feedback{{min-width:4rem;text-align:left}}.error{{color:#a00}}button{{margin:.15rem}}</style>
+<style>body{{font:14px system-ui,sans-serif;margin:2rem;color:#18212b}}table{{border-collapse:collapse;width:100%;margin:1rem 0}}th,td{{padding:.45rem;border:1px solid #ccd6df;text-align:right}}th:first-child,td:first-child{{text-align:left}}th{{background:#edf3f7}}.compact{{width:1%;white-space:nowrap}}code{{font-size:.9em}}.summary{{font-size:1.05rem}}.weight-form,.enabled-form,.admission-form{{display:flex;gap:.35rem;align-items:center;justify-content:flex-end}}.weight-feedback,.enabled-feedback,.admission-feedback,.bulk-feedback{{min-width:4rem;text-align:left}}.error{{color:#a00}}button{{margin:.15rem}}/* TABLE_SORT_CSS */</style>
 <h1>Ollama inference broker queue</h1><p>Snapshot timestamp: {timestamp_cell(data['timestamp'], tag='code')} · refreshes every 30 seconds.</p>
 {('<p class=error>Showing stale data: ' + html.escape(str(observation.get('reason', 'database observer read unavailable'))) + '.</p>') if observation['state'] == 'stale' else ''}
 <p class=summary>Completed: <b>{overall['states']['completed']}</b> total · <b>{overall['completed_last_hour']}</b> last hour · <b>{overall['completed_last_24_hours']}</b> last 24 hours.</p>
-<h2>Sources</h2><table><thead><tr><th>Source</th><th>Dispatch</th><th>Admission</th><th>Weight</th><th>Queued</th><th>Running</th><th>Lease</th><th>Retry</th><th>Delayed</th><th>Failed</th><th>Cancelled</th><th>Completed total</th><th>Completed 1h</th><th>Completed 24h</th><th>Bulk actions</th></tr></thead><tbody>{''.join(rows) or '<tr><td colspan=15>None</td></tr>'}</tbody></table>
+<h2>Sources</h2><table><thead><tr>{sort_th('Source','source')}{sort_th('Dispatch','dispatch')}{sort_th('Admission','admission')}{sort_th('Weight','weight')}{sort_th('Queued','queued')}{sort_th('Running','running')}{sort_th('Lease','lease')}{sort_th('Retry','retry')}{sort_th('Delayed','delayed')}{sort_th('Failed','failed')}{sort_th('Cancelled','cancelled')}{sort_th('Completed total','completed')}{sort_th('Completed 1h','completed_1h')}{sort_th('Completed 24h','completed_24h')}{sort_th('Bulk actions','bulk')}</tr></thead><tbody>{''.join(rows) or '<tr data-sort-ignore><td colspan=15>None</td></tr>'}</tbody></table>
 <p><small>Dispatch pause preserves queued jobs and lets a running job finish. Admission block rejects new jobs and does not change the queue. Delayed jobs are waiting for a source min-interval.</small></p>
-<h2>Active jobs</h2><table><thead><tr><th class=compact>ID</th><th>Source</th><th>State</th><th>Started</th><th>Lease until</th><th class=compact>Attempts</th><th>Retries</th></tr></thead><tbody>{active_rows}</tbody></table>
+<h2>Active jobs</h2><table><thead><tr>{sort_th('ID','id','compact')}{sort_th('Source','source')}{sort_th('State','state')}{sort_th('Started','started')}{sort_th('Lease until','lease_until')}{sort_th('Attempts','attempts','compact')}{sort_th('Retries','retries')}</tr></thead><tbody>{active_rows}</tbody></table>
 {forecast_html}
-<h2>History</h2><p><small>Finished: Asia/Tbilisi. Model turn: completed execution slot, including model preparation, excluding queue wait; unavailable for cancelled, failed or unstarted jobs.</small></p><table><thead><tr><th class=compact>ID</th><th>Source</th><th>Profile</th><th>Model</th><th>State</th><th>Model turn</th><th class=compact>Finished</th><th class=compact>Attempts</th></tr></thead><tbody id=history-body>{history_rows}</tbody></table><div id=history-sentinel data-cursor="{html.escape(str((data.get('history') or [{}])[-1].get('finished','')) + ':' + str((data.get('history') or [{}])[-1].get('id','')), quote=True)}"></div>
+<h2>History</h2><p><small>Finished: Asia/Tbilisi. Model turn: completed execution slot, including model preparation, excluding queue wait; unavailable for cancelled, failed or unstarted jobs.</small></p><table id=history-table><thead><tr>{sort_th('ID','id','compact')}{sort_th('Source','source')}{sort_th('Profile','profile')}{sort_th('Model','model')}{sort_th('State','state')}{sort_th('Model turn','model_turn')}{sort_th('Finished','finished','compact')}{sort_th('Attempts','attempts','compact')}</tr></thead><tbody id=history-body>{history_rows}</tbody></table><div id=history-sentinel data-cursor="{html.escape(str((data.get('history') or [{}])[-1].get('finished','')) + ':' + str((data.get('history') or [{}])[-1].get('id','')), quote=True)}"></div>
 <script>
+/* TABLE_SORT_JS */
+document.querySelectorAll('table').forEach(function(table){{ TableSort.bind(table); }});
 const bindPolicySelect=(form, field)=>{{ const select=form.elements[field], feedback=form.querySelector('.'+field+'-feedback'); let saved=select.value, desired=saved, saving=false; const flush=async()=>{{ if(saving)return; saving=true; while(desired!==saved){{ const value=desired; feedback.className=field+'-feedback'; feedback.textContent='Saving…'; try {{ const response=await fetch('/v1/sources/'+encodeURIComponent(form.dataset.source)+'/'+field,{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{[field]:field==='weight'?Number(value):value==='true'}})}}); const result=await response.json(); if(!response.ok)throw new Error(result.error||'save failed'); saved=String(result[field]); if(desired===value){{ select.value=saved; feedback.textContent='Saved'; }} }} catch(error) {{ if(desired===value){{ select.value=saved; feedback.className=field+'-feedback error'; feedback.textContent=error.message||'Save failed'; break; }} }} }} saving=false; }}; select.addEventListener('change',()=>{{ desired=select.value; flush(); }}); }};
 document.querySelectorAll('.weight-form').forEach(form=>bindPolicySelect(form,'weight'));
 document.querySelectorAll('.enabled-form').forEach(form=>bindPolicySelect(form,'enabled'));
 const bindAdmissionSelect=form=>{{ const select=form.elements.admission, feedback=form.querySelector('.admission-feedback'); let saved=select.value, desired=saved, saving=false; const flush=async()=>{{ if(saving)return; saving=true; while(desired!==saved){{ const value=desired; feedback.className='admission-feedback'; feedback.textContent='Saving…'; try {{ const response=await fetch('/v1/sources/'+encodeURIComponent(form.dataset.source)+'/admission',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{allowed:value==='true'}})}}); const result=await response.json(); if(!response.ok)throw new Error(result.error||'save failed'); saved=String(result.admission_allowed); if(desired===value){{ select.value=saved; feedback.textContent='Saved'; }} }} catch(error) {{ if(desired===value){{ select.value=saved; feedback.className='admission-feedback error'; feedback.textContent=error.message||'Save failed'; break; }} }} }} saving=false; }}; select.addEventListener('change',()=>{{desired=select.value;flush();}}); }};
 document.querySelectorAll('.admission-form').forEach(bindAdmissionSelect);
 document.querySelectorAll('.bulk-action').forEach(button=>button.addEventListener('click',async()=>{{ const count=Number(button.dataset.count), source=button.dataset.source, action=button.dataset.action; if(!window.confirm(action==='queued/cancel'?'Cancel '+count+' queued jobs for '+source+'?':'Retry '+count+' failed jobs for '+source+'?'))return; const feedback=button.parentElement.querySelector('.bulk-feedback'); button.parentElement.querySelectorAll('button').forEach(item=>item.disabled=true); try {{ const response=await fetch('/v1/sources/'+encodeURIComponent(source)+'/'+action,{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{confirm:true}})}}); const result=await response.json(); if(!response.ok)throw new Error(result.error||'operation failed'); feedback.textContent=String(result.cancelled??result.retried)+' changed'; }} catch(error) {{ feedback.className='bulk-feedback error'; feedback.textContent=error.message||'Operation failed'; }} }}));
-const sentinel=document.querySelector('#history-sentinel'); let loading=false; const historyBody=document.querySelector('#history-body'); new IntersectionObserver(async entries => {{ if(loading||!entries[0].isIntersecting||!sentinel.dataset.cursor) return; loading=true; const response=await fetch('/v1/history?limit=30&cursor='+encodeURIComponent(sentinel.dataset.cursor)); const page=await response.json(); (page.items||[]).forEach(row=>{{ const tr=document.createElement('tr'); tr.dataset.historyId=row.id; [row.id,row.source,row.profile,row.model,row.state,row.model_turn_display,row.finished_display,row.attempt_count].forEach((value,index)=>{{ const td=document.createElement('td'); td.textContent=value==null?'—':String(value); if([0,6,7].includes(index))td.className='compact'; tr.append(td); }}); historyBody.append(tr); }}); sentinel.dataset.cursor=page.next_cursor||''; loading=false; }}).observe(sentinel);
+const sentinel=document.querySelector('#history-sentinel'); let loading=false; const historyBody=document.querySelector('#history-body'); new IntersectionObserver(async entries => {{ if(loading||!entries[0].isIntersecting||!sentinel.dataset.cursor) return; loading=true; const response=await fetch('/v1/history?limit=30&cursor='+encodeURIComponent(sentinel.dataset.cursor)); const page=await response.json(); (page.items||[]).forEach(row=>{{ const tr=document.createElement('tr'); tr.dataset.historyId=row.id; [row.id,row.source,row.profile,row.model,row.state,row.model_turn_display,row.finished_display,row.attempt_count].forEach((value,index)=>{{ const td=document.createElement('td'); td.textContent=value==null?'—':String(value); if([0,6,7].includes(index))td.className='compact'; tr.append(td); }}); historyBody.append(tr); const historySort=document.querySelector('#history-table'); if(historySort&&historySort._tableSort) historySort._tableSort.addRow(tr); }}); sentinel.dataset.cursor=page.next_cursor||''; loading=false; }}).observe(sentinel);
 </script>
 """
+    document = document.replace("/* TABLE_SORT_CSS */", TABLE_SORT_CSS).replace("/* TABLE_SORT_JS */", TABLE_SORT_JS)
     return document.encode("utf-8")
