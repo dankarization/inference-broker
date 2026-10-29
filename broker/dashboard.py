@@ -8,9 +8,33 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 from .storage import PUBLIC_JOB_PREDICATE
+from .profiles import PROFILES
 
 
 LOCAL_TIMEZONE = ZoneInfo("Asia/Tbilisi")
+
+
+def history_display(row: dict[str, Any]) -> dict[str, Any]:
+    """Shared display values for initial HTML and paged history (no payload reads)."""
+    finished = row.get("finished")
+    started = row.get("started")
+    duration = (
+        float(finished) - float(started)
+        if row.get("state") == "completed" and started is not None
+        and finished is not None and finished >= started else None
+    )
+    profile = PROFILES.get(row.get("profile"))
+    return dict(
+        row,
+        model=profile.model if profile else None,
+        model_turn_seconds=duration,
+        model_turn_display=f"{duration:.3f}s" if duration is not None else "—",
+        finished_display=(
+            datetime.fromtimestamp(float(finished), tz=timezone.utc)
+            .astimezone(LOCAL_TIMEZONE).strftime("%d/%m/%Y, %H:%M:%S")
+            if finished is not None else "—"
+        ),
+    )
 
 
 def local_timestamp(value: float | None) -> str | None:
@@ -241,20 +265,20 @@ def render(data: dict[str, Any]) -> bytes:
     active = data["active_jobs"]
     active_rows = "".join(
         "<tr>" + "".join((
-            f"<td>{cell(job['id'])}</td>",
+            f"<td class=compact>{cell(job['id'])}</td>",
             f"<td>{cell(job['source'])}</td>",
             f"<td>{cell(job['state'])}</td>",
             timestamp_cell(job["started"]),
             timestamp_cell(job["lease_until"]),
-            f"<td>{cell(job['attempt_count'])}</td>",
+            f"<td class=compact>{cell(job['attempt_count'])}</td>",
             f"<td>{cell(job['retry_count'])}</td>",
         )) + "</tr>"
         for job in active
     ) or "<tr><td colspan=7>None</td></tr>"
     history_rows = "".join(
-        f"<tr data-history-id='{cell(row['id'])}'><td>{cell(row['id'])}</td><td>{cell(row['source'])}</td><td>{cell(row['profile'])}</td><td>{cell(row['state'])}</td>{timestamp_cell(row['finished'])}<td>{cell(row['attempt_count'])}</td></tr>"
-        for row in data.get("history", [])
-    ) or "<tr><td colspan=6>None</td></tr>"
+        f"<tr data-history-id='{cell(row['id'])}'><td class=compact>{cell(row['id'])}</td><td>{cell(row['source'])}</td><td>{cell(row['profile'])}</td><td>{cell(row['model'])}</td><td>{cell(row['state'])}</td><td>{cell(row['model_turn_display'])}</td><td class=compact>{cell(row['finished_display'])}</td><td class=compact>{cell(row['attempt_count'])}</td></tr>"
+        for row in map(history_display, data.get("history", []))
+    ) or "<tr><td colspan=8>None</td></tr>"
     forecast = data.get("forecast")
     forecast_html = ""
     if forecast:
@@ -269,35 +293,36 @@ def render(data: dict[str, Any]) -> bytes:
                 "<tr>" + "".join((
                     f"<td>{cell(item['job_id'])}</td>",
                     f"<td>{cell(item['source'])}</td>",
+                    f"<td>{cell(item.get('profile'))}</td>",
                     f"<td>{cell(item['model'])}</td>",
                     f"<td>{cell(item['weight'])}</td>",
                     f"<td>{cell(item['mode'])}</td>",
-                    f"<td>{cell(item['reason'])}</td>",
+                    f"<td class=compact>{cell(item['reason'])}</td>",
                     f"<td>{cell(item['wait_seconds'])}s</td>",
                 )) + "</tr>"
                 for item in forecast.get("next_selections", [])
-            ) or "<tr><td colspan=7>None queued</td></tr>"
+            ) or "<tr><td colspan=8>None queued</td></tr>"
             forecast_html = (
                 "<h2>Forecast</h2>"
-                f"<p>Current model: <b>{current_model}</b> · Higher Weight receives a "
-                "larger 60-minute execution-time allocation.</p>"
-                "<table><thead><tr><th>Job</th><th>Source</th><th>Model</th>"
-                "<th>Weight</th><th>Mode</th><th>Reason</th><th>Wait</th></tr></thead>"
+                f"<p>Current model: <b>{current_model}</b> · Lower Weight gets more GPU time (reciprocal shares); "
+                "contiguous model batches, FIFO within a source. Active jobs are not interrupted.</p>"
+                "<table><thead><tr><th>Job</th><th>Source</th><th>Profile</th><th>Model</th>"
+                "<th>Weight</th><th>Mode</th><th class=compact>Reason</th><th>Wait</th></tr></thead>"
                 f"<tbody>{selection_rows}</tbody></table>"
                 f"<p><small>{html.escape(forecast.get('contingency', ''))}.</small></p>"
             )
     overall = data["overall"]
     document = f"""<!doctype html><html lang=en><meta charset=utf-8>
 <meta http-equiv=refresh content=30><title>Ollama broker queue</title>
-<style>body{{font:14px system-ui,sans-serif;margin:2rem;color:#18212b}}table{{border-collapse:collapse;width:100%;margin:1rem 0}}th,td{{padding:.45rem;border:1px solid #ccd6df;text-align:right}}th:first-child,td:first-child{{text-align:left}}th{{background:#edf3f7}}code{{font-size:.9em}}.summary{{font-size:1.05rem}}.weight-form,.enabled-form,.admission-form{{display:flex;gap:.35rem;align-items:center;justify-content:flex-end}}.weight-feedback,.enabled-feedback,.admission-feedback,.bulk-feedback{{min-width:4rem;text-align:left}}.error{{color:#a00}}button{{margin:.15rem}}</style>
+<style>body{{font:14px system-ui,sans-serif;margin:2rem;color:#18212b}}table{{border-collapse:collapse;width:100%;margin:1rem 0}}th,td{{padding:.45rem;border:1px solid #ccd6df;text-align:right}}th:first-child,td:first-child{{text-align:left}}th{{background:#edf3f7}}.compact{{width:1%;white-space:nowrap}}code{{font-size:.9em}}.summary{{font-size:1.05rem}}.weight-form,.enabled-form,.admission-form{{display:flex;gap:.35rem;align-items:center;justify-content:flex-end}}.weight-feedback,.enabled-feedback,.admission-feedback,.bulk-feedback{{min-width:4rem;text-align:left}}.error{{color:#a00}}button{{margin:.15rem}}</style>
 <h1>Ollama inference broker queue</h1><p>Snapshot timestamp: {timestamp_cell(data['timestamp'], tag='code')} · refreshes every 30 seconds.</p>
 {('<p class=error>Showing stale data: ' + html.escape(str(observation.get('reason', 'database observer read unavailable'))) + '.</p>') if observation['state'] == 'stale' else ''}
 <p class=summary>Completed: <b>{overall['states']['completed']}</b> total · <b>{overall['completed_last_hour']}</b> last hour · <b>{overall['completed_last_24_hours']}</b> last 24 hours.</p>
 <h2>Sources</h2><table><thead><tr><th>Source</th><th>Dispatch</th><th>Admission</th><th>Weight</th><th>Queued</th><th>Running</th><th>Lease</th><th>Retry</th><th>Delayed</th><th>Failed</th><th>Cancelled</th><th>Completed total</th><th>Completed 1h</th><th>Completed 24h</th><th>Bulk actions</th></tr></thead><tbody>{''.join(rows) or '<tr><td colspan=15>None</td></tr>'}</tbody></table>
 <p><small>Dispatch pause preserves queued jobs and lets a running job finish. Admission block rejects new jobs and does not change the queue. Delayed jobs are waiting for a source min-interval.</small></p>
-<h2>Active jobs</h2><table><thead><tr><th>ID</th><th>Source</th><th>State</th><th>Started</th><th>Lease until</th><th>Attempts</th><th>Retries</th></tr></thead><tbody>{active_rows}</tbody></table>
+<h2>Active jobs</h2><table><thead><tr><th class=compact>ID</th><th>Source</th><th>State</th><th>Started</th><th>Lease until</th><th class=compact>Attempts</th><th>Retries</th></tr></thead><tbody>{active_rows}</tbody></table>
 {forecast_html}
-<h2>History</h2><table><thead><tr><th>ID</th><th>Source</th><th>Profile</th><th>State</th><th>Finished</th><th>Attempts</th></tr></thead><tbody id=history-body>{history_rows}</tbody></table><div id=history-sentinel data-cursor="{html.escape(str((data.get('history') or [{}])[-1].get('finished','')) + ':' + str((data.get('history') or [{}])[-1].get('id','')), quote=True)}"></div>
+<h2>History</h2><p><small>Finished: Asia/Tbilisi. Model turn: completed execution slot, including model preparation, excluding queue wait; unavailable for cancelled, failed or unstarted jobs.</small></p><table><thead><tr><th class=compact>ID</th><th>Source</th><th>Profile</th><th>Model</th><th>State</th><th>Model turn</th><th class=compact>Finished</th><th class=compact>Attempts</th></tr></thead><tbody id=history-body>{history_rows}</tbody></table><div id=history-sentinel data-cursor="{html.escape(str((data.get('history') or [{}])[-1].get('finished','')) + ':' + str((data.get('history') or [{}])[-1].get('id','')), quote=True)}"></div>
 <script>
 const bindPolicySelect=(form, field)=>{{ const select=form.elements[field], feedback=form.querySelector('.'+field+'-feedback'); let saved=select.value, desired=saved, saving=false; const flush=async()=>{{ if(saving)return; saving=true; while(desired!==saved){{ const value=desired; feedback.className=field+'-feedback'; feedback.textContent='Saving…'; try {{ const response=await fetch('/v1/sources/'+encodeURIComponent(form.dataset.source)+'/'+field,{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{[field]:field==='weight'?Number(value):value==='true'}})}}); const result=await response.json(); if(!response.ok)throw new Error(result.error||'save failed'); saved=String(result[field]); if(desired===value){{ select.value=saved; feedback.textContent='Saved'; }} }} catch(error) {{ if(desired===value){{ select.value=saved; feedback.className=field+'-feedback error'; feedback.textContent=error.message||'Save failed'; break; }} }} }} saving=false; }}; select.addEventListener('change',()=>{{ desired=select.value; flush(); }}); }};
 document.querySelectorAll('.weight-form').forEach(form=>bindPolicySelect(form,'weight'));
@@ -305,7 +330,7 @@ document.querySelectorAll('.enabled-form').forEach(form=>bindPolicySelect(form,'
 const bindAdmissionSelect=form=>{{ const select=form.elements.admission, feedback=form.querySelector('.admission-feedback'); let saved=select.value, desired=saved, saving=false; const flush=async()=>{{ if(saving)return; saving=true; while(desired!==saved){{ const value=desired; feedback.className='admission-feedback'; feedback.textContent='Saving…'; try {{ const response=await fetch('/v1/sources/'+encodeURIComponent(form.dataset.source)+'/admission',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{allowed:value==='true'}})}}); const result=await response.json(); if(!response.ok)throw new Error(result.error||'save failed'); saved=String(result.admission_allowed); if(desired===value){{ select.value=saved; feedback.textContent='Saved'; }} }} catch(error) {{ if(desired===value){{ select.value=saved; feedback.className='admission-feedback error'; feedback.textContent=error.message||'Save failed'; break; }} }} }} saving=false; }}; select.addEventListener('change',()=>{{desired=select.value;flush();}}); }};
 document.querySelectorAll('.admission-form').forEach(bindAdmissionSelect);
 document.querySelectorAll('.bulk-action').forEach(button=>button.addEventListener('click',async()=>{{ const count=Number(button.dataset.count), source=button.dataset.source, action=button.dataset.action; if(!window.confirm(action==='queued/cancel'?'Cancel '+count+' queued jobs for '+source+'?':'Retry '+count+' failed jobs for '+source+'?'))return; const feedback=button.parentElement.querySelector('.bulk-feedback'); button.parentElement.querySelectorAll('button').forEach(item=>item.disabled=true); try {{ const response=await fetch('/v1/sources/'+encodeURIComponent(source)+'/'+action,{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{confirm:true}})}}); const result=await response.json(); if(!response.ok)throw new Error(result.error||'operation failed'); feedback.textContent=String(result.cancelled??result.retried)+' changed'; }} catch(error) {{ feedback.className='bulk-feedback error'; feedback.textContent=error.message||'Operation failed'; }} }}));
-const sentinel=document.querySelector('#history-sentinel'); let loading=false; const historyBody=document.querySelector('#history-body'); const displayTime=value=>new Date(Number(value)*1000).toLocaleString('en-GB',{{timeZone:'Asia/Tbilisi'}}); new IntersectionObserver(async entries => {{ if(loading||!entries[0].isIntersecting||!sentinel.dataset.cursor) return; loading=true; const response=await fetch('/v1/history?limit=30&cursor='+encodeURIComponent(sentinel.dataset.cursor)); const page=await response.json(); (page.items||[]).forEach(row=>{{ const tr=document.createElement('tr'); tr.dataset.historyId=row.id; [row.id,row.source,row.profile,row.state,displayTime(row.finished),row.attempt_count].forEach(value=>{{ const td=document.createElement('td'); td.textContent=String(value); tr.append(td); }}); historyBody.append(tr); }}); sentinel.dataset.cursor=page.next_cursor||''; loading=false; }}).observe(sentinel);
+const sentinel=document.querySelector('#history-sentinel'); let loading=false; const historyBody=document.querySelector('#history-body'); new IntersectionObserver(async entries => {{ if(loading||!entries[0].isIntersecting||!sentinel.dataset.cursor) return; loading=true; const response=await fetch('/v1/history?limit=30&cursor='+encodeURIComponent(sentinel.dataset.cursor)); const page=await response.json(); (page.items||[]).forEach(row=>{{ const tr=document.createElement('tr'); tr.dataset.historyId=row.id; [row.id,row.source,row.profile,row.model,row.state,row.model_turn_display,row.finished_display,row.attempt_count].forEach((value,index)=>{{ const td=document.createElement('td'); td.textContent=value==null?'—':String(value); if([0,6,7].includes(index))td.className='compact'; tr.append(td); }}); historyBody.append(tr); }}); sentinel.dataset.cursor=page.next_cursor||''; loading=false; }}).observe(sentinel);
 </script>
 """
     return document.encode("utf-8")

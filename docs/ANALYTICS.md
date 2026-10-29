@@ -85,9 +85,9 @@ Scheduler window сохраняет actual selection count/share и mode. Для
 `time_batch` fairness нельзя выводить из числа jobs: scheduler context каждого
 `scheduler.selected` содержит `horizon_seconds`, `time_budget_seconds` и
 накопленное время lane на момент выбора. Цель — доля **execution time**,
-пропорциональная прямому Weight среди ready lanes. Поэтому при постоянно
-заполненных weights `10` и `8` один 3600-секундный horizon имеет targets
-2000s и 1600s; последний non-preemptive job может дать документированный
+пропорциональная `1 / Weight` среди ready lanes. Поэтому при постоянно
+заполненных weights `1` и `7` один 3600-секундный horizon имеет targets
+3150s и 450s; последний non-preemptive job может дать документированный
 overrun. Disabled, пустые и rate-limited sources не делают GPU idle и не
 считаются нарушением доли.
 
@@ -96,13 +96,14 @@ overrun. Disabled, пустые и rate-limited sources не делают GPU id
 Алгоритм нельзя менять до накопления baseline и отдельного rollout. Затем на
 одинаковом replay workload безопасно сравниваются:
 
-- time-batch scheduler — текущий baseline: 60-минутная прямая доля времени,
+- time-batch scheduler — текущий baseline: 60-минутная обратная доля времени,
   model affinity и FIFO внутри source;
 - deficit round robin — лучше учитывает разную стоимость job, если появится
   надёжная оценка cost;
 - weighted fair queue — полезен при нескольких непрерывно загруженных sources,
-  но требует виртуального времени/cost;
-- aging — уменьшает starvation, но должен сохранять FIFO-инварианты source.
+  но требует виртуального времени/cost.
+
+Waiting time не повышает долю source; aging/promotion в текущей policy отсутствует.
 
 Основные критерии: p95 wait/e2e по source, throughput, success/retry/requeue,
 starvation (максимальный wait), actual-vs-expected share и смены модели. Нельзя

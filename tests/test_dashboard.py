@@ -1,5 +1,9 @@
 import json
+import html as html_module
+import re
+import shutil
 import sqlite3
+import subprocess
 import tempfile
 import threading
 import unittest
@@ -8,7 +12,8 @@ from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 from unittest.mock import patch
 
-from broker.dashboard import render, snapshot
+from broker.dashboard import history_display, render, snapshot
+from broker.profiles import PROFILES
 from broker.http import serve
 from broker.service import Broker, SourcePolicy
 
@@ -25,6 +30,104 @@ class FakeWol:
 
 
 class DashboardTests(unittest.TestCase):
+    def test_history_fields_are_payload_free_and_exclude_queue_wait(self):
+        db = tempfile.NamedTemporaryFile()
+        self.addCleanup(db.close)
+        broker = Broker(db.name, FakeOllama(), FakeWol())
+        self.addCleanup(broker.db.close)
+        finished = datetime(2026, 10, 28, 13, 52, 17, tzinfo=timezone.utc).timestamp()
+        with broker.db:
+            for job_id, state, started in (
+                ('done', 'completed', finished - 12.25),
+                ('cancelled', 'cancelled', finished - 20),
+                ('unstarted', 'completed', None),
+                ('failed', 'failed', finished - 30),
+            ):
+                broker.db.execute(
+                    'INSERT INTO jobs(id,profile,kind,source,payload,state,created,started,finished) '
+                    'VALUES(?,?,?,?,?,?,?,?,?)',
+                    (job_id, 'interactive', 'generate', 'source', '{"secret":"private"}',
+                     state, finished - 3600, started, finished),
+                )
+        first = broker.terminal_history(limit=2)
+        second = broker.terminal_history(limit=2, cursor=tuple(first['next_cursor']))
+        rows = first['items'] + second['items']
+        self.assertEqual(len(rows), 4)
+        for row in rows:
+            self.assertEqual(row['model'], PROFILES['interactive'].model)
+            self.assertEqual(row['finished_display'], '28/10/2026, 17:52:17')
+            self.assertEqual(row['model_turn_seconds'], 12.25 if row['id'] == 'done' else None)
+        self.assertNotIn('private', json.dumps(rows))
+        self.assertEqual(history_display({'finished': 0})['finished_display'], '01/01/1970, 04:00:00')
+        self.assertEqual(history_display({'finished': None})['finished_display'], '—')
+
+    def test_initial_and_appended_history_render_the_same_cells(self):
+        if shutil.which('node') is None:
+            self.skipTest('node required for real inline script execution')
+        finished = datetime(2026, 10, 28, 13, 52, 17, tzinfo=timezone.utc).timestamp()
+        raw_rows = [dict(id='job-<one>', source='source', profile='interactive',
+                         state=state, started=started, finished=finished, attempt_count=2)
+                    for state, started in [('completed', finished - 12.25),
+                                           ('cancelled', finished - 20), ('completed', None)]]
+        page_rows = [history_display(row) for row in raw_rows]
+        document = render({
+            'timestamp': finished, 'sources': [], 'active_jobs': [], 'history': raw_rows,
+            'overall': {'states': {'completed': 1}, 'completed_last_hour': 1, 'completed_last_24_hours': 1},
+            'forecast': {'next_selections': [dict(job_id='next', source='source',
+                profile='interactive', model=PROFILES['interactive'].model,
+                weight=1, mode='weight_priority', reason='lowest weight', wait_seconds=0)]},
+        }).decode()
+        history_html = document.split('<tbody id=history-body>')[1].split('</tbody>')[0]
+        initial_cells = [[html_module.unescape(value) for value in re.findall(r'<td[^>]*>(.*?)</td>', row)]
+                         for row in re.findall(r'<tr[^>]*>(.*?)</tr>', history_html)]
+        self.assertEqual(initial_cells[0], ['job-<one>', 'source', 'interactive',
+            PROFILES['interactive'].model, 'completed', '12.250s', '28/10/2026, 17:52:17', '2'])
+        self.assertEqual([row[5] for row in initial_cells], ['12.250s', '—', '—'])
+        forecast_html = document.split('<h2>Forecast</h2>')[1].split('<h2>History</h2>')[0]
+        self.assertIn('<th>Profile</th>', forecast_html)
+        self.assertIn('<td>interactive</td>', forecast_html)
+        self.assertIn('.compact{width:1%;white-space:nowrap}', document)
+        for label in ('ID', 'Finished', 'Attempts', 'Reason'):
+            self.assertIn(f'<th class=compact>{label}</th>', document)
+        for row in re.findall(r'<tr[^>]*>(.*?)</tr>', history_html):
+            self.assertEqual(re.findall(r'<td class=compact>(.*?)</td>', row),
+                             ['job-&lt;one&gt;', '28/10/2026, 17:52:17', '2'])
+        script = re.search(r'<script>(.*?)</script>', document, re.S).group(1)
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.js') as source:
+            source.write(script); source.flush()
+            checked = subprocess.run(['node', '--check', source.name], capture_output=True, text=True)
+            self.assertEqual(checked.returncode, 0, checked.stderr)
+        harness = r'''
+const assert=require('node:assert/strict');
+const vm=require('node:vm');
+class Element {
+  constructor(){this.children=[];this.dataset={};this.className='';this.textContent='';}
+  append(child){this.children.push(child);}
+}
+const body=new Element(), sentinel=new Element(); sentinel.dataset.cursor='cursor';
+global.document={querySelectorAll:()=>[], createElement:()=>new Element(),
+  querySelector:selector=>selector==='#history-body'?body:sentinel};
+let callback;
+global.IntersectionObserver=class {constructor(fn){callback=fn;} observe(){} };
+global.fetch=async()=>({json:async()=>({items:ROWS,next_cursor:null})});
+vm.runInThisContext('{'+SCRIPT+'\n}');
+(async()=>{
+  await callback([{isIntersecting:true}]);
+  assert.deepEqual(body.children.map(tr=>tr.children.map(td=>td.textContent)), EXPECTED);
+  for(const tr of body.children){
+    assert.equal(tr.dataset.historyId, 'job-<one>');
+    assert.deepEqual(tr.children.map((td,i)=>td.className==='compact'?i:null).filter(i=>i!==null),[0,6,7]);
+  }
+  assert.equal(sentinel.dataset.cursor,'');
+  console.log('history render contract PASS');
+})().catch(error=>{console.error(error);process.exitCode=1;});
+'''
+        harness = ('const ROWS=' + json.dumps(page_rows) + ';\nconst EXPECTED='
+                   + json.dumps(initial_cells) + ';\nconst SCRIPT=' + json.dumps(script) + ';\n' + harness)
+        result = subprocess.run(['node', '-e', harness], capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('history render contract PASS', result.stdout)
+
     def test_policy_select_state_machine_recovers_and_serializes(self):
         # Executable model of the rendered desired/saved/saving state machine.
         saved, desired, saving, sent = "A", "A", False, []
@@ -97,7 +200,7 @@ class DashboardTests(unittest.TestCase):
         self.assertLess(html.index("<h2>Forecast</h2>"), html.index("<h2>History</h2>"))
         self.assertNotIn("tr.innerHTML", html)
         self.assertIn("td.textContent", html)
-        self.assertIn("timeZone:'Asia/Tbilisi'", html)
+        self.assertNotIn("toLocaleString", html)  # one shared server formatter
         self.assertIn("querySelectorAll('.bulk-action')", html)
         self.assertIn("window.confirm", html)
         self.assertIn("addEventListener('change'", html)

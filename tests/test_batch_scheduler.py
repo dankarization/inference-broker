@@ -58,7 +58,7 @@ class FakeOllama:
             if callable(seconds):
                 seconds = seconds(kind, request)
             self.clock.advance(seconds)
-        return {"done": True}
+        return {"done": True, "message": {"role": "assistant", "content": "answer"}}
 
 
 class TimeBatchSchedulerTests(unittest.TestCase):
@@ -67,12 +67,15 @@ class TimeBatchSchedulerTests(unittest.TestCase):
         self.clock = MutableClock()
         self.tmp = tempfile.NamedTemporaryFile()
         self.addCleanup(self.tmp.close)
-        return Broker(
+        broker = Broker(
             self.tmp.name,
             FakeOllama(self.calls, self.clock, execution_seconds, loaded),
             FakeWol(self.calls),
             clock=self.clock,
         )
+
+        self.addCleanup(broker.db.close)
+        return broker
 
     def policy(self, sources):
         descriptor, path = tempfile.mkstemp(suffix=".json")
@@ -116,23 +119,21 @@ class TimeBatchSchedulerTests(unittest.TestCase):
             and call[2].get("model") == model and call[2].get("prompt") == ""
         ]
 
-    def test_10_to_8_allocates_3320_and_2640_execution_seconds(self):
-        broker = self.make(execution_seconds=100)
+    def test_reciprocal_1_to_7_allocates_3150_and_450_execution_seconds(self):
+        broker = self.make(execution_seconds=450)
         policy = self.policy({
-            "olya-vision": {"enabled": True, "weight": 10},
-            "shutterstock-video": {"enabled": True, "weight": 8},
+            "olya-vision": {"enabled": True, "weight": 1},
+            "shutterstock-video": {"enabled": True, "weight": 7},
         })
-        olya = [self.submit_olya(broker, f"o{index}") for index in range(40)]
-        video = [self.submit_video(broker, f"v{index}") for index in range(40)]
+        olya = [self.submit_olya(broker, f"o{index}") for index in range(12)]
+        video = [self.submit_video(broker, f"v{index}") for index in range(12)]
 
-        for _ in range(36):
+        for _ in range(8):
             self.assertTrue(broker.dispatch_once(policy=policy))
 
-        # 10 / 18 of one hour is 2,000 seconds (33m20s); 8 / 18 is
-        # 1,600 seconds (26m40s).  Accounting is by measured execution time,
-        # not number of jobs, so 100-second fake runs make the target exact.
-        self.assertEqual(self.completed_seconds(broker, olya), 2_000)
-        self.assertEqual(self.completed_seconds(broker, video), 1_600)
+        # Reciprocal shares: 7/8 and 1/8 of a 3,600-second horizon.
+        self.assertEqual(self.completed_seconds(broker, olya), 3_150)
+        self.assertEqual(self.completed_seconds(broker, video), 450)
         self.assertEqual(
             sum(
                 broker.attempts(job_id)[0]["finished"] - broker.attempts(job_id)[0]["started"]
@@ -142,15 +143,15 @@ class TimeBatchSchedulerTests(unittest.TestCase):
         )
 
     def test_sustained_backlogs_form_two_contiguous_model_batches(self):
-        broker = self.make(execution_seconds=100)
+        broker = self.make(execution_seconds=225)
         policy = self.policy({
-            "olya-vision": {"enabled": True, "weight": 10},
-            "shutterstock-video": {"enabled": True, "weight": 8},
+            "olya-vision": {"enabled": True, "weight": 1},
+            "shutterstock-video": {"enabled": True, "weight": 7},
         })
-        olya = [self.submit_olya(broker, f"o{index}") for index in range(40)]
-        video = [self.submit_video(broker, f"v{index}") for index in range(40)]
+        olya = [self.submit_olya(broker, f"o{index}") for index in range(18)]
+        video = [self.submit_video(broker, f"v{index}") for index in range(18)]
 
-        for _ in range(36):
+        for _ in range(16):
             broker.dispatch_once(policy=policy)
         selected = [
             event["job_id"] for event in reversed(broker.audit_events(limit=1_000))
@@ -159,7 +160,7 @@ class TimeBatchSchedulerTests(unittest.TestCase):
         models = [
             "gemma4:12b" if job_id in olya else "nemotron3:33b" for job_id in selected
         ]
-        self.assertEqual(models, ["gemma4:12b"] * 20 + ["nemotron3:33b"] * 16)
+        self.assertEqual(models, ["gemma4:12b"] * 14 + ["nemotron3:33b"] * 2)
         self.assertEqual(len(self.load_calls("gemma4:12b")), 1)
         self.assertEqual(len(self.load_calls("nemotron3:33b")), 1)
         self.assertEqual(
@@ -168,28 +169,136 @@ class TimeBatchSchedulerTests(unittest.TestCase):
         )
 
     def test_non_preemptive_job_charges_the_full_boundary_overrun(self):
-        durations = iter((2_100, 1_600))
+        durations = iter((3_200, 450))
         broker = self.make(execution_seconds=lambda _kind, _request: next(durations))
         policy = self.policy({
-            "olya-vision": {"enabled": True, "weight": 10},
-            "shutterstock-video": {"enabled": True, "weight": 8},
+            "olya-vision": {"enabled": True, "weight": 1},
+            "shutterstock-video": {"enabled": True, "weight": 7},
         })
         olya = self.submit_olya(broker, "long")
         video = self.submit_video(broker, "video")
 
         self.assertTrue(broker.dispatch_once(policy=policy))
         self.assertTrue(broker.dispatch_once(policy=policy))
-        self.assertEqual(self.completed_seconds(broker, [olya]), 2_100)
-        self.assertEqual(self.completed_seconds(broker, [video]), 1_600)
+        self.assertEqual(self.completed_seconds(broker, [olya]), 3_200)
+        self.assertEqual(self.completed_seconds(broker, [video]), 450)
         first_context = broker.attempts(olya)[0]["scheduler_context"]
-        self.assertEqual(first_context["time_budget_seconds"], 2_000.0)
+        self.assertEqual(first_context["time_budget_seconds"], 3_150.0)
         self.assertEqual(first_context["horizon_seconds"], 3_600)
+
+    def test_admission_boundary_same_model_first_different_model_second(self):
+        positions = {}
+        for same_model in (True, False):
+            for cancel_requested in (False, True):
+                with self.subTest(same_model=same_model, cancel_requested=cancel_requested):
+                    broker = self.make(execution_seconds=300)
+                    policy = self.policy({"nextcloud": {"weight": 7}, "openclaw": {"weight": 1},
+                                          "olya-vision": {"weight": 1}})
+                    broker.source_policy = policy
+                    def qwen(source, token):
+                        job_id = broker.submit("nextcloud-eval-qwen", "generate",
+                            {"prompt": token, "images": ["aGVsbG8="], "think": True},
+                            source=source, external_id=token, source_item_id=token)["id"]
+                        self.clock.advance(1)
+                        return job_id
+                    active = qwen("nextcloud", "active")
+                    queued = [qwen("nextcloud", str(i)) for i in range(12)]
+                    entered, release = threading.Event(), threading.Event()
+                    original = broker._execute
+                    def blocked(row):
+                        entered.set()
+                        if not release.wait(30):
+                            raise RuntimeError("test release timeout")
+                        original(row)
+                    broker._execute = blocked
+                    worker = threading.Thread(target=lambda: broker.dispatch_once(policy=policy))
+                    worker.start()
+                    try:
+                        self.assertTrue(entered.wait(2))
+                        if cancel_requested:
+                            broker.cancel(active)
+                        self.clock.advance(1)
+                        if same_model:
+                            lower = broker.submit("olya-vision-qwen", "generate",
+                                self.olya_payload("new"), source="olya-vision")["id"]
+                            # This profile targets the current qwen model.
+                            self.assertEqual(broker.status(lower)["profile"], "olya-vision-qwen")
+                        else:
+                            lower = broker.submit("openclaw-gemma4", "chat",
+                                {"messages": [{"role": "user", "content": "new"}]},
+                                source="openclaw")["id"]
+                        before = broker.status(active)
+                        forecast = broker.forecast(policy)["next_selections"]
+                        ids = [row["job_id"] for row in forecast]
+                        position = ids.index(lower) + 1
+                        positions[same_model] = position
+                        self.assertEqual(position, 1 if same_model else 2)
+                        self.assertFalse(broker.dispatch_once(policy=policy))
+                        self.assertEqual(before, broker.status(active))
+                        self.assertEqual(len(broker.attempts(active)), 1)
+                    finally:
+                        release.set()
+                        worker.join(5)
+                    self.assertFalse(worker.is_alive())
+                    self.assertEqual(broker.status(active)["state"],
+                                     "cancelled" if cancel_requested else "completed")
+                    # Actual selections reproduce the forecast, including boundary.
+                    for expected in ids:
+                        self.assertTrue(broker.dispatch_once(policy=policy))
+                        self.assertEqual(broker.db.execute(
+                            "SELECT job_id FROM audit_events WHERE event_type='scheduler.selected' "
+                            "ORDER BY sequence DESC LIMIT 1").fetchone()[0], expected)
+        self.assertLess(positions[True], positions[False])
+
+    def test_larger_arrival_does_not_jump_smaller_queued_work(self):
+        broker = self.make()
+        policy = self.policy({"olya-vision": {"weight": 1}, "shutterstock-video": {"weight": 7}})
+        lower = [self.submit_olya(broker, str(i)) for i in range(4)]
+        broker.dispatch_once(policy=policy)
+        self.submit_video(broker, "new larger weight")
+        self.assertEqual(broker.forecast(policy)["next_selections"][0]["job_id"], lower[1])
+
+    def test_overlong_job_does_not_block_compatible_admission(self):
+        broker = self.make(execution_seconds=4000)
+        policy = self.policy({"nextcloud": {"weight": 7}, "olya-vision": {"weight": 1}})
+        broker.source_policy = policy
+        for i in range(8):
+            broker.submit("nextcloud-eval-qwen", "generate",
+                {"prompt": str(i), "images": ["aGVsbG8="], "think": True},
+                source="nextcloud", external_id=str(i), source_item_id=str(i))
+        broker.dispatch_once(policy=policy)
+        lower = broker.submit("olya-vision-qwen", "generate", self.olya_payload("new"),
+                              source="olya-vision")["id"]
+        forecast = broker.forecast(policy)["next_selections"]
+        self.assertEqual(forecast[0]["job_id"], lower)
+        self.assertEqual(forecast[0]["model"], "qwen3-vl:30b")
+        broker.dispatch_once(policy=policy)
+        self.assertEqual(broker.status(lower)["state"], "completed")
+        self.assertEqual(len(self.load_calls("qwen3-vl:30b")), 1)
+
+    def test_lower_weight_cannot_bypass_disabled_or_min_interval_gates(self):
+        broker = self.make()
+        policy = self.policy({
+            "olya-vision": {"enabled": False, "weight": 1},
+            "interactive": {"weight": 2}, "shutterstock-video": {"weight": 7},
+        })
+        disabled = self.submit_olya(broker, "disabled")
+        delayed = broker.submit("interactive", "generate", {"prompt": "delayed"})["id"]
+        broker.db.execute("INSERT INTO source_schedules(source,next_allowed) VALUES(?,?)",
+                          ("interactive", self.clock() + 100))
+        broker.db.commit()
+        eligible = self.submit_video(broker, "eligible")
+        self.assertEqual([r["job_id"] for r in broker.forecast(policy)["next_selections"]], [eligible])
+        self.assertTrue(broker.dispatch_once(policy=policy))
+        self.assertEqual(broker.status(eligible)["state"], "completed")
+        self.assertEqual(broker.status(disabled)["state"], "queued")
+        self.assertEqual(broker.status(delayed)["state"], "queued")
 
     def test_empty_disabled_and_reactivated_lanes_remain_work_conserving(self):
         broker = self.make(execution_seconds=600)
         policy = self.policy({
-            "olya-vision": {"enabled": True, "weight": 10},
-            "shutterstock-video": {"enabled": True, "weight": 8},
+            "olya-vision": {"enabled": True, "weight": 1},
+            "shutterstock-video": {"enabled": True, "weight": 7},
         })
         videos = [self.submit_video(broker, f"v{index}") for index in range(7)]
 
@@ -205,8 +314,8 @@ class TimeBatchSchedulerTests(unittest.TestCase):
 
         disabled_broker = self.make(execution_seconds=600)
         disabled = self.policy({
-            "olya-vision": {"enabled": False, "weight": 10},
-            "shutterstock-video": {"enabled": True, "weight": 8},
+            "olya-vision": {"enabled": False, "weight": 1},
+            "shutterstock-video": {"enabled": True, "weight": 7},
         })
         blocked = self.submit_olya(disabled_broker, "disabled")
         available = self.submit_video(disabled_broker, "available")
@@ -224,8 +333,8 @@ class TimeBatchSchedulerTests(unittest.TestCase):
 
         failed_broker = self.make(execution_seconds=fail_gemma)
         failed_policy = self.policy({
-            "olya-vision": {"enabled": True, "weight": 10},
-            "shutterstock-video": {"enabled": True, "weight": 8},
+            "olya-vision": {"enabled": True, "weight": 1},
+            "shutterstock-video": {"enabled": True, "weight": 7},
         })
         failed = self.submit_olya(failed_broker, "fails")
         after_failure = self.submit_video(failed_broker, "still-runs")
@@ -237,8 +346,8 @@ class TimeBatchSchedulerTests(unittest.TestCase):
     def test_forecast_of_ten_uses_the_same_time_batch_order_as_dispatch(self):
         broker = self.make(execution_seconds=300)
         policy = self.policy({
-            "olya-vision": {"enabled": True, "weight": 10},
-            "shutterstock-video": {"enabled": True, "weight": 8},
+            "olya-vision": {"enabled": True, "weight": 1},
+            "shutterstock-video": {"enabled": True, "weight": 7},
         })
         job_ids = [self.submit_olya(broker, f"o{index}") for index in range(12)]
         job_ids.extend(self.submit_video(broker, f"v{index}") for index in range(12))
@@ -248,7 +357,7 @@ class TimeBatchSchedulerTests(unittest.TestCase):
         forecast_ids = [item["job_id"] for item in forecast["next_selections"]]
         self.assertEqual(
             [item["model"] for item in forecast["next_selections"]],
-            ["gemma4:12b"] * 7 + ["nemotron3:33b"] * 3,
+            ["gemma4:12b"] * 10,
         )
         actual = []
         for _ in range(10):

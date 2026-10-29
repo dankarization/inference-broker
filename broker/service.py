@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Any
 
 from .analytics import analytics_snapshot, attempt_history, audit_history
-from .dashboard import snapshot as dashboard_snapshot
+from .dashboard import history_display, snapshot as dashboard_snapshot
 from .qwen_budget import (PROFILE as QWEN64_PROFILE, CONTRACT as QWEN64_CONTRACT,
                           snapshot as qwen64_snapshot, evidence as qwen64_evidence,
                           project as project_qwen64_evidence)
@@ -1463,7 +1463,7 @@ class Broker:
             " ORDER BY finished DESC,id DESC LIMIT ?",
             (*values, max(1, min(limit, 30))),
         )
-        return [dict(row) for row in rows]
+        return [history_display(dict(row)) for row in rows]
 
     def terminal_history(
         self, *, limit: int = 30, cursor: tuple[float, str] | None = None,
@@ -1598,7 +1598,7 @@ class Broker:
         model_oldest: dict[str, tuple[float, str]] = {}
         for key, lane in lanes.items():
             source, model = key
-            model_totals[model] = model_totals.get(model, 0.0) + lane["weight"]
+            model_totals[model] = model_totals.get(model, 0.0) + 1.0 / lane["weight"]
             candidate_key = (lane["queued_at"], source)
             if model not in model_oldest or candidate_key < model_oldest[model]:
                 model_oldest[model] = candidate_key
@@ -1610,7 +1610,7 @@ class Broker:
         for model in models:
             order.extend(sorted(
                 (key for key in lanes if key[1] == model),
-                key=lambda key: (-lanes[key]["weight"], lanes[key]["queued_at"], key[0]),
+                key=lambda key: (lanes[key]["weight"], lanes[key]["queued_at"], key[0]),
             ))
         return order
 
@@ -1640,7 +1640,7 @@ class Broker:
             key: float(policy.weight(row["source"]) or 1.0)
             for key, row in available.items()
         }
-        weight_total = sum(weights.values())
+        weight_total = sum(1.0 / weight for weight in weights.values())
         old_lanes = previous.get("lanes", {})
         lanes: dict[tuple[str, str], dict[str, Any]] = {}
         for key, row in available.items():
@@ -1651,7 +1651,7 @@ class Broker:
                 "weight": weights[key],
                 "queued_at": row["queued_at"] if row["queued_at"] is not None else row["created"],
                 "used": used,
-                "budget": used + (remaining * weights[key] / weight_total if weight_total else 0.0),
+                "budget": used + (remaining / weights[key] / weight_total if weight_total else 0.0),
             }
         current = previous.get("current") if preserve_current else None
         if current not in lanes:
@@ -1683,22 +1683,41 @@ class Broker:
         if not available:
             return None, cycle, {}
         signature = self._policy_signature(policy)
-        if cycle is None or cycle.get("total_used", 0.0) >= SCHEDULING_HORIZON_SECONDS:
+        new_lanes = set(available) - set((cycle or {}).get("lanes", {}))
+        current = (cycle or {}).get("current")
+        # Admission is a non-preemptive boundary, not a redistribution of the
+        # leftover hour inside an unchanged model batch. A more important new
+        # lane joins immediately if compatible; otherwise finish exactly one
+        # queued turn of the current model before beginning its own batch.
+        lower_arrival = (
+            cycle is not None and current in cycle["lanes"]
+            and any(policy.weight(key[0]) < cycle["lanes"][current]["weight"]
+                    for key in new_lanes)
+        )
+        if lower_arrival:
+            newcomers = [key for key in new_lanes
+                         if policy.weight(key[0]) < cycle["lanes"][current]["weight"]]
+            first = min(newcomers, key=lambda key: (
+                policy.weight(key[0]), available[key]["created"], key))
+            # An overlong active turn must not suppress same-model insertion.
+            previous = cycle if cycle["total_used"] < SCHEDULING_HORIZON_SECONDS else None
+            cycle = self._new_time_cycle(available, policy, now, previous)
+            cycle["current"] = first
+            if first[1] != current[1] and current in available:
+                cycle["boundary_lane"] = current
+        elif cycle is None or cycle.get("total_used", 0.0) >= SCHEDULING_HORIZON_SECONDS:
             cycle = self._new_time_cycle(available, policy, now)
         elif cycle.get("signature") != signature:
-            # A hot policy change takes effect at the next non-preemptive job
-            # boundary.  The active request has already completed here.
             cycle = self._new_time_cycle(available, policy, now, cycle)
-        elif any(key not in cycle.get("lanes", {}) for key in available):
-            # A source/model lane became ready after an empty/failing period.
-            # Preserve the current contiguous batch, but divide the remaining
-            # horizon so the returning lane receives bounded service.
+        elif new_lanes:
             cycle = self._new_time_cycle(
                 available, policy, now, cycle, preserve_current=True,
             )
 
-        selected_key = cycle.get("current")
-        if (
+        boundary = cycle.pop("boundary_lane", None)
+        # The admission boundary leaves the new lane current for the next pick.
+        selected_key = boundary if boundary in available else cycle.get("current")
+        if boundary not in available and (
             selected_key not in available
             or selected_key not in cycle["lanes"]
             or not self._budget_remaining(cycle["lanes"][selected_key])
@@ -1719,13 +1738,14 @@ class Broker:
                 key for key in cycle["order"] if key in available
             )
 
-        cycle["current"] = selected_key
+        if boundary not in available:
+            cycle["current"] = selected_key
         selected = available[selected_key]
         lane = cycle["lanes"][selected_key]
         eligible_sources = sorted({row["source"] for row in available.values()})
         decision = {
             "mode": "time_batch",
-            "reason": "60-minute weighted time batch with model affinity",
+            "reason": "60-minute reciprocal-weight model batch; lower weight gets more time",
             "eligible_sources": eligible_sources,
             "active_weights": {
                 source: weight for source, weight in self._policy_signature(policy)

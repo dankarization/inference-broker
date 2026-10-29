@@ -99,7 +99,12 @@ Rollback: `systemctl --user disable --now ollama-inference-broker.service`.
   результатов и ошибок. Она показывает policy (`enabled`, `weight`),
   состояния, lease, retry/delay, активные jobs, completed total/1h/24h и
   read-only **Forecast** под активными jobs: текущую модель и список следующих
-  десяти выборов тех же model-aware time batches с configured Weight. Forecast помечен как
+  десяти выборов в непрерывных model batches с обратными долями Weight,
+  с Source, Profile и Model. History показывает Profile, Model и Model turn:
+  время от started до finished завершённого задания, включая подготовку модели,
+  но без ожидания в очереди. Для cancelled, failed и незапущенных заданий
+  длительность не заявляется (—). Finished на всех страницах History имеет
+  единый формат `DD/MM/YYYY, HH:MM:SS` в Asia/Tbilisi. Forecast помечен как
   contingent: он меняется при новых admissions, завершениях и hot reload
   policy, и никогда не мутирует очередь/leases/аккумуляторы. Машинный
   payload-free снимок доступен как `GET /v1/dashboard` (тот же `forecast`),
@@ -129,7 +134,7 @@ Rollback: `systemctl --user disable --now ollama-inference-broker.service`.
 Сервер сам выбирает профиль, модель, контекст, лимит вывода и keepalive.
 Переданные caller значения `model`, `num_ctx`, `num_predict` и `keep_alive` не
 могут повысить эти лимиты. SQLite использует WAL. Без source policy dispatch
-выполняется в глобальном FIFO-порядке; с policy — по weight источника и FIFO
+выполняется в глобальном FIFO-порядке; с policy — по обратным временным долям weight источника и FIFO
 внутри выбранного источника.
 
 Каждое принятое задание и scheduler decision сохраняются в durable
@@ -183,16 +188,14 @@ durable `queued`. Это позволяет включить обратимый 
 }
 ```
 
-При наличии policy scheduler строит повторяющийся 60-минутный execution-time
-horizon для готовых FIFO heads, сгруппированных по `(source, target model)`.
-Weight — прямая доля времени: при готовых Olya Vision / Gemma `10` и
-Shutterstock Video / Nemotron `8` их budgets равны `10/18` = 33m20s и
-`8/18` = 26m40s. Внутри source сохраняется FIFO, а одинаковые target model
-исполняются непрерывным batch, чтобы не unload/load модель после каждого job.
-Job не preempt-ится: целиком измеренное `finished - started` списывается с
-текущего batch, поэтому последний job вправе пересечь его границу. Если lane
-пуста, disabled или временно не eligible, другой ready lane берёт capacity;
-вернувшаяся lane получает долю оставшегося horizon на ближайшей job boundary.
+При наличии policy GPU execution time делится в 60-минутном горизонте
+пропорционально `1 / weight`: `1` важнее `7`, получает большую долю и
+первый batch. Готовые модели обслуживаются непрерывными batches, внутри
+source — FIFO; waiting time не повышает долю. Running и cancel-requested
+job не прерываются. При новом меньшем weight batch перестраивается:
+совместимая модель — следующий dispatch, другая — после одного оставшегося
+turn текущей модели (или сразу, если текущая очередь пуста). Больший weight
+не вытесняет уже ожидающую меньшую долю. Hard eligibility не меняется.
 
 ### Safe dispatcher drain
 
@@ -208,10 +211,8 @@ systemctl --user reload ollama-inference-broker.service
 эта команда сигнализирует весь service cgroup, включая дочерний `curl` активного
 inference, и может прервать job.
 
-Источники делят GPU через model-affine weighted time batches; hard eligibility
-включает FIFO, per-source concurrency и min-interval backpressure. Время
-учитывается по исполнению, а не по числу jobs; waiting time не вызывает
-preemption.
+Hard eligibility по-прежнему включает enabled, per-source concurrency и
+min-interval backpressure; меньший weight не обходит эти ограничения.
 Итоговый allowlist берётся из `enabled`-записей файла, а не из env.
 `GET /v1/sources` отдаёт текущий снапшот политики (без секретов). При
 отсутствии policy поведение — env-allowlist + global FIFO.
@@ -251,8 +252,8 @@ values и error text в control events не копируются.
 Канонический production policy хранится в `config/sources.production.json`:
 веса Shutterstock Video / Olya Vision / Olya Decision остаются `3/8/6`, а
 отдельный source `syncopia-telegram-memory` имеет scheduler weight ровно `4`.
-`weight` — единственный scheduling-параметр: он задаёт прямую долю source в
-time-batch scheduler. Policy с неизвестным ключом отклоняется, чтобы конфигурация не могла
+`weight` — единственный scheduling-параметр: меньшее значение выбирается раньше
+среди eligible queued jobs. Policy с неизвестным ключом отклоняется, чтобы конфигурация не могла
 молча стать default `1.0`.
 
 ### Producer-owned storage: additive safe rollout
@@ -288,10 +289,10 @@ WAL ограничивается `wal_autocheckpoint=4096`,
 lossless rollout/rollback описаны в
 [docs/PRODUCER_STORAGE.md](docs/PRODUCER_STORAGE.md).
 
-### User-facing Weight (1 lowest … 10 highest)
+### User-facing Weight (1 most important … 10 least important)
 
-Weight — единственный soft scheduling input. **10 — самая большая доля
-execution time, 1 — самая маленькая**. Weight не является deadline и не
+Weight — единственный soft scheduling input. **1 — самая большая доля
+execution time, 10 — самая маленькая**. Weight не является deadline и не
 меняется с возрастом job.
 
 `POST /v1/shutterstock-video/generate` — синхронный bounded контракт локального

@@ -286,7 +286,7 @@ class AnalyticsTests(unittest.TestCase):
         self.assertNotIn("payload", matches[0])
         self.assertNotIn("result", matches[0])
 
-    def test_time_batch_selection_records_direct_weight_context(self):
+    def test_weight_selection_records_reciprocal_batch_context(self):
         clock = MutableClock(1_000)
         broker = self.make(clock=clock)
         policy = self.policy({
@@ -322,7 +322,8 @@ class AnalyticsTests(unittest.TestCase):
             event["metadata"] for event in broker.audit_events(limit=1_000)
             if event["event_type"] == "scheduler.selected"
         )
-        self.assertEqual(first["horizon_seconds"], 3_600)
+        self.assertEqual(first["selected_source"], "shutterstock-video")
+        self.assertGreater(first["time_budget_seconds"], 0)
         self.assertEqual(first["active_weights"]["olya-vision"], 8.0)
         self.assertEqual(first["active_weights"]["shutterstock-video"], 3.0)
         self.assertEqual(
