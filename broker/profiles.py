@@ -14,6 +14,7 @@ class Profile:
     request_timeout_seconds: int = 300
     max_images: int = 0
     max_schema_bytes: int = 0
+    executor: str = "ollama"
 
 
 # This is deliberately server-owned. Callers can select a profile, never a model
@@ -149,6 +150,12 @@ PROFILES = {
         max_images=4, max_schema_bytes=16_384,
     ),
 }
+
+# Distinct scheduler lanes; model labels are not caller-controlled Ollama models.
+VOICE_PROFILE_NAMES = frozenset({"voice-wyoming-v1", "voice-gigaam-v1", "voice-whisper-gpu-v1"})
+for _name in VOICE_PROFILE_NAMES:
+    PROFILES[_name] = Profile(_name, _name, 0, 0, 0, request_timeout_seconds=1800,
+                             executor="voice")
 
 # Separate text-only comparison lane; never borrow an existing producer source.
 NIGHTLY_PROFILE_NAMES = frozenset({

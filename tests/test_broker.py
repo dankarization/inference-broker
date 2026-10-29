@@ -517,14 +517,14 @@ class SourcePolicyTests(unittest.TestCase):
         sources = SourcePolicy(policy_path).snapshot()["sources"]
         self.assertEqual(
             {name: entry["weight"] for name, entry in sources.items()},
-            {"shutterstock-video": 3.0, "olya-vision": 8.0,
+            {"local-voice": 2.0, "shutterstock-video": 3.0, "olya-vision": 8.0,
              "olya-decision": 6.0, "syncopia-telegram-memory": 4.0},
         )
         for name, entry in sources.items():
             with self.subTest(source=name):
                 self.assertTrue(entry["enabled"])
                 self.assertTrue(entry["admission_allowed"])
-                self.assertTrue(entry["producer_storage_enabled"])
+                self.assertEqual(entry["producer_storage_enabled"], name != "local-voice")
                 self.assertFalse(entry["ack_required"])
                 self.assertFalse(entry["compaction_enabled"])
                 self.assertTrue(entry["legacy_result_fallback"])

@@ -28,7 +28,8 @@ from .compat import (CompatibilityError, NEXTCLOUD_PROFILES, GEMMA26_CONTRACT,
                      validate_syncopia_memory_payload)
 from .profiles import EVALUATION_PROFILE_NAMES, OPENCLAW_PROFILE_NAMES, PROFILES
 from . import nightly_eval, syncopia_daily
-from .profiles import NIGHTLY_PROFILE_NAMES
+from .profiles import NIGHTLY_PROFILE_NAMES, VOICE_PROFILE_NAMES
+from . import voice
 from .evaluation import normalize_request as normalize_evaluation_request
 from .evaluation import validate_result as validate_evaluation_result
 from .openclaw import (MAX_OUTSTANDING, normalize_request as normalize_openclaw_request,
@@ -599,9 +600,13 @@ class Broker:
                producer_storage: dict[str, Any] | None = None) -> dict:
         if profile not in PROFILES:
             raise ValueError("unknown profile")
-        if kind not in {"chat", "generate"}:
-            raise ValueError("kind must be chat or generate")
+        if kind not in {"chat", "generate", "transcribe"}:
+            raise ValueError("kind must be chat, generate or transcribe")
         source = source or profile
+        if source == "local-voice" or profile in VOICE_PROFILE_NAMES or kind == "transcribe":
+            if source != "local-voice" or profile not in VOICE_PROFILE_NAMES or kind != "transcribe":
+                raise ValueError("voice requires local-voice source, voice profile and transcribe kind")
+            payload = voice.validate(payload, profile)
         if profile == syncopia_daily.PROFILE:
             if source != syncopia_daily.SOURCE or kind != "chat":
                 raise ValueError("daily capacity requires its protected source/profile and chat")
@@ -1927,6 +1932,11 @@ class Broker:
             if (row["source"] != syncopia_daily.SOURCE or row["kind"] != "chat"
                     or syncopia_daily.normalize_request(payload) != payload):
                 raise ValueError("daily capacity persisted contract drift")
+        if profile.executor == "voice":
+            self.wol.wake()
+            result = voice.execute(row["profile"], json.loads(row["payload"]), profile.request_timeout_seconds)
+            self._finish_execution(row, result, "voice executor call completed")
+            return
         self.wol.wake()
         nightly_evidence = None
         if row["profile"] in NIGHTLY_PROFILE_NAMES:
@@ -1996,6 +2006,9 @@ class Broker:
             result = nightly_eval.project_result(result, profile.model)
             result["execution_evidence"] = nightly_eval.project_evidence(
                 dict(nightly_evidence, runtime_context_length=context))
+        self._finish_execution(row, result, reason)
+
+    def _finish_execution(self, row, result, reason):
         result_json = json.dumps(result)
         with self.lock, self.db:
             state = self.db.execute("SELECT state FROM jobs WHERE id=?", (row["id"],)).fetchone()[0]
