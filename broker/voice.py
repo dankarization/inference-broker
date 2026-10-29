@@ -7,12 +7,14 @@ import os
 import socket
 import urllib.request
 import wave
+from . import voice_cpu
 
 MAX_AUDIO_BYTES = 8 * 1024 * 1024
 
 
 def validate(payload, profile):
-    if not isinstance(payload, dict) or set(payload) - {"audio_base64", "filename"}:
+    allowed = {"audio_base64", "filename", "response_format"} if profile == voice_cpu.PROFILE else {"audio_base64", "filename"}
+    if not isinstance(payload, dict) or set(payload) - allowed:
         raise ValueError("voice payload requires only audio_base64 and filename")
     encoded, filename = payload.get("audio_base64"), payload.get("filename")
     if not isinstance(encoded, str) or len(encoded) > ((MAX_AUDIO_BYTES + 2) // 3) * 4:
@@ -25,6 +27,11 @@ def validate(payload, profile):
         raise ValueError("voice audio must be nonempty and at most 8 MiB")
     if not isinstance(filename, str) or not filename or len(filename) > 128 or any(c not in 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-' for c in filename):
         raise ValueError("invalid filename")
+    if profile == voice_cpu.PROFILE:
+        voice_cpu.configuration()
+        if payload.get("response_format") != "segments-v1" or filename != "audio.flac" or not audio.startswith(b'fLaC'):
+            raise ValueError("CPU voice requires FLAC and segments-v1")
+        return {"audio_base64": encoded, "filename": filename, "response_format": "segments-v1"}
     if profile == "voice-wyoming-v1":
         try:
             with wave.open(io.BytesIO(audio), 'rb') as wav:

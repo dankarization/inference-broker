@@ -158,7 +158,7 @@ PROFILES = {
 }
 
 # Distinct scheduler lanes; model labels are not caller-controlled Ollama models.
-VOICE_PROFILE_NAMES = frozenset({"voice-wyoming-v1", "voice-gigaam-v1", "voice-whisper-gpu-v1"})
+VOICE_PROFILE_NAMES = frozenset({"voice-wyoming-v1", "voice-gigaam-v1", "voice-whisper-gpu-v1", "voice-native-cpu-v1"})
 for _name in VOICE_PROFILE_NAMES:
     PROFILES[_name] = Profile(_name, _name, 0, 0, 0, request_timeout_seconds=1800,
                              executor="voice")

@@ -503,6 +503,12 @@ def serve(broker, host="127.0.0.1", port=8088, policy=None, storage_token=None):
             elif path == "/v1/nightly-eval/contract":
                 from .nightly_eval import contract
                 self._json(200, contract())
+            elif path == "/v1/voice/capabilities":
+                from . import voice_cpu
+                try:
+                    self._json(200, voice_cpu.capabilities())
+                except ValueError:
+                    self._json(503, {"error": "CPU voice capability unavailable"})
             elif path == "/healthz": self._json(200, broker.health())
             elif path == "/v1/metrics": self._json(200, broker.metrics())
             elif path == "/v1/storage/health": self._json(200, broker.storage_health())

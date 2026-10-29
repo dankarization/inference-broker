@@ -624,6 +624,8 @@ class Broker:
         if source == "local-voice" or profile in VOICE_PROFILE_NAMES or kind == "transcribe":
             if source != "local-voice" or profile not in VOICE_PROFILE_NAMES or kind != "transcribe":
                 raise ValueError("voice requires local-voice source, voice profile and transcribe kind")
+            if profile == voice.voice_cpu.PROFILE and (not external_id or not source_item_id):
+                raise ValueError("CPU voice requires durable correlation IDs")
             payload = voice.validate(payload, profile)
         if profile == syncopia_daily.PROFILE:
             if source != syncopia_daily.SOURCE or kind != "chat":
@@ -1087,11 +1089,13 @@ class Broker:
         data.pop("priority", None)  # inert historic column is never public
         for field in LEGACY_HIDDEN_STORAGE_FIELDS:
             data.pop(field, None)
-        if data["source"] in {"pilot-mainpc", nightly_eval.SOURCE} or data["profile"] == QWEN64_PROFILE:
+        if data["source"] in {"pilot-mainpc", nightly_eval.SOURCE} or data["profile"] in {QWEN64_PROFILE, voice.voice_cpu.PROFILE}:
             # Exact durable client correlation survives terminal payload cleanup.
             data["input_hash"] = row["input_hash"]
             data["input_bytes"] = row["input_bytes"]
         data["payload"] = json.loads(data["payload"])
+        if data["profile"] == voice.voice_cpu.PROFILE and data["payload"] == {}:
+            data.pop("payload")  # terminal cleanup: correlate using the original input_hash
         if data.get("result_json") is not None:
             data["result"] = json.loads(data.pop("result_json"))
         else:
@@ -1977,6 +1981,12 @@ class Broker:
                     or syncopia_daily.normalize_request(payload) != payload):
                 raise ValueError("daily capacity persisted contract drift")
         if profile.executor == "voice":
+            if row["profile"] == voice.voice_cpu.PROFILE:
+                import base64
+                payload = voice.validate(json.loads(row["payload"]), row["profile"])
+                result = voice.voice_cpu.execute(base64.b64decode(payload["audio_base64"]), row["id"], profile.request_timeout_seconds)
+                self._finish_execution(row, result, "CPU voice adapter call completed")
+                return
             self.wol.wake()
             result = voice.execute(row["profile"], json.loads(row["payload"]), profile.request_timeout_seconds)
             self._finish_execution(row, result, "voice executor call completed")
