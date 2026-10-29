@@ -11,7 +11,7 @@ from urllib.request import Request, ProxyHandler, build_opener
 
 from broker.http import openclaw_wait_seconds, serve
 from broker.openclaw import MODEL, normalize_request
-from broker.profiles import OPENCLAW_PROFILES_BY_MODEL, PROFILES
+from broker.profiles import OPENCLAW_PROFILES_BY_MODEL, PROFILES, VOICE_PROFILE_NAMES
 from broker.service import Broker
 
 
@@ -430,7 +430,7 @@ class NativeWaitBudgetTests(unittest.TestCase):
             elif name == "openclaw-bolt-e4b":
                 self.assertEqual(profile.request_timeout_seconds, 1800)
                 self.assertEqual(openclaw_wait_seconds(profile), 2100)
-            elif name in {
+            elif name in VOICE_PROFILE_NAMES or name in {
                 "nextcloud-eval-qwen-64k-v1",
                 "telegram-nightly-qwen38-v1", "telegram-nightly-gemma12-v1",
                 "telegram-nightly-gemma26-v1", "telegram-nightly-nemotron-nano-v1",

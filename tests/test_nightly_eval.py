@@ -18,7 +18,7 @@ from broker import nightly_eval as lane
 from broker import nightly_client as client
 from broker.nightly_client import (Closed, Uncertain, Transport, Journal, freeze_plan,
     load_frozen, new_json, request_for, admit, collect, main, accepted_cases)
-from broker.profiles import PROFILES, NIGHTLY_PROFILE_NAMES
+from broker.profiles import PROFILES, NIGHTLY_PROFILE_NAMES, VOICE_PROFILE_NAMES
 from broker.service import Broker, SourcePolicy, SourceAdmissionBlocked, SourceQueueFull
 from broker.http import serve
 
@@ -167,8 +167,11 @@ class NightlyTests(unittest.TestCase):
     def test_all_31_preexisting_profiles_are_unchanged(self):
         # Additive daily capacity is not one of the immutable original 31 profiles.
         from broker.syncopia_daily import PROFILE as DAILY_PROFILE
-        old = {k: asdict(v) for k, v in PROFILES.items()
-               if k not in NIGHTLY_PROFILE_NAMES and k != DAILY_PROFILE}
+        added_fields = {'executor', 'occupancy_class', 'occupancy_cohort',
+                        'occupancy_max_jobs', 'occupancy_peak_vram_bytes', 'occupancy_evidence'}
+        old = {k: {field: value for field, value in asdict(v).items() if field not in added_fields}
+               for k, v in PROFILES.items()
+               if k not in NIGHTLY_PROFILE_NAMES and k != DAILY_PROFILE and k not in VOICE_PROFILE_NAMES}
         self.assertEqual(len(old), 31)
         self.assertEqual(hashlib.sha256(json.dumps(old, sort_keys=True, separators=(',', ':')).encode()).hexdigest(),
                          'ddc9184d744685ed87969710c82a87cb53e7c7889780556b89b5e92824b611e2')

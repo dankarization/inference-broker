@@ -2,7 +2,7 @@ import unittest
 from dataclasses import replace
 
 from broker.occupancy import Envelope, can_admit
-from broker.profiles import Profile
+from broker.profiles import Profile, PROFILES
 from broker.service import Broker, SCHEDULING_HORIZON_SECONDS
 
 
@@ -48,6 +48,14 @@ class OccupancyTest(unittest.TestCase):
             for candidate in self.profiles:
                 with self.subTest(active=active, candidate=candidate):
                     self.assertFalse(self.admit(candidate, [active]))
+
+    def test_shipped_profiles_have_no_unmeasured_sharing(self):
+        for name, profile in PROFILES.items():
+            with self.subTest(profile=name):
+                self.assertEqual(profile.occupancy_class, 'unknown')
+                self.assertIsNone(profile.occupancy_cohort)
+                self.assertIsNone(profile.occupancy_peak_vram_bytes)
+                self.assertIsNone(profile.occupancy_evidence)
 
     def test_voice_weight_two_receives_half_weight_one_budget(self):
         class Policy:

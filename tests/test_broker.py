@@ -209,12 +209,12 @@ class BrokerTests(unittest.TestCase):
                 "prompt": "photo", "images": ["aGVsbG8="], "format": {},
             }, source="shutterstock")
 
-    def test_dispatch_allowlist_leaves_non_pilot_work_queued(self):
+    def test_dispatch_allowlist_leaves_other_work_queued(self):
         b=self.make(["nemotron3:33b"])
         blocked=b.submit("interactive", "generate", {"prompt":"do not run"})["id"]
-        pilot=b.submit("interactive", "generate", {"prompt":"pilot"}, source="pilot-mainpc")["id"]
-        self.assertTrue(b.dispatch_once(frozenset({"pilot-mainpc"})))
-        self.assertEqual(b.status(pilot)["state"], "completed")
+        allowed=b.submit("interactive", "generate", {"prompt":"allowed"}, source="allowed-source")["id"]
+        self.assertTrue(b.dispatch_once(frozenset({"allowed-source"})))
+        self.assertEqual(b.status(allowed)["state"], "completed")
         self.assertEqual(b.status(blocked)["state"], "queued")
 
     def test_canary_rate_limit_and_persisted_result(self):

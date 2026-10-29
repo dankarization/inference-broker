@@ -15,7 +15,7 @@ from urllib.request import Request, urlopen
 from broker import syncopia_daily as daily
 from broker.compat import validate_syncopia_memory_payload
 from broker.http import serve
-from broker.profiles import PROFILES
+from broker.profiles import PROFILES, VOICE_PROFILE_NAMES
 from broker.service import Broker, SourcePolicy
 from broker.storage import content_evidence
 
@@ -92,7 +92,10 @@ class DailyCapacityTests(unittest.TestCase):
                         "result": {"mode": "hybrid", "schema_version": "freeform-v1"}})
 
     def test_additive_profile_preserves_every_prior_profile(self):
-        old = {k: asdict(v) for k, v in PROFILES.items() if k != daily.PROFILE}
+        added_fields = {'executor', 'occupancy_class', 'occupancy_cohort',
+                        'occupancy_max_jobs', 'occupancy_peak_vram_bytes', 'occupancy_evidence'}
+        old = {k: {field: value for field, value in asdict(v).items() if field not in added_fields}
+               for k, v in PROFILES.items() if k != daily.PROFILE and k not in VOICE_PROFILE_NAMES}
         self.assertEqual(len(old), 35)
         self.assertEqual(hashlib.sha256(json.dumps(old, sort_keys=True, separators=(",", ":")).encode()).hexdigest(),
                          "71073b5b7f598194832a1d9b57316b78ee64f6607ce79f98105e56ad8ce10147")

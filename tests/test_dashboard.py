@@ -84,11 +84,11 @@ class DashboardTests(unittest.TestCase):
             PROFILES['interactive'].model, 'completed', '12.250s', '28/10/2026, 17:52:17', '2'])
         self.assertEqual([row[5] for row in initial_cells], ['12.250s', '—', '—'])
         forecast_html = document.split('<h2>Forecast</h2>')[1].split('<h2>History</h2>')[0]
-        self.assertIn('<th>Profile</th>', forecast_html)
+        self.assertRegex(forecast_html, r'<th data-sort-key="profile"[^>]*>.*?Profile')
         self.assertIn('<td>interactive</td>', forecast_html)
         self.assertIn('.compact{width:1%;white-space:nowrap}', document)
         for label in ('ID', 'Finished', 'Attempts', 'Reason'):
-            self.assertIn(f'<th class=compact>{label}</th>', document)
+            self.assertRegex(document, rf'<th[^>]*class=compact[^>]*>.*?{label}')
         for row in re.findall(r'<tr[^>]*>(.*?)</tr>', history_html):
             self.assertEqual(re.findall(r'<td class=compact>(.*?)</td>', row),
                              ['job-&lt;one&gt;', '28/10/2026, 17:52:17', '2'])
@@ -554,7 +554,7 @@ vm.runInThisContext('{'+SCRIPT+'\n}');
         self.assertNotIn(b">3.0<", html)
         self.assertIn(b"weight-feedback", html)
         self.assertNotIn(b"Dead", html)
-        self.assertIn(b'<tr><td colspan=15>None</td></tr>', render({
+        self.assertIn(b'<tr data-sort-ignore><td colspan=15>None</td></tr>', render({
             "timestamp": 0,
             "sources": [],
             "active_jobs": [],
