@@ -287,7 +287,8 @@ class Broker:
         # 60-minute allocation from the durable ready queue.
         self._time_cycle: dict[str, Any] | None = None
         self._duration_estimates: dict[tuple[str, str], float] = {}
-        self._active_time_batch: dict[str, Any] | None = None
+        # Account attempts independently; completion order need not match claim order.
+        self._active_time_batches: dict[str, dict[str, Any]] = {}
         # Immutable copy written under the lock for the lock-free forecast.
         self._scheduler_snapshot: dict[str, Any] | None = None
         self.source_policy = source_policy
@@ -566,6 +567,7 @@ class Broker:
             ))
             for row in expired:
                 attempt_no = row["attempt_count"] or None
+                self._complete_time_batch(row["id"], now)
                 if attempt_no is not None:
                     self.db.execute(
                         "UPDATE job_attempts SET finished=?,outcome='lease_expired' "
@@ -1331,15 +1333,16 @@ class Broker:
         snapshot = self._scheduler_snapshot or {}
         cycle = deepcopy(snapshot.get("time_cycle"))
         estimates = dict(snapshot.get("duration_estimates") or {})
-        active = snapshot.get("active_time_batch")
+        active_batches = snapshot.get("active_time_batches") or {}
         # The active lease will release before any projected selection.  Its
         # true duration is unknown until completion, so forecast uses the same
         # lane estimate it uses for all subsequent non-preemptive boundaries.
-        if policy is not None and running is not None and active is not None and cycle:
-            self._record_time_usage(
-                cycle, tuple(active["lane"]),
-                self._forecast_duration(tuple(active["lane"]), estimates),
-            )
+        if policy is not None and running is not None and cycle:
+            for active in active_batches.values():
+                self._record_time_usage(
+                    cycle, tuple(active["lane"]),
+                    self._forecast_duration(tuple(active["lane"]), estimates),
+                )
         remaining = [dict(row) for row in candidates]
         selections: list[dict[str, Any]] = []
         for _ in range(bounded):
@@ -1658,6 +1661,18 @@ class Broker:
                 "used": used,
                 "budget": used + (remaining / weights[key] / weight_total if weight_total else 0.0),
             }
+        # An in-flight lane can disappear from the ready queue before its
+        # attempt finishes. Retain its accounting record until completion.
+        for active in self._active_time_batches.values():
+            key = tuple(active["lane"])
+            if key not in lanes and key in old_lanes:
+                lanes[key] = dict(old_lanes[key], accounting_only=True)
+            elif key not in lanes and not previous:
+                # A fresh horizon must still charge attempts begun in the
+                # preceding horizon when they eventually complete.
+                old = (getattr(self, "_time_cycle", None) or {}).get("lanes", {}).get(key)
+                if old is not None:
+                    lanes[key] = dict(old, used=0.0, budget=0.0, accounting_only=True)
         current = previous.get("current") if preserve_current else None
         if current not in lanes:
             current = None
@@ -1688,7 +1703,9 @@ class Broker:
         if not available:
             return None, cycle, {}
         signature = self._policy_signature(policy)
-        new_lanes = set(available) - set((cycle or {}).get("lanes", {}))
+        existing_lanes = (cycle or {}).get("lanes", {})
+        new_lanes = {key for key in available
+                     if key not in existing_lanes or existing_lanes[key].get("accounting_only")}
         current = (cycle or {}).get("current")
         # Admission is a non-preemptive boundary, not a redistribution of the
         # leftover hour inside an unchanged model batch. A more important new
@@ -1786,14 +1803,14 @@ class Broker:
         self._scheduler_snapshot = {
             "time_cycle": deepcopy(self._time_cycle),
             "duration_estimates": dict(self._duration_estimates),
-            "active_time_batch": deepcopy(self._active_time_batch),
+            "active_time_batches": deepcopy(self._active_time_batches),
             "last": dict(self._last_scheduler_decision)
             if getattr(self, "_last_scheduler_decision", None) else None,
         }
 
-    def _complete_time_batch(self, finished: float) -> None:
+    def _complete_time_batch(self, job_id: str, finished: float) -> None:
         """Charge one completed non-preemptive attempt to its selected lane."""
-        active = self._active_time_batch
+        active = self._active_time_batches.pop(job_id, None)
         if active is None:
             return
         lane = tuple(active["lane"])
@@ -1803,7 +1820,6 @@ class Broker:
         self._duration_estimates[lane] = (
             elapsed if previous is None else ((previous + elapsed) / 2.0)
         )
-        self._active_time_batch = None
         self._publish_scheduler_snapshot()
 
     def _next(self, allowed_sources: frozenset[str] | None = None, policy: SourcePolicy | None = None):
@@ -1886,7 +1902,7 @@ class Broker:
                 occurred=now, metadata={"lease_until": lease_until},
             )
             if policy is not None:
-                self._active_time_batch = {
+                self._active_time_batches[row["id"]] = {
                     "lane": self._lane_key(row),
                     "started": now,
                 }
@@ -1914,7 +1930,7 @@ class Broker:
                 finished = self.clock()
                 error_summary = ("nightly execution failed; no raw executor detail retained"
                                  if row["source"] == nightly_eval.SOURCE else bounded_error_summary(exc))
-                self._complete_time_batch(finished)
+                self._complete_time_batch(row["id"], finished)
                 self.db.execute("UPDATE jobs SET state='failed',finished=?,lease_until=NULL,error=? WHERE id=?", (finished, error_summary, row["id"]))
                 self.storage.record_terminal_retention(
                     row["id"], row["source"], "failed", finished,
@@ -2047,7 +2063,7 @@ class Broker:
                 attempt_no=attempt_no, from_state=state, to_state=final,
                 reason=reason, occurred=finished,
             )
-            self._complete_time_batch(finished)
+            self._complete_time_batch(row["id"], finished)
             self._refresh_health_cache_locked()
             self.completed.notify_all()
 

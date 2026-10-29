@@ -58,6 +58,7 @@ class OccupancyTest(unittest.TestCase):
                 return {'sources': {'local-voice': {'weight': 2}, 'llm-source': {'weight': 1}}}
 
         broker = Broker.__new__(Broker)
+        broker._active_time_batches = {}
         available = {
             ('local-voice', 'voice-model'): {'source': 'local-voice', 'queued_at': 1, 'created': 1},
             ('llm-source', 'llm-model'): {'source': 'llm-source', 'queued_at': 1, 'created': 1},
@@ -67,6 +68,71 @@ class OccupancyTest(unittest.TestCase):
         llm = cycle['lanes'][('llm-source', 'llm-model')]['budget']
         self.assertAlmostEqual(voice, SCHEDULING_HORIZON_SECONDS / 3)
         self.assertAlmostEqual(llm, 2 * voice)
+
+    def test_parallel_attempts_are_charged_to_their_own_lanes(self):
+        broker = Broker.__new__(Broker)
+        a, b = ('local-voice', 'voice'), ('llm-source', 'llm')
+        broker._active_time_batches = {
+            'a': {'lane': a, 'started': 10},
+            'b': {'lane': b, 'started': 12},
+        }
+        broker._duration_estimates = {}
+        broker._time_cycle = {'lanes': {a: {'used': 0}, b: {'used': 0}}, 'total_used': 0}
+        broker._last_scheduler_decision = None
+        broker._complete_time_batch('b', 17)
+        self.assertEqual(broker._time_cycle['lanes'][b]['used'], 5)
+        self.assertIn('a', broker._active_time_batches)
+        broker._complete_time_batch('a', 20)
+        self.assertEqual(broker._time_cycle['lanes'][a]['used'], 10)
+        self.assertEqual(broker._time_cycle['total_used'], 15)
+        self.assertFalse(broker._active_time_batches)
+
+    def test_inflight_lane_survives_ready_queue_rebase(self):
+        class Policy:
+            def weight(self, source):
+                return {'local-voice': 2, 'llm-source': 1}[source]
+
+            def snapshot(self):
+                return {'sources': {'local-voice': {'weight': 2}, 'llm-source': {'weight': 1}}}
+
+        broker = Broker.__new__(Broker)
+        broker._active_time_batches = {}
+        a, b = ('local-voice', 'voice'), ('llm-source', 'llm')
+        rows = {a: {'source': a[0], 'queued_at': 1, 'created': 1},
+                b: {'source': b[0], 'queued_at': 1, 'created': 1}}
+        cycle = broker._new_time_cycle(rows, Policy(), 1)
+        broker._active_time_batches['a'] = {'lane': a, 'started': 1}
+        cycle = broker._new_time_cycle({b: rows[b]}, Policy(), 2, cycle)
+        self.assertIn(a, cycle['lanes'])
+        broker._time_cycle = cycle
+        broker._duration_estimates = {}
+        broker._last_scheduler_decision = None
+        broker._complete_time_batch('a', 11)
+        self.assertEqual(cycle['lanes'][a]['used'], 10)
+
+    def test_inflight_lane_survives_fresh_horizon(self):
+        class Policy:
+            def weight(self, source):
+                return 1
+
+            def snapshot(self):
+                return {'sources': {'llm-source': {'weight': 1}}}
+
+        broker = Broker.__new__(Broker)
+        a, b = ('local-voice', 'voice'), ('llm-source', 'llm')
+        broker._active_time_batches = {'a': {'lane': a, 'started': 1}}
+        broker._time_cycle = {'lanes': {a: {'used': 100, 'budget': 100,
+                                                  'source': a[0], 'model': a[1],
+                                                  'weight': 2, 'queued_at': 1}}}
+        rows = {b: {'source': b[0], 'queued_at': 1, 'created': 1}}
+        cycle = broker._new_time_cycle(rows, Policy(), 2)
+        self.assertEqual(cycle['lanes'][a]['used'], 0)
+        self.assertTrue(cycle['lanes'][a]['accounting_only'])
+        broker._time_cycle = cycle
+        broker._duration_estimates = {}
+        broker._last_scheduler_decision = None
+        broker._complete_time_batch('a', 11)
+        self.assertEqual(cycle['lanes'][a]['used'], 10)
 
 
 if __name__ == '__main__':
