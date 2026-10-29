@@ -7,6 +7,8 @@ import unittest
 import http.server
 import io
 import wave
+import urllib.error
+from clients import broker_voice_client
 from broker import voice
 from unittest.mock import patch
 from broker.service import Broker, SourcePolicy
@@ -184,6 +186,46 @@ class VoiceTests(unittest.TestCase):
             server.shutdown()
             worker.join(5)
             server.server_close()
+
+    def test_client_request_and_retry_after_lost_response(self):
+        path = os.path.join(self.tmp.name, 'audio.ogg')
+        with open(path, 'wb') as f:
+            f.write(b'audio')
+        requests = []
+        def submit(request, timeout):
+            body = json.loads(request.data)
+            requests.append(body)
+            self.assertEqual(request.full_url, 'http://broker.test/v1/jobs')
+            job = self.broker.submit(body['profile'], body['kind'], body['payload'],
+                                     source=body['source'], source_item_id=body['source_item_id'],
+                                     external_id=body['external_id'])
+            if len(requests) == 1:
+                raise urllib.error.URLError('response lost')
+            return io.BytesIO(json.dumps({'id': job['id']}).encode())
+        with patch.dict(os.environ, {'BROKER_VOICE_ENABLED': '1'}), \
+             patch('urllib.request.urlopen', side_effect=submit), patch('time.sleep'):
+            result = broker_voice_client.submit(path, 'gigaam', 'http://broker.test',
+                                                 external_id='stable', source_item_id='audio')
+        self.assertEqual(requests[0], requests[1])
+        self.assertEqual(requests[0]['source'], 'local-voice')
+        self.assertEqual(requests[0]['profile'], 'voice-gigaam-v1')
+        self.assertEqual(requests[0]['kind'], 'transcribe')
+        self.assertNotIn('weight', requests[0])  # Weight belongs to server policy.
+        self.assertEqual(self.policy.weight('local-voice'), 2)
+        production_policy = SourcePolicy(os.path.join(os.path.dirname(__file__), '..', 'config', 'sources.production.json'))
+        self.assertEqual(production_policy.weight('local-voice'), 2)
+        self.assertEqual(self.broker.status(result['id'])['state'], 'queued')
+        self.assertEqual(self.broker.db.execute('SELECT count(*) FROM jobs').fetchone()[0], 1)
+        with self.assertRaises(ValueError):
+            self.broker.submit('voice-gigaam-v1', 'transcribe',
+                               {'filename': 'other.ogg', 'audio_base64': self.payload['audio_base64']},
+                               source='local-voice', source_item_id='audio', external_id='stable')
+
+    def test_client_disabled_by_default(self):
+        with patch.dict(os.environ, {}, clear=True), patch('urllib.request.urlopen') as urlopen:
+            with self.assertRaisesRegex(RuntimeError, 'disabled'):
+                broker_voice_client.submit('not-opened', 'gigaam', 'http://broker.test')
+            urlopen.assert_not_called()
 
     def test_profile_contract(self):
         with self.assertRaises(ValueError): self.broker.submit('voice-gigaam-v1', 'transcribe', self.payload, source='other')

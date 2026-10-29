@@ -713,7 +713,7 @@ class Broker:
                         (source, external_id),
                     ).fetchone()
                     tombstone_is_idempotent = tombstone is not None and (
-                        source in {"olya-vision", "olya-decision", "syncopia-telegram-memory", "openclaw", "nextcloud", "pilot-mainpc", nightly_eval.SOURCE}
+                        source in {"olya-vision", "olya-decision", "syncopia-telegram-memory", "openclaw", "nextcloud", "pilot-mainpc", "local-voice", nightly_eval.SOURCE}
                         or producer_storage is not None
                         or tombstone["producer_attempt_id"] is not None
                     )
@@ -742,7 +742,7 @@ class Broker:
                         or existing["result_storage_mode"] != "broker_temporary"
                     )
                     if (
-                        source in {"olya-vision", "olya-decision", "syncopia-telegram-memory", "openclaw", "nextcloud", "pilot-mainpc", nightly_eval.SOURCE}
+                        source in {"olya-vision", "olya-decision", "syncopia-telegram-memory", "openclaw", "nextcloud", "pilot-mainpc", "local-voice", nightly_eval.SOURCE}
                         or producer_storage is not None
                         or existing_has_producer_storage
                     ):
@@ -769,12 +769,12 @@ class Broker:
                                 raise ValueError(
                                     "producer storage idempotency conflict for existing correlation"
                                 )
-                        if source in {"openclaw", "nextcloud", "pilot-mainpc", nightly_eval.SOURCE} and (
+                        if source in {"openclaw", "nextcloud", "pilot-mainpc", "local-voice", nightly_eval.SOURCE} and (
                             existing["profile"] != profile or existing["kind"] != kind
                             or existing["input_hash"] != content_evidence(payload)[0]
                         ):
                             raise ValueError("idempotency key was used for another request")
-                        if source in {"nextcloud", "pilot-mainpc", nightly_eval.SOURCE} and existing["source_item_id"] != source_item_id:
+                        if source in {"nextcloud", "pilot-mainpc", "local-voice", nightly_eval.SOURCE} and existing["source_item_id"] != source_item_id:
                             raise ValueError("source correlation item conflict")
                         return self.status(existing["id"])
             if source == nightly_eval.SOURCE:
