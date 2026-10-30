@@ -2,24 +2,36 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="color-scheme" content="dark">
 <title>Ollama broker queue</title>
 <link rel="stylesheet" href="/dashboard/assets/dashboard.css?v=__VERSION_dashboard.css__">
 <script src="/dashboard/assets/table_sort.js?v=__VERSION_table_sort.js__" defer></script>
 <script src="/dashboard/assets/dashboard.js?v=__VERSION_dashboard.js__" defer></script>
 </head>
 <body>
-<h1>Ollama inference broker queue</h1>
-
-<p>Snapshot timestamp: <code id="snapshot-timestamp">—</code> · refreshes every 30 seconds in the background; paused while this tab is in the background.</p>
-<p id="dashboard-error" class="error" role="status">Loading dashboard…</p>
+<header class="topbar">
+  <div class="topbar-in">
+    <div class="brand">
+      <span class="dot" aria-hidden="true"></span>
+      <h1>Ollama inference broker queue</h1>
+    </div>
+    <div class="spacer"></div>
+    <span class="stamp">Snapshot: <code id="snapshot-timestamp">—</code></span>
+  </div>
+</header>
 <noscript>JavaScript is required to load queue data from /v1/dashboard.</noscript>
+
+<div class="wrap">
+<p class="note">Data refreshes every 30 seconds in the background; paused while this tab is in the background.</p>
+<p id="dashboard-error" class="error" role="status">Loading dashboard…</p>
+
 <main id="dashboard-live" hidden>
 <p id="maintenance" class="error" hidden>Admission maintenance is active; new jobs and retries are blocked.</p>
 <p id="stale" class="error" hidden></p>
 <p id="summary" class="summary"></p>
-<h2>Sources</h2>
 
+<h2>Sources</h2>
 <div class="table-scroll"><table id="sources-table">
 <thead><tr>
 <th data-sort-key="source"><button type="button" class="sort-btn">Source<span class="sort-mark" aria-hidden="true">↕</span></button></th>
@@ -33,16 +45,16 @@
 <th data-sort-key="delayed"><button type="button" class="sort-btn">Delayed<span class="sort-mark" aria-hidden="true">↕</span></button></th>
 <th data-sort-key="failed"><button type="button" class="sort-btn">Failed<span class="sort-mark" aria-hidden="true">↕</span></button></th>
 <th data-sort-key="cancelled"><button type="button" class="sort-btn">Cancelled<span class="sort-mark" aria-hidden="true">↕</span></button></th>
-<th data-sort-key="completed"><button type="button" class="sort-btn">Completed total<span class="sort-mark" aria-hidden="true">↕</span></button></th>
+<th data-sort-key="completed"><button type="button" class="sort-btn">Completed<span class="sort-mark" aria-hidden="true">↕</span></button></th>
 <th data-sort-key="completed_1h"><button type="button" class="sort-btn">Completed 1h<span class="sort-mark" aria-hidden="true">↕</span></button></th>
 <th data-sort-key="completed_24h"><button type="button" class="sort-btn">Completed 24h<span class="sort-mark" aria-hidden="true">↕</span></button></th>
-<th data-sort-key="bulk"><button type="button" class="sort-btn">Bulk actions<span class="sort-mark" aria-hidden="true">↕</span></button></th>
+<th data-sort-key="bulk"><button type="button" class="sort-btn">Bulk<span class="sort-mark" aria-hidden="true">↕</span></button></th>
 </tr></thead>
 <tbody id="sources-body"></tbody>
 </table></div>
-<p><small>Dispatch pause preserves queued jobs and lets a running job finish. Admission block rejects new jobs and does not change the queue. Delayed jobs are waiting for a source min-interval.</small></p>
-<h2>Active jobs</h2>
+<p class="note">Dispatch pause preserves queued jobs and lets a running job finish. Admission block rejects new jobs and does not change the queue. Delayed jobs are waiting for a source min-interval.</p>
 
+<h2>Active jobs</h2>
 <div class="table-scroll"><table id="active-table">
 <thead><tr>
 <th data-sort-key="id" class="compact"><button type="button" class="sort-btn">ID<span class="sort-mark" aria-hidden="true">↕</span></button></th>
@@ -56,12 +68,12 @@
 </tr></thead>
 <tbody id="active-body"></tbody>
 </table></div>
+
 <section id="forecast" hidden>
 <h2>Forecast</h2>
 <p id="forecast-error" class="error" hidden></p>
 <div id="forecast-live">
-<p>Current model: <b id="current-model"></b> · Lower Weight gets more GPU time (reciprocal shares); contiguous model batches, FIFO within a source. Active jobs are not interrupted.</p>
-
+<p class="note">Current model: <b id="current-model"></b> · Lower Weight gets more GPU time (reciprocal shares); contiguous model batches, FIFO within a source. Active jobs are not interrupted.</p>
 <div class="table-scroll"><table id="forecast-table">
 <thead><tr>
 <th data-sort-key="job"><button type="button" class="sort-btn">Job<span class="sort-mark" aria-hidden="true">↕</span></button></th>
@@ -75,12 +87,12 @@
 </tr></thead>
 <tbody id="forecast-body"></tbody>
 </table></div>
-<p><small id="contingency"></small></p>
+<p class="note"><small id="contingency"></small></p>
 </div>
 </section>
-<h2>History</h2>
-<p><small>Finished: Asia/Tbilisi. Model turn: completed execution slot, including model preparation, excluding queue wait; unavailable for cancelled, failed or unstarted jobs. All durations use mm:ss, or h:mm:ss from one hour (for example 00:42, 02:30, 1:05:00).</small></p>
 
+<h2>History</h2>
+<p class="note">Finished: Asia/Tbilisi. Model turn: completed execution slot, including model preparation, excluding queue wait; unavailable for cancelled, failed or unstarted jobs. All durations use mm:ss, or h:mm:ss from one hour (for example 00:42, 02:30, 1:05:00).</p>
 <div class="table-scroll"><table id="history-table">
 <thead><tr>
 <th data-sort-key="id" class="compact"><button type="button" class="sort-btn">ID<span class="sort-mark" aria-hidden="true">↕</span></button></th>
@@ -98,5 +110,6 @@
 <div id="history-sentinel" data-cursor=""></div>
 <p id="history-error" class="error" role="status"></p>
 </main>
+</div>
 </body>
 </html>

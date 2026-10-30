@@ -1,95 +1,201 @@
+/* Ollama broker dashboard — dark control-room theme.
+   Design tokens adapted from the AI Usage Dashboard (OpenCodex design system,
+   MIT): role-based colour tokens, a 10/11/12/13/14 type scale, a 4px spacing
+   base and 6/8/12/pill radii, so both dashboards read as one product family.
+   The accent follows the Syncopia brand teal (wordmark #0E3F44). No external
+   assets: every rule below is self-contained. */
+:root {
+  --bg: #14181a; --surface: #1b2124; --raised: #232b2f; --raised-2: #2a3338;
+  --line: #2d373c; --line-soft: #242c30;
+  --text: #e9eef1; --muted: #9aa8b0; --faint: #71818a;
+  --green: #4ecb9d; --amber: #fbbf24; --red: #f87171;
+  --accent: #2fb8ac; --accent-ink: #07211f;
+  --brand: #0e3f44; --brand-hi: #14757a;
+  --radius-xs: 6px; --radius-sm: 8px; --radius: 12px; --pill: 999px;
+  --s1: 4px; --s2: 8px; --s3: 12px; --s4: 16px; --s5: 20px; --s6: 24px;
+  --font-ui: "Manrope", -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+  --font-code: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  --motion-fast: 120ms;
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; padding: 0; }
 body {
-  font: 14px system-ui, sans-serif;
-  margin: 2rem;
-  color: #18212b;
+  background: var(--bg);
+  color: var(--text);
+  font: 13px/1.4 var(--font-ui);
+  -webkit-font-smoothing: antialiased;
+  padding: 0 0 40px;
 }
-table {
-  border-collapse: collapse;
-  /* Size to content: a 100%-wide table stretches short columns into empty
-     space on wide screens. Any overflow scrolls in .table-scroll instead. */
-  width: auto;
-  margin: 1rem 0;
+code { font-family: var(--font-code); font-size: .92em; color: var(--muted); }
+
+/* ---------- top bar ---------- */
+.topbar {
+  position: sticky; top: 0; z-index: 20;
+  background: linear-gradient(180deg, var(--bg) 72%, rgba(20,24,26,.85));
+  border-bottom: 1px solid var(--line);
 }
-th, td {
-  padding: .45rem;
-  border: 1px solid #ccd6df;
-  text-align: right;
+.topbar-in {
+  display: flex; align-items: center; gap: var(--s3);
+  padding: 10px var(--s4); width: 100%;
 }
-th:first-child, td:first-child { text-align: left; }
-th { background: #edf3f7; }
-.compact { white-space: nowrap; }
-/* Keep every cell on one line so rows stay short; the scroll box absorbs any
-   horizontal overflow. Columns hug their content, so no cell stretches into
-   empty space. */
-th, td { white-space: nowrap; }
-/* Long prose (Forecast reason) may wrap; it is one column, not the grid. */
-#forecast-table th[data-sort-key="reason"],
-#forecast-table td:nth-child(7) { white-space: normal; }
+.brand { display: flex; align-items: center; gap: var(--s2); min-width: 0; }
+.dot { width: 8px; height: 8px; border-radius: var(--pill); background: var(--green); flex: none; }
+h1 { font-size: 14px; margin: 0; font-weight: 700; letter-spacing: -.01em; white-space: nowrap; }
+.brand .mark { font-weight: 800; color: var(--accent); letter-spacing: -.02em; }
+.spacer { flex: 1 1 auto; }
+.stamp { color: var(--faint); font-size: 11px; font-variant-numeric: tabular-nums; white-space: nowrap; }
+
+/* ---------- layout ---------- */
+.wrap { max-width: 100%; margin: 0 auto; padding: var(--s4) var(--s4) 0; }
+.note { color: var(--faint); font-size: 11px; margin: var(--s2) 0; }
+h2 {
+  font-size: 12px; margin: var(--s4) 0 var(--s2); font-weight: 700;
+  letter-spacing: .05em; text-transform: uppercase; color: var(--muted);
+}
+.summary { font-size: 13px; color: var(--text); margin: var(--s2) 0; }
+.summary b { color: var(--accent); font-variant-numeric: tabular-nums; }
+.error { color: #f5b3ae; font-size: 12px; margin: var(--s2) 0; }
+.error:not([hidden]) {
+  background: rgba(248,113,113,.08); border: 1px solid rgba(248,113,113,.35);
+  border-radius: var(--radius-sm); padding: var(--s2) var(--s3);
+}
+
+/* ---------- tables ---------- */
+/* Content-sized table inside an absorbent scroll box: a 100%-wide table
+   stretches short columns into empty space, so any overflow scrolls here. */
 .table-scroll {
   overflow-x: auto;
   overscroll-behavior-x: contain;
   -webkit-overflow-scrolling: touch;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--surface);
+  margin: var(--s2) 0 var(--s4);
 }
-code { font-size: .9em; }
-.summary { font-size: 1.05rem; }
-.weight-form, .enabled-form, .admission-form {
-  display: flex;
-  gap: .35rem;
-  align-items: center;
-  justify-content: flex-end;
+table { border-collapse: collapse; width: auto; margin: 0; font-size: 12px; }
+th, td {
+  padding: 5px 6px;
+  border-bottom: 1px solid var(--line-soft);
+  text-align: right;
+  vertical-align: middle;
 }
-.weight-feedback, .enabled-feedback, .admission-feedback, .bulk-feedback {
-  min-width: 4rem;
-  text-align: left;
+th:first-child, td:first-child { text-align: left; }
+th {
+  position: sticky; top: 0; z-index: 1;
+  background: var(--raised);
+  color: var(--muted);
+  font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: .03em;
+  border-bottom: 1px solid var(--line);
 }
-.error { color: #a00; }
-button { margin: .15rem; }
-.sort-btn {
-  appearance: none;
-  border: 0;
-  background: none;
-  color: inherit;
-  font: inherit;
-  text-transform: inherit;
-  letter-spacing: inherit;
-  padding: 2px 0;
-  cursor: pointer;
-  white-space: nowrap;
-}
-.sort-btn:hover { filter: brightness(.85); }
-.sort-btn:focus-visible {
-  outline: 2px solid currentColor;
-  outline-offset: 2px;
-  border-radius: 2px;
-}
-.sort-mark {
-  display: inline-block;
-  min-width: 12px;
-  margin-left: 3px;
-  opacity: .85;
-}
+/* Keep every cell on one line so rows stay short; the scroll box absorbs any
+   horizontal overflow, and columns hug their content (no stretched cells). */
+th, td { white-space: nowrap; }
+tbody tr:nth-child(even) td { background: rgba(255,255,255,.018); }
+tbody tr:hover td { background: rgba(47,184,172,.07); }
+tbody tr:last-child td { border-bottom: 0; }
+td { font-variant-numeric: tabular-nums; }
+.compact { font-family: var(--font-code); font-size: 11px; color: var(--muted); }
+/* Long prose (Forecast reason) may wrap; it is one column, not the grid. */
+#forecast-table th[data-sort-key="reason"],
+#forecast-table td:nth-child(7) { white-space: normal; min-width: 160px; }
+#forecast-table td:nth-child(7) { text-align: left; }
+#sources-table td:first-child { font-weight: 600; }
 [hidden] { display: none !important; }
 
-/* Narrow screens: tighten cell padding and type, let text wrap instead of
-   forcing a wide table, and hide the least actionable columns. Column headers
-   keep their sort buttons, so the sorting contract stays visible. Wide-screen
-   layout is untouched. */
+/* ---------- sorting ---------- */
+.sort-btn {
+  appearance: none; border: 0; background: none; color: inherit;
+  font: inherit; text-transform: inherit; letter-spacing: inherit;
+  padding: 2px 0; cursor: pointer; white-space: nowrap;
+}
+.sort-btn:hover { color: var(--text); }
+.sort-btn:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 2px; }
+.sort-mark { display: inline-block; min-width: 12px; margin-left: 3px; color: var(--accent); opacity: .9; }
+
+/* ---------- policy controls ---------- */
+.weight-form, .enabled-form, .admission-form {
+  display: flex; gap: 4px; align-items: center; justify-content: flex-end;
+}
+select {
+  appearance: none;
+  background: var(--raised-2) url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='8' height='6'><path d='M0 0l4 5 4-5z' fill='%2371818a'/></svg>") no-repeat right 6px center;
+  color: var(--text);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-xs);
+  font: 500 11px/1.2 var(--font-ui);
+  padding: 4px 20px 4px 7px;
+  cursor: pointer;
+  min-width: 74px;
+}
+select:hover { border-color: var(--brand-hi); }
+select:disabled { opacity: .5; cursor: not-allowed; }
+select:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+.weight-form select { min-width: 46px; padding-right: 18px; }
+.weight-feedback, .enabled-feedback, .admission-feedback, .bulk-feedback {
+  min-width: 0; text-align: left; color: var(--muted); font-size: 10px;
+}
+.bulk-feedback.error, .weight-feedback.error,
+.enabled-feedback.error, .admission-feedback.error { color: #f5b3ae; }
+.bulk-action {
+  appearance: none;
+  background: var(--raised-2); color: var(--text);
+  border: 1px solid var(--line); border-radius: var(--pill);
+  font: 500 11px/1 var(--font-ui);
+  padding: 4px 8px; margin: 0 0 0 3px; cursor: pointer;
+  white-space: nowrap;
+  transition: background var(--motion-fast), border-color var(--motion-fast);
+}
+.bulk-action:hover:not(:disabled) { border-color: var(--brand-hi); background: #303a40; }
+.bulk-action:disabled { opacity: .35; cursor: default; }
+.bulk-action:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+/* ---------- footer legend ---------- */
+footer {
+  max-width: 100%; margin: 0 auto; padding: 0 var(--s4);
+  color: var(--faint); font-size: 11px;
+}
+footer p { margin: var(--s2) 0; }
+
+/* Narrow screens: tighten padding and type, let text wrap, and hide the least
+   actionable columns. Column headers keep their sort buttons, so the sorting
+   contract stays visible. Wide-screen layout is untouched. */
 @media (max-width: 900px) {
-  body { margin: 1rem; font-size: 13px; }
-  th, td { padding: .3rem .25rem; }
-  .sort-btn { font-size: 12px; }
-  .weight-form, .enabled-form, .admission-form { gap: .2rem; }
-  .weight-feedback, .enabled-feedback, .admission-feedback, .bulk-feedback { min-width: 0; }
+  body { font-size: 13px; }
+  .wrap, .topbar-in, footer { padding-left: var(--s3); padding-right: var(--s3); }
+  th, td { padding: 4px 5px; }
+  select { min-width: 66px; font-size: 10px; padding-right: 18px; }
+  .sort-btn { font-size: 11px; }
+  .weight-form, .enabled-form, .admission-form { gap: 3px; }
   /* Forecast: drop the prose reason, keep the wait estimate. */
   #forecast-table th[data-sort-key="reason"],
   #forecast-table td:nth-child(7) { display: none; }
 }
 
+/* Laptop widths: the Sources grid needs ~1505px with every counter, which
+   overflows even a 1536-class screen. Below 1600px drop the slow tail (retry,
+   delayed, 1h completions) so the first table fits without horizontal scroll.
+   Desktop screens (>=1600px) keep all fifteen columns. */
+@media (max-width: 1600px) {
+  #sources-table th[data-sort-key="retry"], #sources-table td:nth-child(8),
+  #sources-table th[data-sort-key="delayed"], #sources-table td:nth-child(9),
+  #sources-table th[data-sort-key="completed_1h"], #sources-table td:nth-child(13) { display: none; }
+}
+
+@media (max-width: 1320px) {
+  /* One more column down for ~1280-wide screens. */
+  #sources-table th[data-sort-key="cancelled"], #sources-table td:nth-child(11) { display: none; }
+}
+
+@media (max-width: 1180px) {
+  #sources-table th[data-sort-key="lease"], #sources-table td:nth-child(7) { display: none; }
+}
+
 @media (max-width: 640px) {
-  body { margin: .6rem; font-size: 12px; }
-  th, td { padding: .25rem .2rem; }
-  .sort-btn { font-size: 11px; }
-  .summary { font-size: .95rem; }
+  body { font-size: 12px; }
+  .wrap, .topbar-in, footer { padding-left: var(--s2); padding-right: var(--s2); }
+  th, td { padding: 4px 5px; }
+  .sort-btn { font-size: 10px; }
+  .summary { font-size: 12px; }
   /* Least-actionable columns: keep the counters that operators page on. */
   #sources-table th[data-sort-key="lease"], #sources-table td:nth-child(7),
   #sources-table th[data-sort-key="retry"], #sources-table td:nth-child(8),
@@ -100,6 +206,7 @@ button { margin: .15rem; }
 @media (max-width: 480px) {
   #sources-table th[data-sort-key="failed"], #sources-table td:nth-child(10),
   #sources-table th[data-sort-key="cancelled"], #sources-table td:nth-child(11),
-  #active-table th[data-sort-key="lease_until"], #active-table td:nth-child(6) { display: none; }
-  .table-scroll { margin: 0 -.6rem; }
+  #active-table th[data-sort-key="lease_until"], #active-table td:nth-child(6),
+  #sources-table th[data-sort-key="completed_1h"], #sources-table td:nth-child(13) { display: none; }
+  .table-scroll { margin-left: calc(-1 * var(--s2)); margin-right: calc(-1 * var(--s2)); }
 }
