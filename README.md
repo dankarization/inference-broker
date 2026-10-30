@@ -96,7 +96,9 @@ Rollback: `systemctl --user disable --now ollama-inference-broker.service`.
   [docs/ANALYTICS.md](docs/ANALYTICS.md).
 - `GET /dashboard` — локальная HTML-панель очереди с refresh раз в 30 секунд,
   ETag/304 для неизменившегося состояния и без payload,
-  результатов и ошибок. Она показывает policy (`enabled`, `weight`),
+  результатов и ошибок. HTML/CSS/JS загружаются с диска и обновляются без рестарта
+  процесса: [архитектура и обновление UI](docs/DASHBOARD.md). Таблицы рисуются
+  в браузере из `/v1/dashboard`. Она показывает policy (`enabled`, `weight`),
   состояния, lease, retry/delay, активные jobs, completed total/1h/24h и
   read-only **Forecast** под активными jobs: текущую модель и список следующих
   десяти выборов в непрерывных model batches с обратными долями Weight,

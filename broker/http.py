@@ -1,4 +1,5 @@
 from __future__ import annotations
+import hashlib
 import hmac
 import json
 import select
@@ -12,7 +13,7 @@ from .compat import (CompatibilityError, stream_frames, submit as submit_compati
                      submit_olya_decision, submit_olya_vision, submit_shutterstock_canary,
                      submit_shutterstock_video, submit_syncopia_memory)
 from .profiles import OPENCLAW_PROFILES_BY_MODEL, PROFILES
-from .dashboard import render as render_dashboard
+from .dashboard_assets import DashboardAssets
 from .policy import SourcePolicyError
 from .service import SourceAdmissionBlocked, SourceQueueFull, StorageAuthorizationRequired
 from .storage import ReceiptConflict, StorageContractError
@@ -29,6 +30,7 @@ def openclaw_wait_seconds(profile):
 def serve(broker, host="127.0.0.1", port=8088, policy=None, storage_token=None):
     broker.use_source_policy(policy)
     openclaw_slots = threading.BoundedSemaphore(MAX_OUTSTANDING)
+    dashboard_assets = DashboardAssets()
     class Handler(BaseHTTPRequestHandler):
         def _json(self, status, value, headers=None):
             encoded=json.dumps(value).encode(); self.send_response(status); self.send_header("Content-Type","application/json"); self.send_header("Content-Length",str(len(encoded)))
@@ -63,10 +65,12 @@ def serve(broker, host="127.0.0.1", port=8088, policy=None, storage_token=None):
                 self._json(401, {"error": {"code": "storage_auth_required"}})
                 return False
             return True
-        def _dashboard_validator(self, include_producer_storage):
+        def _dashboard_validator(self, include_producer_storage, asset_version=None):
             etag = broker.dashboard_etag(
                 policy, include_producer_storage=include_producer_storage,
             )
+            if asset_version is not None:
+                etag = '"' + hashlib.sha256((etag + asset_version).encode()).hexdigest() + '"'
             headers = {"ETag": etag, "Cache-Control": "private, no-cache"}
             if self.headers.get("If-None-Match") == etag:
                 self.send_response(304)
@@ -473,20 +477,49 @@ def serve(broker, host="127.0.0.1", port=8088, policy=None, storage_token=None):
             parsed = urlsplit(self.path)
             path = parsed.path
             query = parse_qs(parsed.query)
-            if path == "/dashboard":
+            if path.startswith("/dashboard/assets/"):
+                try:
+                    asset = dashboard_assets.read(path.removeprefix("/dashboard/assets/"))
+                except KeyError:
+                    self._json(404, {"error": "not found"})
+                    return
+                except OSError:
+                    self._json(503, {"error": "dashboard asset unavailable"}, {"Cache-Control": "no-store"})
+                    return
+                etag = asset.etag
+                unchanged = self.headers.get("If-None-Match") == etag
+                self.send_response(304 if unchanged else 200)
+                self.send_header("Content-Type", asset.content_type)
+                self.send_header("Cache-Control", "no-cache")
+                self.send_header("ETag", etag)
+                if not unchanged:
+                    self.send_header("Content-Length", str(len(asset.content)))
+                self.end_headers()
+                if not unchanged:
+                    self.wfile.write(asset.content)
+            elif path == "/dashboard":
+                try:
+                    live_page, unavailable_page, version = dashboard_assets.pages()
+                except OSError:
+                    self._json(503, {"error": "dashboard assets unavailable"}, {"Cache-Control": "no-store"})
+                    return
                 include_producer_storage = self._storage_authenticated()
-                etag, headers = self._dashboard_validator(include_producer_storage)
+                etag, headers = self._dashboard_validator(include_producer_storage, version)
                 if etag is None:
                     return
-                dashboard = broker.dashboard(
-                    policy,
-                    include_producer_storage=include_producer_storage,
-                )
-                encoded = render_dashboard(dashboard)
-                status = 503 if dashboard["observation"]["state"] == "unavailable" else 200
-                self.send_response(status); self.send_header("Content-Type", "text/html; charset=utf-8"); self.send_header("Content-Length", str(len(encoded)))
+                # Preserve the 503 contract; rows and counters now come only
+                # from the client's /v1/dashboard request, not Python rendering.
+                dashboard = broker.dashboard(policy, include_producer_storage=include_producer_storage)
+                unavailable = dashboard["observation"]["state"] == "unavailable"
+                page = unavailable_page if unavailable else live_page
+                if unavailable:
+                    headers["Cache-Control"] = "no-store"
+                self.send_response(503 if unavailable else 200)
+                self.send_header("Content-Type", page.content_type)
+                self.send_header("Content-Length", str(len(page.content)))
                 for name, value in headers.items(): self.send_header(name, value)
-                self.end_headers(); self.wfile.write(encoded)
+                self.end_headers()
+                self.wfile.write(page.content)
             elif path == "/v1/dashboard":
                 include_producer_storage = self._storage_authenticated()
                 etag, headers = self._dashboard_validator(include_producer_storage)

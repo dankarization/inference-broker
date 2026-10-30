@@ -379,9 +379,8 @@ class TimeBatchSchedulerTests(unittest.TestCase):
         dashboard = broker.dashboard(policy)
         dashboard_ids = [item["job_id"] for item in dashboard["forecast"]["next_selections"]]
         self.assertEqual(len(dashboard_ids), 10)
-        from broker.dashboard import render
-        html = render(dashboard).decode()
-        self.assertTrue(all(job_id in html for job_id in dashboard_ids))
+        self.assertEqual(dashboard_ids, [item["job_id"]
+                         for item in broker.forecast(policy)["next_selections"]])
 
         server = serve(broker, port=0, policy=policy)
         self.addCleanup(server.server_close)

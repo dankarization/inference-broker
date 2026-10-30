@@ -1,6 +1,4 @@
 import json
-import html as html_module
-import re
 import shutil
 import sqlite3
 import subprocess
@@ -8,11 +6,13 @@ import tempfile
 import threading
 import unittest
 from datetime import datetime, timezone
+from pathlib import Path
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 from unittest.mock import patch
 
-from broker.dashboard import history_display, render, snapshot
+from broker.dashboard import history_display, snapshot
+from broker.dashboard_assets import DashboardAssets
 from broker.profiles import PROFILES
 from broker.http import serve
 from broker.service import Broker, SourcePolicy
@@ -61,72 +61,17 @@ class DashboardTests(unittest.TestCase):
         self.assertEqual(history_display({'finished': 0})['finished_display'], '01/01/1970, 04:00:00')
         self.assertEqual(history_display({'finished': None})['finished_display'], '—')
 
-    def test_initial_and_appended_history_render_the_same_cells(self):
+    def test_frontend_rendering_and_controls_with_real_scripts(self):
         if shutil.which('node') is None:
-            self.skipTest('node required for real inline script execution')
-        finished = datetime(2026, 10, 28, 13, 52, 17, tzinfo=timezone.utc).timestamp()
-        raw_rows = [dict(id='job-<one>', source='source', profile='interactive',
-                         state=state, started=started, finished=finished, attempt_count=2, weight=3)
-                    for state, started in [('completed', finished - 12.25),
-                                           ('cancelled', finished - 20), ('completed', None)]]
-        page_rows = [history_display(row) for row in raw_rows]
-        document = render({
-            'timestamp': finished, 'sources': [], 'active_jobs': [], 'history': raw_rows,
-            'overall': {'states': {'completed': 1}, 'completed_last_hour': 1, 'completed_last_24_hours': 1},
-            'forecast': {'next_selections': [dict(job_id='next', source='source',
-                profile='interactive', model=PROFILES['interactive'].model,
-                weight=1, mode='weight_priority', reason='lowest weight', wait_seconds=0)]},
-        }).decode()
-        history_html = document.split('<tbody id=history-body>')[1].split('</tbody>')[0]
-        initial_cells = [[html_module.unescape(value) for value in re.findall(r'<td[^>]*>(.*?)</td>', row)]
-                         for row in re.findall(r'<tr[^>]*>(.*?)</tr>', history_html)]
-        self.assertEqual(initial_cells[0], ['job-<one>', 'source', '3', 'interactive',
-            PROFILES['interactive'].model, 'completed', '12.250s', '28/10/2026, 17:52:17', '2'])
-        self.assertEqual([row[6] for row in initial_cells], ['12.250s', '—', '—'])
-        forecast_html = document.split('<h2>Forecast</h2>')[1].split('<h2>History</h2>')[0]
-        self.assertRegex(forecast_html, r'<th data-sort-key="profile"[^>]*>.*?Profile')
-        self.assertIn('<td>interactive</td>', forecast_html)
-        self.assertIn('.compact{width:1%;white-space:nowrap}', document)
-        for label in ('ID', 'Finished', 'Attempts', 'Reason'):
-            self.assertRegex(document, rf'<th[^>]*class=compact[^>]*>.*?{label}')
-        for row in re.findall(r'<tr[^>]*>(.*?)</tr>', history_html):
-            self.assertEqual(re.findall(r'<td class=compact>(.*?)</td>', row),
-                             ['job-&lt;one&gt;', '28/10/2026, 17:52:17', '2'])
-        script = re.search(r'<script>(.*?)</script>', document, re.S).group(1)
-        with tempfile.NamedTemporaryFile(mode='w', suffix='.js') as source:
-            source.write(script); source.flush()
-            checked = subprocess.run(['node', '--check', source.name], capture_output=True, text=True)
-            self.assertEqual(checked.returncode, 0, checked.stderr)
-        harness = r'''
-const assert=require('node:assert/strict');
-const vm=require('node:vm');
-class Element {
-  constructor(){this.children=[];this.dataset={};this.className='';this.textContent='';}
-  append(child){this.children.push(child);}
-}
-const body=new Element(), sentinel=new Element(); sentinel.dataset.cursor='cursor';
-global.document={querySelectorAll:()=>[], createElement:()=>new Element(),
-  querySelector:selector=>selector==='#history-body'?body:sentinel};
-let callback;
-global.IntersectionObserver=class {constructor(fn){callback=fn;} observe(){} };
-global.fetch=async()=>({json:async()=>({items:ROWS,next_cursor:null})});
-vm.runInThisContext('{'+SCRIPT+'\n}');
-(async()=>{
-  await callback([{isIntersecting:true}]);
-  assert.deepEqual(body.children.map(tr=>tr.children.map(td=>td.textContent)), EXPECTED);
-  for(const tr of body.children){
-    assert.equal(tr.dataset.historyId, 'job-<one>');
-    assert.deepEqual(tr.children.map((td,i)=>td.className==='compact'?i:null).filter(i=>i!==null),[0,7,8]);
-  }
-  assert.equal(sentinel.dataset.cursor,'');
-  console.log('history render contract PASS');
-})().catch(error=>{console.error(error);process.exitCode=1;});
-'''
-        harness = ('const ROWS=' + json.dumps(page_rows) + ';\nconst EXPECTED='
-                   + json.dumps(initial_cells) + ';\nconst SCRIPT=' + json.dumps(script) + ';\n' + harness)
-        result = subprocess.run(['node', '-e', harness], capture_output=True, text=True)
+            self.skipTest('node required for real frontend execution')
+        root = Path(__file__).resolve().parents[1]
+        checked = subprocess.run(['node', '--check', str(root / 'broker/static/dashboard.js')],
+                                 capture_output=True, text=True)
+        self.assertEqual(checked.returncode, 0, checked.stderr)
+        result = subprocess.run(['node', str(root / 'tests/dashboard_dom.cjs')],
+                                capture_output=True, text=True)
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn('history render contract PASS', result.stdout)
+        self.assertIn('dashboard frontend contract PASS', result.stdout)
 
     def test_policy_select_state_machine_recovers_and_serializes(self):
         # Executable model of the rendered desired/saved/saving state machine.
@@ -190,68 +135,20 @@ vm.runInThisContext('{'+SCRIPT+'\n}');
         self.assertEqual(ids, [f"terminal-{index:02d}" for index in range(39, -1, -1)])
         self.assertNotIn("payload", json.dumps(first))
 
-    def test_dashboard_html_contains_enabled_and_history_loading_contract(self):
-        html = render({"timestamp": 1, "sources": [], "active_jobs": [],
-                       "overall": {"states": {"completed": 0}, "completed_last_hour": 0, "completed_last_24_hours": 0},
-                       "history": [], "forecast": {"contingent": True, "next_selections": []}}).decode()
-        self.assertIn('class="enabled-form"', html) if False else self.assertIn("id=history-body", html)
-        self.assertIn("IntersectionObserver", html)
-        self.assertIn("/v1/history?limit=30", html)
-        self.assertLess(html.index("<h2>Forecast</h2>"), html.index("<h2>History</h2>"))
-        self.assertNotIn("tr.innerHTML", html)
-        self.assertIn("td.textContent", html)
-        self.assertNotIn("toLocaleString", html)  # one shared server formatter
-        self.assertIn("querySelectorAll('.bulk-action')", html)
-        self.assertIn("window.confirm", html)
-        self.assertIn("addEventListener('change'", html)
-        self.assertIn("while(desired!==saved)", html)
-        self.assertIn("desired===value", html)
-        self.assertIn("<meta http-equiv=refresh content=30>", html)
-        self.assertIn("refreshes every 30 seconds", html)
-        self.assertNotIn("content=15", html)
-        unavailable = render({
-            "observation": {"state": "unavailable", "observed_at": 1},
-        }).decode()
-        self.assertIn("<meta http-equiv=refresh content=30>", unavailable)
-        self.assertIn("refreshes every 30 seconds", unavailable)
-        self.assertNotIn("content=15", unavailable)
+    def test_dashboard_html_contains_static_loading_contract(self):
+        live, unavailable, _ = DashboardAssets().pages()
+        html = live.content.decode()
+        self.assertIn('id="history-body"', html)
+        self.assertLess(html.index('<h2>Forecast</h2>'), html.index('<h2>History</h2>'))
+        self.assertIn('/dashboard/assets/dashboard.js?v=', html)
+        self.assertIn('/dashboard/assets/dashboard.css?v=', html)
+        self.assertNotIn('__VERSION_', html)
+        for page in (html, unavailable.content.decode()):
+            self.assertIn('<meta http-equiv=refresh content=30>', page)
+            self.assertIn('refreshes every 30 seconds', page)
+        self.assertIn('Dashboard data unavailable', unavailable.content.decode())
+        self.assertNotIn('Completed:', unavailable.content.decode())
 
-    def test_sources_are_sorted_by_numeric_weight_then_source(self):
-        def source(name, weight):
-            return {
-                "source": name,
-                "scheduler": {
-                    "enabled": True, "admission_allowed": True,
-                    "weight": weight, "next_allowed": None,
-                },
-                "states": {
-                    name: 0 for name in (
-                        "queued", "running", "lease", "retry", "delayed",
-                        "failed", "cancelled", "completed",
-                    )
-                },
-                "completed_last_hour": 0,
-                "completed_last_24_hours": 0,
-            }
-
-        rendered = render({
-            "timestamp": 1,
-            "sources": [
-                source("weight-10", 10), source("weight-1-b", 1),
-                source("weight-2", 2), source("weight-1-a", 1),
-            ],
-            "active_jobs": [],
-            "overall": {
-                "states": {"completed": 0},
-                "completed_last_hour": 0,
-                "completed_last_24_hours": 0,
-            },
-        }).decode()
-        positions = [
-            rendered.index(f"<td>{name}</td>")
-            for name in ("weight-1-a", "weight-1-b", "weight-2", "weight-10")
-        ]
-        self.assertEqual(positions, sorted(positions))
     def test_payload_history_uses_the_bounded_observer_index_path(self):
         db = tempfile.NamedTemporaryFile()
         self.addCleanup(db.close)
@@ -460,29 +357,6 @@ vm.runInThisContext('{'+SCRIPT+'\n}');
             self.assertNotEqual(changed_headers["ETag"], etag)
             self.assertEqual(regenerate.call_count, 3)
 
-    def test_html_renders_active_timestamps_in_tbilisi_and_nulls_as_dash(self):
-        timestamp = datetime(2026, 8, 29, 8, 30, tzinfo=timezone.utc).timestamp()
-        html = render({
-            "timestamp": timestamp,
-            "sources": [],
-            "active_jobs": [{
-                "id": "active-job", "source": "interactive", "state": "running",
-                "started": timestamp, "lease_until": None, "attempt_count": 1, "retry_count": 0,
-                "weight": 2,
-            }],
-            "overall": {
-                "states": {"completed": 0},
-                "completed_last_hour": 0,
-                "completed_last_24_hours": 0,
-            },
-        }).decode()
-        self.assertIn("2026-08-29 12:30:00 UTC+04:00 (Asia/Tbilisi)", html)
-        self.assertNotIn(f">{timestamp}<", html)
-        self.assertIn(
-            'title="2026-08-29T08:30:00Z (epoch 1787992200.0)"', html,
-        )
-        self.assertIn("<td>—</td>", html)
-
     def test_dashboard_is_payload_free_and_uses_finished_completion_windows(self):
         clock = lambda: 100_000
         db = tempfile.NamedTemporaryFile()
@@ -539,6 +413,9 @@ vm.runInThisContext('{'+SCRIPT+'\n}');
 
         body, _ = get("/v1/dashboard")
         data = json.loads(body)
+        self.assertEqual(set(data), {"timestamp", "maintenance", "sources", "active_jobs",
+                                     "overall", "forecast", "history", "observation"})
+        self.assertEqual(data, broker.dashboard(policy, include_producer_storage=False))
         source = next(item for item in data["sources"] if item["source"] == "dashboard-source")
         self.assertEqual(source["scheduler"], {
             "enabled": True, "dispatch_paused": False,
@@ -559,21 +436,10 @@ vm.runInThisContext('{'+SCRIPT+'\n}');
         self.assertIn("text/html", content_type)
         self.assertIn(b"Completed 1h", html)
         self.assertIn(b"Weight", html)
-        self.assertIn(b'<select name="weight" aria-label="Weight for dashboard-source">', html)
-        self.assertIn(b'<option value="3" selected>3</option>', html)
-        self.assertNotIn(b">3.0<", html)
-        self.assertIn(b"weight-feedback", html)
+        # HTML is a data-free shell; the DOM harness exercises real controls.
+        self.assertNotIn(b'dashboard-source', html)
+        self.assertNotIn(b'active-job', html)
         self.assertNotIn(b"Dead", html)
-        self.assertIn(b'<tr data-sort-ignore><td colspan=15>None</td></tr>', render({
-            "timestamp": 0,
-            "sources": [],
-            "active_jobs": [],
-            "overall": {
-                "states": {"completed": 0},
-                "completed_last_hour": 0,
-                "completed_last_24_hours": 0,
-            },
-        }))
         self.assertNotIn(b"do-not-expose", html)
         status, result = post("/v1/sources/dashboard-source/weight", {"weight": 7})
         self.assertEqual((status, result), (200, {"source": "dashboard-source", "weight": 7}))
