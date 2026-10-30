@@ -72,7 +72,12 @@ h2 {
   background: var(--surface);
   margin: var(--s2) 0 var(--s4);
 }
-table { border-collapse: collapse; width: auto; margin: 0; font-size: 12px; }
+/* Tables fill the page so the sections span the full width evenly. Sources is
+   wide, so responsive breakpoints shed its tail columns to keep its content
+   fitting instead of overflowing into a horizontal scroll. width:auto stays as
+   the content-sized fallback before the full-width rule applies. */
+table { border-collapse: collapse; width: auto; margin: 0; font-size: 12px; table-layout: auto; }
+.table-scroll > table { width: 100%; }
 th, td {
   padding: 5px 6px;
   border-bottom: 1px solid var(--line-soft);
