@@ -176,8 +176,11 @@ class DashboardTests(unittest.TestCase):
         css = (Path(__file__).resolve().parents[1] / 'broker/static/dashboard.css').read_text(encoding='utf-8')
         self.assertIn('.table-scroll', css)
         self.assertIn('overflow-x: auto', css)
-        # Numeric cells shrink to their content instead of forcing a wide table.
-        self.assertIn('width: 1%', css)
+        # Cells stay on one line (short rows) and the table sizes to its
+        # content instead of stretching columns into empty space.
+        self.assertIn('white-space: nowrap', css)
+        self.assertIn('width: auto', css)
+        self.assertNotIn('th, td { width: 1%', css)
         # Narrow-screen rules exist and never touch the wide default layout.
         self.assertIn('@media (max-width: 900px)', css)
         self.assertIn('@media (max-width: 640px)', css)
