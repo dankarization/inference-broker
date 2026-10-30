@@ -66,7 +66,7 @@ class DashboardTests(unittest.TestCase):
             self.skipTest('node required for real inline script execution')
         finished = datetime(2026, 10, 28, 13, 52, 17, tzinfo=timezone.utc).timestamp()
         raw_rows = [dict(id='job-<one>', source='source', profile='interactive',
-                         state=state, started=started, finished=finished, attempt_count=2)
+                         state=state, started=started, finished=finished, attempt_count=2, weight=3)
                     for state, started in [('completed', finished - 12.25),
                                            ('cancelled', finished - 20), ('completed', None)]]
         page_rows = [history_display(row) for row in raw_rows]
@@ -80,9 +80,9 @@ class DashboardTests(unittest.TestCase):
         history_html = document.split('<tbody id=history-body>')[1].split('</tbody>')[0]
         initial_cells = [[html_module.unescape(value) for value in re.findall(r'<td[^>]*>(.*?)</td>', row)]
                          for row in re.findall(r'<tr[^>]*>(.*?)</tr>', history_html)]
-        self.assertEqual(initial_cells[0], ['job-<one>', 'source', 'interactive',
+        self.assertEqual(initial_cells[0], ['job-<one>', 'source', '3', 'interactive',
             PROFILES['interactive'].model, 'completed', '12.250s', '28/10/2026, 17:52:17', '2'])
-        self.assertEqual([row[5] for row in initial_cells], ['12.250s', '—', '—'])
+        self.assertEqual([row[6] for row in initial_cells], ['12.250s', '—', '—'])
         forecast_html = document.split('<h2>Forecast</h2>')[1].split('<h2>History</h2>')[0]
         self.assertRegex(forecast_html, r'<th data-sort-key="profile"[^>]*>.*?Profile')
         self.assertIn('<td>interactive</td>', forecast_html)
@@ -116,7 +116,7 @@ vm.runInThisContext('{'+SCRIPT+'\n}');
   assert.deepEqual(body.children.map(tr=>tr.children.map(td=>td.textContent)), EXPECTED);
   for(const tr of body.children){
     assert.equal(tr.dataset.historyId, 'job-<one>');
-    assert.deepEqual(tr.children.map((td,i)=>td.className==='compact'?i:null).filter(i=>i!==null),[0,6,7]);
+    assert.deepEqual(tr.children.map((td,i)=>td.className==='compact'?i:null).filter(i=>i!==null),[0,7,8]);
   }
   assert.equal(sentinel.dataset.cursor,'');
   console.log('history render contract PASS');
@@ -265,7 +265,7 @@ vm.runInThisContext('{'+SCRIPT+'\n}');
                 [
                     (
                         f"history-{index}", "interactive", "generate", "archive",
-                        payload, "completed", float(index), 99_999.0, float(index),
+                        payload, "completed", float(index), float(index), float(index),
                     )
                     for index in range(2_000)
                 ],
@@ -292,15 +292,23 @@ vm.runInThisContext('{'+SCRIPT+'\n}');
         broker.db.set_progress_handler(stop_full_table_scan, 1)
         broker.db.set_trace_callback(queries.append)
         try:
-            data = snapshot(broker.db, now=100_000, policy_snapshot={"sources": {
-                "history": {"enabled": True, "weight": 1.0},
-            }})
+            data = snapshot(
+                broker.db, now=100_000,
+                policy_snapshot={"sources": {"history": {"enabled": True, "weight": 1.0}}},
+                # Keep this probe focused on the covering completion windows:
+                # exclude the 2_000 archive rows so the state counts describe the
+                # same single source the policy knows about.
+                include_producer_storage=False,
+            )
         finally:
             broker.db.set_progress_handler(None, 0)
             broker.db.set_trace_callback(None)
 
-        self.assertEqual(data["overall"]["states"]["completed"], 1)
-        self.assertEqual(data["overall"]["completed_last_hour"], 1)
+        history_source = next(
+            item for item in data["sources"] if item["source"] == "history"
+        )
+        self.assertEqual(history_source["states"]["completed"], 1)
+        self.assertEqual(history_source["completed_last_hour"], 1)
         self.assertLess(progress_calls[0], 70_000)
         self.assertTrue(any("FROM audit_events" in query for query in queries))
         self.assertFalse(any("finished>=" in query for query in queries))
@@ -460,6 +468,7 @@ vm.runInThisContext('{'+SCRIPT+'\n}');
             "active_jobs": [{
                 "id": "active-job", "source": "interactive", "state": "running",
                 "started": timestamp, "lease_until": None, "attempt_count": 1, "retry_count": 0,
+                "weight": 2,
             }],
             "overall": {
                 "states": {"completed": 0},

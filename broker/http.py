@@ -540,6 +540,10 @@ def serve(broker, host="127.0.0.1", port=8088, policy=None, storage_token=None):
                     body = broker.terminal_history(
                         limit=limit, cursor=cursor,
                         include_producer_storage=self._storage_authenticated(),
+                        source_weights={
+                            name: entry.get("weight")
+                            for name, entry in ((policy.snapshot().get("sources") if policy is not None else {}) or {}).items()
+                        },
                     )
                     if body.get("next_cursor"):
                         body["next_cursor"] = f"{body['next_cursor'][0]}:{body['next_cursor'][1]}"

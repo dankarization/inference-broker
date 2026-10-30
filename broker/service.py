@@ -1420,6 +1420,10 @@ class Broker:
     ) -> dict:
         """Payload-free live queue data for the local operational dashboard."""
         policy_snapshot = policy.snapshot() if policy is not None else None
+        source_weights = {
+            name: entry.get("weight")
+            for name, entry in ((policy_snapshot or {}).get("sources") or {}).items()
+        }
         now = self.clock()
         snapshot, error = self._observer_read(
             lambda db: {
@@ -1434,6 +1438,7 @@ class Broker:
                 "history": self._terminal_history(
                     db, limit=10,
                     include_producer_storage=include_producer_storage,
+                    source_weights=source_weights,
                 ),
             }
         )
@@ -1474,6 +1479,7 @@ class Broker:
     def _terminal_history(
         self, db, *, limit: int, cursor: tuple[float, str] | None = None,
         include_producer_storage: bool = True,
+        source_weights: dict[str, Any] | None = None,
     ):
         values: list[Any] = []
         clause = ""
@@ -1495,15 +1501,23 @@ class Broker:
             " ORDER BY finished DESC,id DESC LIMIT ?",
             (*values, max(1, min(limit, 30))),
         )
-        return [history_display(dict(row)) for row in rows]
+        weights = source_weights or {}
+        history = []
+        for row in rows:
+            item = history_display(dict(row))
+            item["weight"] = weights.get(item["source"])
+            history.append(item)
+        return history
 
     def terminal_history(
         self, *, limit: int = 30, cursor: tuple[float, str] | None = None,
         include_producer_storage: bool = True,
+        source_weights: dict[str, Any] | None = None,
     ):
         data, error = self._observer_read(lambda db: self._terminal_history(
             db, limit=limit, cursor=cursor,
             include_producer_storage=include_producer_storage,
+            source_weights=source_weights,
         ))
         if data is None:
             return {"unavailable": True, "reason": (error or {}).get("reason")}
@@ -1876,11 +1890,19 @@ class Broker:
         self._publish_scheduler_snapshot()
         return selected
 
-    def dispatch_once(self, allowed_sources: frozenset[str] | None = None, policy: SourcePolicy | None = None) -> bool:
+    def dispatch_once(self, allowed_sources: frozenset[str] | None = None, policy: SourcePolicy | None = None, drain_check: bool = False) -> bool:
+        """Claim the next eligible job, or report that none can start.
+
+        ``drain_check=True`` turns this into a readiness probe for the one-shot
+        drain: it claims nothing and returns True while an attempt is still in
+        flight, so the caller knows to keep the drain flag until it clears.
+        """
         with self.lock, self.db:
             occupants = [r["profile"] for r in self.db.execute(
                 "SELECT profile FROM jobs WHERE state IN ('running','cancel_requested')"
             )]
+            if drain_check:
+                return bool(occupants)
             if occupants:
                 return False
             row = self._next(allowed_sources, policy)
@@ -2155,8 +2177,15 @@ class Dispatcher(threading.Thread):
         self.drain_event = threading.Event()
 
     def drain(self) -> None:
-        """Stop new claims while the in-flight remote execution finishes."""
+        """Stop new claims while the in-flight remote execution finishes.
+
+        A drain is deliberately one-shot: the next dispatch loop that finds the
+        in-flight attempt finished resumes claims automatically.  SIGUSR1 (and
+        therefore ``systemctl reload``) must never leave the dispatcher stopped
+        until a process restart.
+        """
         self.drain_event.set()
+
     def run(self):
         while not self.stop_event.is_set():
             # With a runtime policy, the effective allowlist and weights come
@@ -2170,6 +2199,17 @@ class Dispatcher(threading.Thread):
             self.broker.recover()
             self.broker.storage.maybe_checkpoint()
             self.broker.storage.maybe_maintain()
-            if not self.drain_event.is_set():
+            if self.drain_event.is_set():
+                # One-shot drain: the first loop that finds no in-flight attempt
+                # resumes claims instead of waiting for a process restart.  A
+                # running job keeps the drain flag until it finishes, so the
+                # active attempt is never interleaved with a new claim.
+                if not self.broker.dispatch_once(allowed, policy, drain_check=True):
+                    self.drain_event.clear()
+                    self.broker._audit(
+                        "dispatcher.resumed",
+                        reason="drain finished; no in-flight attempt",
+                    )
+            else:
                 self.broker.dispatch_once(allowed, policy)
             self.stop_event.wait(self.interval)

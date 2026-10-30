@@ -211,6 +211,12 @@ systemctl --user reload ollama-inference-broker.service
 эта команда сигнализирует весь service cgroup, включая дочерний `curl` активного
 inference, и может прервать job.
 
+Drain одноразовый и самовосстанавливающийся: первый цикл, не обнаруживший
+in-flight попытки, сам возобновляет dispatch и пишет событие
+`dispatcher.resumed`. Перезапускать сервис для возврата к работе не нужно —
+это устраняет прежний сбой, после которого `SIGUSR1` останавливал диспетчер
+до рестарта процесса.
+
 Hard eligibility по-прежнему включает enabled, per-source concurrency и
 min-interval backpressure; меньший weight не обходит эти ограничения.
 Итоговый allowlist берётся из `enabled`-записей файла, а не из env.
