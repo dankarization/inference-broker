@@ -94,7 +94,9 @@ Rollback: `systemctl --user disable --now ollama-inference-broker.service`.
   `/v1/correlations` дают payload-free историю очереди, попыток, correlation и
   scheduler fairness. Определения метрик и пример 8:3 — в
   [docs/ANALYTICS.md](docs/ANALYTICS.md).
-- `GET /dashboard` — локальная HTML-панель очереди с refresh раз в 30 секунд,
+- `GET /dashboard` — локальная HTML-панель очереди: данные обновляются в фоне
+  каждые 30 секунд (fetch `/v1/dashboard`, патч DOM без перезагрузки страницы;
+  таймер на паузе при скрытой вкладке, сортировка и скролл сохраняются),
   ETag/304 для неизменившегося состояния и без payload,
   результатов и ошибок. HTML/CSS/JS загружаются с диска и обновляются без рестарта
   процесса: [архитектура и обновление UI](docs/DASHBOARD.md). Таблицы рисуются
@@ -105,7 +107,9 @@ Rollback: `systemctl --user disable --now ollama-inference-broker.service`.
   с Source, Profile и Model. History показывает Profile, Model и Model turn:
   время от started до finished завершённого задания, включая подготовку модели,
   но без ожидания в очереди. Для cancelled, failed и незапущенных заданий
-  длительность не заявляется (—). Finished на всех страницах History имеет
+  длительность не заявляется (—). Длительности выводятся единообразно:
+  `mm:ss`, от часа — `h:mm:ss` (например `00:42`, `02:30`, `1:05:00`),
+  одинаково в Python и в браузере. Finished на всех страницах History имеет
   единый формат `DD/MM/YYYY, HH:MM:SS` в Asia/Tbilisi. Forecast помечен как
   contingent: он меняется при новых admissions, завершениях и hot reload
   policy, и никогда не мутирует очередь/leases/аккумуляторы. Машинный

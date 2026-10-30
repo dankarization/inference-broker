@@ -3,7 +3,6 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<meta http-equiv=refresh content=30>
 <title>Ollama broker queue unavailable</title>
 <link rel="stylesheet" href="/dashboard/assets/dashboard.css?v=__VERSION_dashboard.css__">
 <script src="/dashboard/assets/table_sort.js?v=__VERSION_table_sort.js__" defer></script>
@@ -13,7 +12,7 @@
 <h1>Ollama inference broker queue</h1>
 
 <p id="dashboard-error" class="error" role="status">Dashboard data unavailable.</p>
-<p>Observed at: <code id="snapshot-timestamp">—</code> · refreshes every 30 seconds.</p>
+<p>Observed at: <code id="snapshot-timestamp">—</code> · retries every 30 seconds in the background; paused while this tab is in the background.</p>
 <noscript>JavaScript is required to load observer details from /v1/dashboard.</noscript>
 </body>
 </html>

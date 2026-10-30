@@ -16,6 +16,15 @@ th, td {
 th:first-child, td:first-child { text-align: left; }
 th { background: #edf3f7; }
 .compact { width: 1%; white-space: nowrap; }
+/* Numeric/state cells stay as narrow as their content so an overflowing table
+   scrolls in its own box instead of stretching the page. */
+th, td { width: 1%; }
+th:first-child, td:first-child { width: auto; }
+.table-scroll {
+  overflow-x: auto;
+  overscroll-behavior-x: contain;
+  -webkit-overflow-scrolling: touch;
+}
 code { font-size: .9em; }
 .summary { font-size: 1.05rem; }
 .weight-form, .enabled-form, .admission-form {
@@ -55,3 +64,38 @@ button { margin: .15rem; }
   opacity: .85;
 }
 [hidden] { display: none !important; }
+
+/* Narrow screens: tighten cell padding and type, let text wrap instead of
+   forcing a wide table, and hide the least actionable columns. Column headers
+   keep their sort buttons, so the sorting contract stays visible. Wide-screen
+   layout is untouched. */
+@media (max-width: 900px) {
+  body { margin: 1rem; font-size: 13px; }
+  th, td { padding: .3rem .25rem; }
+  .sort-btn { font-size: 12px; }
+  .weight-form, .enabled-form, .admission-form { gap: .2rem; }
+  .weight-feedback, .enabled-feedback, .admission-feedback, .bulk-feedback { min-width: 0; }
+  /* Forecast: drop the prose reason, keep the wait estimate. */
+  #forecast-table th[data-sort-key="reason"],
+  #forecast-table td:nth-child(7) { display: none; }
+}
+
+@media (max-width: 640px) {
+  body { margin: .6rem; font-size: 12px; }
+  th, td { padding: .25rem .2rem; }
+  .compact { white-space: normal; }
+  .sort-btn { font-size: 11px; }
+  .summary { font-size: .95rem; }
+  /* Least-actionable columns: keep the counters that operators page on. */
+  #sources-table th[data-sort-key="lease"], #sources-table td:nth-child(7),
+  #sources-table th[data-sort-key="retry"], #sources-table td:nth-child(8),
+  #sources-table th[data-sort-key="delayed"], #sources-table td:nth-child(9),
+  #history-table th[data-sort-key="attempts"], #history-table td:nth-child(9) { display: none; }
+}
+
+@media (max-width: 480px) {
+  #sources-table th[data-sort-key="failed"], #sources-table td:nth-child(10),
+  #sources-table th[data-sort-key="cancelled"], #sources-table td:nth-child(11),
+  #active-table th[data-sort-key="lease_until"], #active-table td:nth-child(6) { display: none; }
+  .table-scroll { margin: 0 -.6rem; }
+}

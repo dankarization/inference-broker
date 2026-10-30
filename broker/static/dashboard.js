@@ -27,13 +27,12 @@ function timestamp(element, value) {
 
 function duration(value) {
   if (value == null) return '—';
-  if (value < 60) return Number(value).toFixed(3) + 's';
-  // Match Python format_duration's round-to-even at exact half seconds.
-  const floor = Math.floor(value);
-  const total = value - floor === 0.5 ? floor + floor % 2 : Math.round(value);
+  // Same contract as broker/dashboard.py:format_duration — one format for
+  // every duration, mm:ss below one hour and h:mm:ss above it.
+  const total = Math.max(0, Math.trunc(Number(value)));
   const seconds = String(total % 60).padStart(2, '0');
   const minutes = Math.floor(total / 60);
-  return minutes < 60 ? `${minutes}:${seconds}` :
+  return minutes < 60 ? `${String(minutes).padStart(2, '0')}:${seconds}` :
     `${Math.floor(minutes / 60)}:${String(minutes % 60).padStart(2, '0')}:${seconds}`;
 }
 
@@ -99,15 +98,16 @@ function renderDashboard(data) {
   const error = byId('dashboard-error'), live = byId('dashboard-live');
   timestamp(byId('snapshot-timestamp'), data.timestamp ?? observation.observed_at);
   if (observation.state === 'unavailable') {
-    if (live) live.hidden = true;
+    setLive(false);
     document.title = 'Ollama broker queue unavailable';
-    error.hidden = false;
     error.textContent = 'Dashboard data unavailable: ' + (observation.reason || 'observer read failed') + '.';
     return false;
   }
   // An unavailable HTML shell can recover if the observer recovered between
   // the HTML and JSON requests. Reload once to obtain the full live shell.
-  if (!live) { window.location.reload(); return false; }
+  // Stop the background timer first: the loaded document is about to be
+  // replaced, and a paused timer cannot queue another reload before it is.
+  if (!live) { pauseRefreshTimer(); window.location.reload(); return false; }
   byId('maintenance').hidden = !data.maintenance;
   byId('stale').hidden = observation.state !== 'stale';
   byId('stale').textContent = 'Showing stale data: ' + (observation.reason || 'database observer read unavailable') + '.';
@@ -147,10 +147,44 @@ function renderDashboard(data) {
   fillBody('history-body', history.map(historyRow), 9);
   const last = history[history.length - 1];
   byId('history-sentinel').dataset.cursor = last ? `${last.finished}:${last.id}` : '';
-  document.querySelectorAll('table').forEach(table => TableSort.bind(table));
+  bindTables();
   bindControls();
-  live.hidden = false; error.hidden = true;
+  setLive(true);
   return true;
+}
+
+function setLive(available) {
+  const live = byId('dashboard-live');
+  if (live) live.hidden = !available;
+  byId('dashboard-error').hidden = available;
+  if (available) document.title = 'Ollama broker queue';
+}
+
+// Every refresh replaces the rows, so each table must re-apply the sort the
+// operator chose. The shared sorter keeps that key/direction per table, so an
+// existing handle is reused (no duplicate click handlers) and a new table is
+// bound once.
+function bindTables() {
+  document.querySelectorAll('table').forEach(table => {
+    const sort = table._tableSort || TableSort.bind(table);
+    sort.refreshRows();
+  });
+}
+
+function scrollBoxes() { return [...document.querySelectorAll('.table-scroll')]; }
+
+function captureView() {
+  return {
+    x: window.scrollX || 0,
+    y: window.scrollY || 0,
+    boxes: scrollBoxes().map(box => box.scrollLeft || 0)
+  };
+}
+
+function restoreView(view) {
+  if (!view) return;
+  scrollBoxes().forEach((box, index) => { box.scrollLeft = view.boxes[index] || 0; });
+  if (window.scrollTo) window.scrollTo(view.x, view.y);
 }
 
 function bindPolicySelect(form, field, requestField = field, resultField = field) {
@@ -233,16 +267,58 @@ function observeHistory() {
 }
 
 async function loadDashboard() {
+  if (inFlight) return;
+  inFlight = true;
   try {
     const response = await fetch('/v1/dashboard', {cache: 'no-cache'});
     const data = await response.json();
     if (!response.ok && data.observation?.state !== 'unavailable') throw new Error('dashboard read failed');
-    if (renderDashboard(data)) observeHistory();
+    const view = captureView();
+    if (renderDashboard(data)) {
+      restoreView(view);
+      if (!renderedOnce) { renderedOnce = true; observeHistory(); }
+    }
   } catch (error) {
-    const live = byId('dashboard-live'); if (live) live.hidden = true;
-    byId('dashboard-error').hidden = false;
+    setLive(false);
     byId('dashboard-error').textContent = 'Dashboard data unavailable: ' + (error.message || 'request failed') + '.';
+  } finally {
+    inFlight = false;
   }
 }
 
+const REFRESH_INTERVAL_MS = 30000;
+let inFlight = false;
+let renderedOnce = false;
+let refreshTimer = null;
+
+// Background refresh: fetch /v1/dashboard on a timer and patch the DOM only.
+// The page is never reloaded while data is renderable; window.location.reload()
+// stays reserved for the one unrecoverable case (an unavailable shell that the
+// observer has recovered from between the HTML and JSON responses).
+function renderTick() { return loadDashboard(); }
+
+function startRefreshTimer() {
+  if (refreshTimer != null) clearInterval(refreshTimer);
+  refreshTimer = setInterval(renderTick, REFRESH_INTERVAL_MS);
+}
+
+function pauseRefreshTimer() {
+  if (refreshTimer == null) return;
+  clearInterval(refreshTimer);
+  refreshTimer = null;
+}
+
+function syncRefreshTimer() {
+  if (document.hidden) pauseRefreshTimer(); else startRefreshTimer();
+}
+
+// A hidden tab must not poll the broker; return to the foreground refreshes
+// once immediately (the interval only starts counting from now).
+document.addEventListener('visibilitychange', () => {
+  syncRefreshTimer();
+  if (!document.hidden) renderTick();
+});
+
 const dashboardReady = loadDashboard();
+// Keep the DOM patched in the background; a hidden tab does not poll.
+syncRefreshTimer();

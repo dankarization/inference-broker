@@ -11,7 +11,7 @@ from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 from unittest.mock import patch
 
-from broker.dashboard import history_display, snapshot
+from broker.dashboard import format_duration, history_display, snapshot
 from broker.dashboard_assets import DashboardAssets
 from broker.profiles import PROFILES
 from broker.http import serve
@@ -143,11 +143,88 @@ class DashboardTests(unittest.TestCase):
         self.assertIn('/dashboard/assets/dashboard.js?v=', html)
         self.assertIn('/dashboard/assets/dashboard.css?v=', html)
         self.assertNotIn('__VERSION_', html)
+        # A meta refresh reloads the whole page: it would drop the chosen sort,
+        # the scroll position and the form state on every tick. Data is patched
+        # in the background instead.
         for page in (html, unavailable.content.decode()):
-            self.assertIn('<meta http-equiv=refresh content=30>', page)
-            self.assertIn('refreshes every 30 seconds', page)
+            self.assertNotIn('http-equiv="refresh"', page)
+            self.assertNotIn('http-equiv=refresh', page)
+            self.assertNotIn('http-equiv', page.lower())
+            self.assertIn('every 30 seconds in the background', page)
+        self.assertIn('refreshes every 30 seconds', html)
+        # Wide tables scroll in their own box instead of stretching the page.
+        self.assertEqual(html.count('<div class="table-scroll">'), 4)
+        for name in ('sources-table', 'active-table', 'forecast-table', 'history-table'):
+            self.assertIn(f'<div class="table-scroll"><table id="{name}">', html)
+        self.assertIn('mm:ss', html)
         self.assertIn('Dashboard data unavailable', unavailable.content.decode())
         self.assertNotIn('Completed:', unavailable.content.decode())
+
+    def test_no_meta_refresh_in_shipped_dashboard_html(self):
+        """The auto-reload contract: no meta refresh in either shipped shell."""
+        dashboard = Path(__file__).resolve().parents[1] / 'broker/static/dashboard.html'
+        raw = dashboard.read_text(encoding='utf-8')
+        self.assertNotIn('http-equiv="refresh"', raw)
+        self.assertNotIn('http-equiv=refresh', raw)
+        self.assertNotIn('http-equiv', raw.lower())
+        live, unavailable, _ = DashboardAssets().pages()
+        for page in (live.content.decode(), unavailable.content.decode()):
+            self.assertNotIn('http-equiv', page.lower())
+
+    def test_dashboard_css_keeps_tables_compact_and_responsive(self):
+        """Narrow screens must not be stretched by numeric columns."""
+        css = (Path(__file__).resolve().parents[1] / 'broker/static/dashboard.css').read_text(encoding='utf-8')
+        self.assertIn('.table-scroll', css)
+        self.assertIn('overflow-x: auto', css)
+        # Numeric cells shrink to their content instead of forcing a wide table.
+        self.assertIn('width: 1%', css)
+        # Narrow-screen rules exist and never touch the wide default layout.
+        self.assertIn('@media (max-width: 900px)', css)
+        self.assertIn('@media (max-width: 640px)', css)
+        self.assertIn('@media (max-width: 480px)', css)
+        self.assertLess(css.index('.table-scroll'), css.index('@media'))
+        # Column hiding is scoped to the narrow queries only (the [hidden]
+        # attribute utility is the one pre-existing display rule).
+        default_rules = css[:css.index('@media')].replace('[hidden] { display: none !important; }', '')
+        self.assertNotIn('display: none', default_rules)
+        for query in css[css.index('@media'):].split('@media')[1:]:
+            self.assertIn('display: none', query)
+        # The 30-second background refresh lives in the script, not the document.
+        script = (Path(__file__).resolve().parents[1] / 'broker/static/dashboard.js').read_text(encoding='utf-8')
+        self.assertIn('REFRESH_INTERVAL_MS = 30000', script)
+        self.assertIn("'visibilitychange'", script)
+        self.assertIn('setInterval', script)
+        self.assertIn('clearInterval', script)
+        # A reload survives only as the unavailable-shell recovery branch.
+        # Comments are stripped so the count reflects executable code only.
+        code = '\n'.join(line for line in script.splitlines() if not line.strip().startswith('//'))
+        self.assertEqual(code.count('location.reload'), 1)
+        self.assertIn('pauseRefreshTimer(); window.location.reload();', code)
+        self.assertIn('captureView', script)
+        self.assertIn('restoreView', script)
+        self.assertIn('refreshRows', script)
+
+    def test_duration_format_is_mm_ss_and_matches_the_javascript_helper(self):
+        """One duration format for both halves of the dashboard contract.
+
+        The same fixture file drives ``duration()`` in tests/dashboard_dom.cjs,
+        so the Python and JavaScript helpers cannot drift apart.
+        """
+        cases = json.loads((Path(__file__).resolve().parent / 'duration_format_cases.json')
+                           .read_text(encoding='utf-8'))['cases']
+        self.assertGreaterEqual(len(cases), 10)
+        for seconds, expected in cases:
+            with self.subTest(seconds=seconds):
+                self.assertEqual(format_duration(seconds), expected)
+        # The former "42.000s" shape is gone: every duration is a clock value.
+        self.assertEqual(format_duration(42), '00:42')
+        self.assertEqual(format_duration(150.2), '02:30')
+        self.assertEqual(format_duration(3725.9), '1:02:05')
+        self.assertNotIn('s', format_duration(0.4))
+        row = history_display({'state': 'completed', 'started': 100.0, 'finished': 142.0})
+        self.assertEqual(row['model_turn_seconds'], 42.0)
+        self.assertEqual(row['model_turn_display'], '00:42')
+        self.assertEqual(history_display({'finished': 0})['finished_display'], '01/01/1970, 04:00:00')
 
     def test_payload_history_uses_the_bounded_observer_index_path(self):
         db = tempfile.NamedTemporaryFile()

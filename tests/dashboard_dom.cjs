@@ -5,11 +5,16 @@ const path = require('node:path');
 const vm = require('node:vm');
 const root = path.resolve(__dirname, '..');
 
+// A browser-like scroll reset is injected only by the scroll-preservation check,
+// so the DOM shim stays passive everywhere else.
+let disturbScroll = null;
+
 class Element {
   constructor(tag) {
     this.tagName = tag.toUpperCase(); this.children = []; this.dataset = {};
     this.attrs = {}; this.events = {}; this.className = ''; this.hidden = false;
     this._text = ''; this.value = ''; this.disabled = false;
+    this.scrollLeft = 0;
   }
   set textContent(value) { this._text = String(value); this.children = []; }
   get textContent() { return this._text + this.children.map(c => c.textContent).join(''); }
@@ -25,6 +30,7 @@ class Element {
   replaceChildren(...nodes) {
     this.children.forEach(node => { node.parentElement = null; });
     this.children = []; this._text = ''; this.append(...nodes);
+    if (disturbScroll) disturbScroll(this);
   }
   setAttribute(key, value) {
     value = String(value); this.attrs[key] = value;
@@ -68,6 +74,7 @@ class Element {
 
 function parseHTML(html) {
   const document = new Element('document'), stack = [document];
+  document.hidden = false; document.scrollX = 0; document.scrollY = 0;
   for (const token of html.match(/<[^>]+>|[^<]+/g)) {
     if (token.startsWith('<!')) continue;
     if (token.startsWith('</')) { stack.pop(); continue; }
@@ -87,7 +94,7 @@ function parseHTML(html) {
 const stamp = Date.now() / 1000;
 const history = (id, turn = 12.25) => ({
   id, source: 'source', weight: 3, profile: 'interactive', model: 'test-model', state: turn == null ? 'cancelled' : 'completed',
-  model_turn_display: turn == null ? '—' : '12.250s', model_turn_seconds: turn,
+  model_turn_display: turn == null ? '—' : '00:12', model_turn_seconds: turn,
   finished: stamp, finished_display: '28/10/2026, 17:52:17', attempt_count: 2
 });
 const source = (name, weight) => ({
@@ -112,7 +119,7 @@ const fixture = {
 async function boot(data, unavailableShell = false, fail = false) {
   const document = parseHTML(fs.readFileSync(path.join(root, 'broker/static',
     unavailableShell ? 'dashboard-unavailable.html' : 'dashboard.html'), 'utf8'));
-  const requests = [], observerCallbacks = [];
+  const requests = [], observerCallbacks = [], timers = [];
   const context = vm.createContext({
     document, Intl, Date, console, Set, Map,
     location: {reload() { context.reloaded = true; }},
@@ -121,6 +128,11 @@ async function boot(data, unavailableShell = false, fail = false) {
       constructor(callback) { observerCallbacks.push(callback); }
       observe() {}
     },
+    setInterval: (callback, ms) => {
+      const timer = {id: timers.length + 1, callback, ms, active: true};
+      timers.push(timer); return timer.id;
+    },
+    clearInterval: id => { const timer = timers.find(item => item.id === id); if (timer) timer.active = false; },
     fetch: async (url, options) => {
       requests.push({url, options});
       if (fail) throw new Error('offline');
@@ -128,11 +140,18 @@ async function boot(data, unavailableShell = false, fail = false) {
     }
   });
   context.window = context;
+  context.scrollTo = (x, y) => { context.scrollX = x; context.scrollY = y; };
   vm.runInContext(fs.readFileSync(path.join(root, 'broker/table_sort.js'), 'utf8'), context);
   vm.runInContext(fs.readFileSync(path.join(root, 'broker/static/dashboard.js'), 'utf8'), context);
   await vm.runInContext('dashboardReady', context);
-  return {context, document, requests, observerCallbacks, id: id => document.getElementById(id)};
+  return {context, document, requests, observerCallbacks, timers,
+    active: () => timers.filter(timer => timer.active),
+    flush: async (turns = 8) => { for (let i = 0; i < turns; i++) await new Promise(resolve => setImmediate(resolve)); },
+    id: id => document.getElementById(id)};
 }
+
+const durationCases = JSON.parse(
+  fs.readFileSync(path.join(root, 'tests/duration_format_cases.json'), 'utf8')).cases;
 
 (async () => {
   const page = await boot(fixture);
@@ -155,13 +174,28 @@ async function boot(data, unavailableShell = false, fail = false) {
   assert.equal(id('active-body').rows[0].cells[4].title, '2026-08-29T08:30:00Z (epoch 1787992200)');
   assert.equal(id('active-body').rows[0].cells[5].textContent, '—');
   assert.equal(id('forecast-body').rows[0].cells[2].textContent, 'interactive');
-  assert.equal(id('forecast-body').rows[0].cells[7].textContent, '2:30');
+  assert.equal(id('forecast-body').rows[0].cells[7].textContent, '02:30');
   assert.equal(id('forecast-body').rows[0].cells[7].getAttribute('data-sort-value'), '150.2');
   const initial = id('history-body').rows[0].cells.map(td => td.textContent);
   assert.deepEqual(initial, ['job-<one>', 'source', '3', 'interactive', 'test-model',
-    'completed', '12.250s', '28/10/2026, 17:52:17', '2']);
+    'completed', '00:12', '28/10/2026, 17:52:17', '2']);
   assert.deepEqual(id('history-body').rows[0].cells.map((td, i) => td.className === 'compact' ? i : null)
     .filter(i => i != null), [0, 7, 8]);
+
+  // (i) One duration format, shared with the Python helper through a fixture.
+  for (const [value, expected] of durationCases)
+    assert.equal(context.duration(value), expected, `duration(${value})`);
+  assert.equal(context.duration(150.2), '02:30');
+
+  // (ii) No meta refresh anywhere; the background timer replaces it.
+  for (const name of ['dashboard.html', 'dashboard-unavailable.html']) {
+    const html = fs.readFileSync(path.join(root, 'broker/static', name), 'utf8');
+    assert.doesNotMatch(html, /http-equiv/i, name);
+    assert.doesNotMatch(html, /content=30/i, name);
+  }
+  assert.equal(page.active().length, 1);
+  assert.equal(page.active()[0].ms, 30000);
+  assert.equal(context.reloaded, undefined);
 
   // Real sorting click cycle, including reset to the original numeric-weight order.
   const weightHead = id('sources-table').querySelectorAll('thead th[data-sort-key]')[3];
@@ -173,6 +207,45 @@ async function boot(data, unavailableShell = false, fail = false) {
   assert.equal(weightHead.getAttribute('aria-sort'), 'ascending');
   await weightHead.querySelector('button').fire('click');
   assert.equal(id('sources-body').rows[0].cells[0].textContent, 'weight-1-a');
+
+  // (iii) A background tick patches the DOM in place: no reload, and the chosen
+  // sort plus the scroll positions survive the row replacement.
+  await weightHead.querySelector('button').fire('click');
+  assert.equal(weightHead.getAttribute('aria-sort'), 'descending');
+  const box = document.querySelector('#sources-table').parentElement;
+  assert.equal(box.className, 'table-scroll');
+  assert.deepEqual(document.querySelectorAll('.table-scroll').map(node => node.tagName),
+    ['DIV', 'DIV', 'DIV', 'DIV']);
+  box.scrollLeft = 640; context.scrollY = 2100; context.scrollX = 12;
+  const before = page.requests.length;
+  disturbScroll = () => { box.scrollLeft = 0; context.scrollY = 0; context.scrollX = 0; };
+  await page.active()[0].callback();
+  disturbScroll = null;
+  assert.equal(page.requests.length, before + 1);
+  assert.equal(page.requests[page.requests.length - 1].url, '/v1/dashboard');
+  assert.equal(context.reloaded, undefined);
+  assert.deepEqual(id('sources-body').rows.map(tr => tr.cells[0].textContent),
+    ['weight-10', 'weight-2', 'weight-1-a', 'weight-1-b', 'unknown']);
+  assert.equal(weightHead.getAttribute('aria-sort'), 'descending');
+  assert.equal(box.scrollLeft, 640);
+  assert.equal(context.scrollY, 2100);
+  assert.equal(context.scrollX, 12);
+  // The sort handle is reused, so a click still cycles after the refresh.
+  await weightHead.querySelector('button').fire('click');
+  assert.equal(weightHead.getAttribute('aria-sort'), 'ascending');
+
+  // (ii) A hidden tab stops polling; returning to the foreground resumes and
+  // refreshes once, without reloading the page.
+  document.hidden = true; await document.fire('visibilitychange');
+  assert.equal(page.active().length, 0);
+  await page.flush(); assert.equal(page.requests.length, before + 1);
+  const hidden = page.requests.length;
+  document.hidden = false; await document.fire('visibilitychange');
+  assert.equal(page.active().length, 1);
+  await page.flush();
+  assert.equal(page.requests.length, hidden + 1);
+  assert.equal(page.requests[page.requests.length - 1].url, '/v1/dashboard');
+  assert.equal(context.reloaded, undefined);
 
   // Appended history shares the initial renderer, de-duplicates and recovers after failure.
   context.fetch = async () => { throw new Error('history offline'); };
@@ -233,6 +306,7 @@ async function boot(data, unavailableShell = false, fail = false) {
     const broken = await boot({observation: {state: 'unavailable', reason: '<locked>', observed_at: stamp}}, unavailableShell);
     assert.match(broken.id('dashboard-error').textContent, /Dashboard data unavailable: <locked>/);
     assert.equal(broken.observerCallbacks.length, 0);
+    assert.equal(broken.active().length, 1);
     if (!unavailableShell) assert.equal(broken.id('dashboard-live').hidden, true);
   }
   const offline = await boot(fixture, false, true);
@@ -240,5 +314,6 @@ async function boot(data, unavailableShell = false, fail = false) {
   assert.match(offline.id('dashboard-error').textContent, /offline/);
   const recovered = await boot(fixture, true);
   assert.equal(recovered.context.reloaded, true);
+  assert.equal(recovered.active().length, 0);
   console.log('dashboard frontend contract PASS');
 })().catch(error => { console.error(error); process.exitCode = 1; });

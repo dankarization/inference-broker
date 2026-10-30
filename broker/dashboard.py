@@ -1,6 +1,7 @@
 """Payload-free operational snapshot and history display values for the broker."""
 from __future__ import annotations
 
+import math
 import sqlite3
 from datetime import datetime, timezone
 from typing import Any
@@ -14,19 +15,19 @@ LOCAL_TIMEZONE = ZoneInfo("Asia/Tbilisi")
 
 
 def format_duration(seconds: float | None) -> str:
-    """Human duration for wait/turn cells: under a minute stays in seconds.
+    """Human duration for wait/turn cells in one format: mm:ss, then h:mm:ss.
 
-    Values of a minute or more use mm:ss, and an hour or more uses hh:mm:ss,
-    so long queue waits stay readable in the operator dashboard.
+    Every duration uses the same clock shape (``00:42``, ``02:30``, ``1:05:00``)
+    so a column of them lines up and nothing is misread as minutes. This is the
+    server half of a contract mirrored by ``duration()`` in
+    ``broker/static/dashboard.js``; both must agree.
     """
     if seconds is None:
         return "—"
-    total = float(seconds)
-    if total < 60:
-        return f"{total:.3f}s"
-    minutes, sec = divmod(int(round(total)), 60)
+    total = max(0, math.trunc(float(seconds)))
+    minutes, sec = divmod(total, 60)
     if minutes < 60:
-        return f"{minutes:d}:{sec:02d}"
+        return f"{minutes:02d}:{sec:02d}"
     hours, minutes = divmod(minutes, 60)
     return f"{hours:d}:{minutes:02d}:{sec:02d}"
 

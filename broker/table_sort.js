@@ -137,7 +137,9 @@
     options = options || {};
     var defaultKey = options.defaultKey || null;
     var defaultDirection = options.defaultDirection || "descending";
-    var state = { key: defaultKey, direction: "default" };
+    var state = options.state
+      ? { key: options.state.key, direction: options.state.direction }
+      : { key: defaultKey, direction: "default" };
     var tbody = table.tBodies[0];
     var heads = table.querySelectorAll("thead th[data-sort-key]");
     var original = tbody ? Array.prototype.slice.call(tbody.rows) : [];
@@ -191,13 +193,23 @@
       });
     });
     applyHeaders();
+    applySort();
 
     table._tableSort = {
       addRow: function (tr) {
         if (original.indexOf(tr) < 0) original.push(tr);
         applySort();
       },
-      resort: function () { applySort(); }
+      resort: function () { applySort(); },
+      // Refresh replaces every row (a background fetch renders a full snapshot),
+      // so the previous rows are dropped from the default order and the current
+      // sort/direction is re-applied to the new ones.
+      refreshRows: function () {
+        original = tbody ? Array.prototype.slice.call(tbody.rows) : [];
+        applyHeaders();
+        applySort();
+      },
+      state: function () { return { key: state.key, direction: state.direction }; }
     };
     return table._tableSort;
   }
