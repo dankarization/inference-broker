@@ -1,61 +1,62 @@
 # Inference broker queue
 
-Это приватный control plane для одного GPU-хоста с Ollama. Брокер предотвращает
-конкуренцию локальных задач за VRAM и предоставляет durable FIFO-очередь с
-weighted scheduling по источникам. Это изолированный MVP: он не меняет текущих callers, трафик,
-маршрутизацию, production-конфигурацию или порядок source roots.
+Брокер принимает задания локального инференса в durable SQLite-очередь и
+последовательно передаёт их настроенным backend: Ollama, Wyoming, GigaAM и
+Whisper GPU. Источники используют общую очередь, source policy и один execution
+slot; профиль задания определяет backend и лимиты. Dashboard показывает
+состояние очереди и управляет dispatch/admission.
 
-## Назначение
-
-Ollama хранит веса моделей, но каждый параллельный запрос использует собственный
-KV cache и буферы генерации либо изображений. При больших контекстах или смене
-модели это может исчерпать VRAM. Брокер является единой точкой admission для
-локального инференса: callers ставят задания в очередь, а не вызывают Ollama
-напрямую.
-
-```text
-Постоянный хост OpenClaw: broker + SQLite WAL      MAIN-PC: executor Ollama
-Задания OpenClaw / M101 ──> очередь, policy, API ──> Ollama ──> один GPU / VRAM
-                              resource: mainpc-gpu       ^
-                                                   WOL при dispatch задания
-```
+## Как проходит задание
 
 ```mermaid
+%%{init: {"flowchart": {"htmlLabels": false}}}%%
 flowchart LR
-    classDef alwaysOn fill:#e3f2fd,stroke:#1976d2,color:#0d47a1
-    classDef wakeable fill:#fff3e0,stroke:#ef6c00,color:#e65100
-    classDef gpu fill:#fce4ec,stroke:#c2185b,color:#880e4f
-
-    subgraph HOST["Постоянный хост OpenClaw"]
-        broker["broker + SQLite WAL"]:::alwaysOn
+    jobs["Источники заданий"] -->|HTTP| broker
+    subgraph HOST["Постоянный хост"]
+        broker["broker · SQLite WAL"]
+        ui["Dashboard"] -->|Pause / Resume| broker
     end
-
-    jobs["Задания OpenClaw / M101"]
-    queue["очередь, policy, API"]:::alwaysOn
-    resource["resource: mainpc-gpu"]:::wakeable
-    wol["WOL при dispatch задания"]:::wakeable
-
-    subgraph MAINPC["MAIN-PC: executor (пробуждаемый)"]
-        ollama["Ollama"]:::wakeable
-        gpu["один GPU / VRAM"]:::gpu
+    subgraph MAINPC["MAIN-PC · GPU"]
+        ollama["Ollama"]
+        voice["GigaAM / Whisper GPU"]
     end
-
-    jobs --> queue
-    broker --> queue
-    queue --> resource
-    resource -->|dispatch| wol
-    wol -.->|WOL| MAINPC
-    resource --> ollama
-    ollama --> gpu
+    broker -->|один slot| ollama
+    broker -->|тот же slot| voice
+    broker -->|тот же slot| wyoming["Wyoming"]
+    broker -.->|WOL| MAINPC
 ```
 
-Cloud-routed нагрузки, CPU-задачи и существующие GPU-workers Whisper остаются
-вне этого пути. Брокер запускается вне MAIN-PC, поэтому его очередь переживает
-WOL cycle; MAIN-PC не хранит состояние очереди.
+Очередь и leases хранятся на постоянном хосте, а не на MAIN-PC. Source policy
+задаёт admission, dispatch и weight; scheduler выбирает eligible source по
+обратной доле weight, затем FIFO внутри source и совместимые model batches.
+Без source policy действует глобальный FIFO. Подключённые voice jobs проходят
+тот же scheduler: [контракт voice backends](docs/VOICE-JOBS.md). Прямые вызовы
+backend в обход broker не входят в его очередь.
 
-## API MVP
+**Pause queue** запрещает новые запуски для всех источников, но сохраняет приём
+заданий. Текущее задание завершается, затем broker выгружает GPU-модели;
+неудачная выгрузка повторяется без возобновления dispatch. Пауза сохраняется
+в SQLite после рестарта. **Resume queue** снова разрешает dispatch.
+Это отдельный контроль от per-source dispatch pause и admission block.
 
-Запускайте только в лабораторной или staging-среде:
+## Dashboard
+
+Панель доступна на `/dashboard`: общие счётчики, Sources с весами и контролями,
+Active jobs, Forecast и History. Данные обновляются в фоне каждые 30 секунд без
+перезагрузки страницы. Подробности: [Dashboard](docs/DASHBOARD.md).
+
+Текущая панель, ширина viewport 1440 px:
+
+![Inference broker queue: Pause queue, Sources, Active jobs, Forecast и History при 1440 px](docs/images/dashboard-1440.png)
+
+Та же панель при 1920 px; таблицы используют доступную ширину с небольшими
+боковыми отступами:
+
+![Inference broker queue: dashboard при 1920 px](docs/images/dashboard-1920.png)
+
+## Запуск и API
+
+Локальный запуск (dispatch настраивается отдельно):
 
 ```bash
 MAINPC_MAC=2c:f0:5d:74:6a:44 python -m broker
@@ -161,7 +162,7 @@ server-side timeout 300 секунд. `shutterstock-video` — отдельны�
 admission не принимает scheduling-параметров: source weight задаётся только
 runtime policy.
 
-При смене модели broker будит MAIN-PC, читает `/api/ps`, выгружает несовместимую
+Для Ollama при смене модели broker будит MAIN-PC, читает `/api/ps`, выгружает несовместимую
 модель, запрашивает и проверяет готовность целевой модели и только затем
 запускает задание. Просроченная running lease возвращается в очередь при
 перезапуске broker.
