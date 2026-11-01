@@ -138,14 +138,13 @@ class OpenClawRouteTests(unittest.TestCase):
             self.assertEqual(caught.exception.code, 400)
         capped = self.sample()
         capped["options"] = {"num_ctx": 999999, "num_predict": 999999}
-        job = self.broker.submit("openclaw", "chat", normalize_request(capped))
-        self.broker.dispatch_once(frozenset({"openclaw"}))
-        self.assertEqual(self.ollama.requests[-1][1]["options"],
-                         {"num_ctx": 131072, "num_predict": 16384})
-        self.assertEqual(self.broker.status(job["id"])["state"], "completed")
-        with self.assertRaisesRegex(ValueError, "requires the OpenClaw profile"):
-            self.broker.submit("cron", "chat", {"messages": [{"role": "user", "content": "x"}]},
-                               source="openclaw")
+        with self.assertRaisesRegex(ValueError, "999999.*131072.*qwen3.8"):
+            self.broker.submit("openclaw", "chat", normalize_request(capped))
+        with self.assertRaises(HTTPError) as caught:
+            self.opener.open(self.request(capped))
+        self.assertEqual(caught.exception.code, 400)
+        job = self.broker.submit("cron", "chat", {"messages": [{"role": "user", "content": "x"}]}, source="openclaw")
+        self.assertEqual(job["source"], "openclaw")
 
     def test_all_configured_models_route_to_server_owned_profiles(self):
         cases = {
@@ -196,9 +195,10 @@ class OpenClawRouteTests(unittest.TestCase):
                 self.assertEqual(request["options"]["num_predict"], output)
                 if vision:
                     self.assertEqual(request["messages"][0]["images"], ["aGVsbG8="])
-                with self.assertRaisesRegex(ValueError, "requires source openclaw"):
-                    self.broker.submit(profile, "chat", normalize_request(body), source="other")
-                with self.assertRaisesRegex(ValueError, "must match its profile"):
+                other = self.broker.submit(profile, "chat", normalize_request(body), source="other")
+                self.assertEqual(other["source"], "other")
+                self.broker.cancel(other["id"])
+                with self.assertRaisesRegex(ValueError, "physical context limit unavailable"):
                     self.broker.submit(profile, "chat", {**normalize_request(body),
                                                           "model": "caller-chosen:bad"},
                                        source="openclaw")
@@ -268,8 +268,6 @@ class OpenClawRouteTests(unittest.TestCase):
                 self.assertEqual(PROFILES[profile_name].max_images, 4)
                 for options, expected in (
                     ({}, {"num_ctx": 8192, "num_predict": 2048}),
-                    ({"num_ctx": 999999, "num_predict": 999999},
-                     {"num_ctx": 8192, "num_predict": 2048}),
                     ({"num_ctx": 2048, "num_predict": 128},
                      {"num_ctx": 2048, "num_predict": 128}),
                 ):
@@ -309,8 +307,6 @@ class OpenClawRouteTests(unittest.TestCase):
         for think, requested, expected in (
             (False, {"num_ctx": 8192, "num_predict": 512},
              {"num_ctx": 8192, "num_predict": 512}),
-            (True, {"num_ctx": 999999, "num_predict": 999999},
-             {"num_ctx": 262144, "num_predict": 8192}),
             (True, {}, {"num_ctx": 262144, "num_predict": 8192}),
             *((False, {"num_ctx": size, "num_predict": 512},
                {"num_ctx": size, "num_predict": 512})

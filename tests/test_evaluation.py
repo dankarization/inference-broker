@@ -130,9 +130,9 @@ class EvaluationTests(unittest.TestCase):
             {"messages": [{"role": "user", "content": "x"}] * 17},
             {"format": []}, {"format": "xml"}, {"format": {"description": "x" * 65536}},
         ]
-        for key, values in {"num_ctx": [16385, 8193, 8191, 0, -1, True, None, 16384.0],
-                            "num_predict": [8193, 2049, 2047, 0, True, None],
-                            "temperature": [1, True, None, float("nan")],
+        for key, values in {"num_ctx": [999999, 0, -1, True, None, 16384.0],
+                            "num_predict": [999999, 0, True, None],
+                            "temperature": [True, None, float("nan")],
                             "num_gpu": [1]}.items():
             changes.extend({"options": {key: value}} for value in values)
         for profile in EVALUATION_PROFILE_NAMES:

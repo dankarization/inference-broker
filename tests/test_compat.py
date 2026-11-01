@@ -24,9 +24,9 @@ class CompatibilityTests(unittest.TestCase):
 
     def test_generate_is_admitted_without_model_escalation_or_external_calls(self):
         broker = self.make()
-        job = submit(broker, "generate", {"profile": "interactive", "model": "nemotron3:33b", "prompt": "test", "keep_alive": "forever", "options": {"num_ctx": 999999, "num_predict": 999999}})
+        job = submit(broker, "generate", {"profile": "interactive", "model": "nemotron3:33b", "prompt": "test", "keep_alive": "forever", "options": {"num_ctx": 4096, "num_predict": 4096}})
         self.assertEqual(job["state"], "queued")
-        self.assertEqual(job["payload"]["options"], {"num_ctx": 999999, "num_predict": 999999})
+        self.assertEqual(job["payload"]["options"], {"num_ctx": 4096, "num_predict": 4096})
         self.assertNotIn("model", job["payload"]); self.assertNotIn("keep_alive", job["payload"])
 
     def test_correlation_metadata_is_not_copied_into_inference_payload(self):

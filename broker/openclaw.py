@@ -31,7 +31,7 @@ def _json_size(value: Any) -> int:
         raise OpenClawRequestError("request must be JSON serializable") from exc
 
 
-def normalize_request(request: Any) -> dict:
+def normalize_request(request: Any, profile_override=None) -> dict:
     if not isinstance(request, dict):
         raise OpenClawRequestError("request must be a JSON object")
     allowed = {"model", "messages", "tools", "stream", "options", "format", "think",
@@ -40,9 +40,9 @@ def normalize_request(request: Any) -> dict:
         raise OpenClawRequestError("unsupported Ollama chat request fields")
     model = request.get("model")
     profile_name = OPENCLAW_PROFILES_BY_MODEL.get(model) if isinstance(model, str) else None
-    if profile_name is None:
+    if profile_name is None and profile_override is None:
         raise OpenClawRequestError("model must be a configured OpenClaw model")
-    profile = PROFILES[profile_name]
+    profile = profile_override or PROFILES[profile_name]
     if not isinstance(request.get("stream", True), bool):
         raise OpenClawRequestError("stream must be boolean")
     messages = request.get("messages")

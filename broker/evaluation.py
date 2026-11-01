@@ -25,8 +25,6 @@ def normalize_request(request: dict, profile_name: str) -> dict:
     }:
         raise ValueError("unsupported evaluation request fields")
     profile = PROFILES[profile_name]
-    if "model" in request and request["model"] != profile.model:
-        raise ValueError("evaluation model must match its profile")
     if request.get("think", False) is not False or request.get("stream", False) is not False:
         raise ValueError("evaluation requires think false and stream false")
     options = request.get("options", {})
@@ -36,13 +34,12 @@ def normalize_request(request: dict, profile_name: str) -> dict:
         raise ValueError("unsupported evaluation options")
     for key, value in options.items():
         if (isinstance(value, bool) or not isinstance(value, (int, float))
-                or value != expected[key]
                 or (key != "temperature" and not isinstance(value, int))):
             raise ValueError(f"evaluation requires {key}={expected[key]}")
     # Reuse bounded native-chat validation without changing OpenClaw's map,
     # source guard, or history contract. The lane's stricter checks stay here.
-    payload = normalize_chat({**request, "model": profile.model, "think": False,
-                              "stream": False, "options": expected})
+    payload = normalize_chat({**request, "model": request.get("model", profile.model), "think": False,
+                              "stream": False, "options": {**expected, **options}}, profile_override=profile)
     messages = payload["messages"]
     if len(messages) > 16 or not any(m["role"] == "user" for m in messages):
         raise ValueError("evaluation requires user input and at most 16 messages")
@@ -56,6 +53,8 @@ def normalize_request(request: dict, profile_name: str) -> dict:
     # Keep this bound independent of the existing OpenClaw profiles.
     if sum(len(m.get("images", [])) for m in messages) > profile.max_images:
         raise ValueError("too many evaluation images")
+    if "model" in request:
+        payload["model"] = request["model"]
     return payload
 
 

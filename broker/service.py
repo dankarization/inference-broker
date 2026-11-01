@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from copy import deepcopy
+from dataclasses import replace
+import math
 import hashlib
 import json
 import logging
@@ -207,7 +209,12 @@ class SourcePolicy:
                         raise SourcePolicyError("policy checksum changed")
                     raw = json.loads(raw_bytes)
                     normalized = normalize_source_policy(raw)
-                    if source is None:
+                    if field == "__register__":
+                        if source in normalized:
+                            return normalized[source]
+                        raw["sources"][source] = value
+                        normalize_source_policy(raw)
+                    elif source is None:
                         raw[field] = value
                     else:
                         if source not in normalized:
@@ -244,6 +251,13 @@ class SourcePolicy:
             self._signature = None
             self._load_locked()
             return value
+
+    def register(self, source, weight=5):
+        if not isinstance(source, str) or not source or len(source) > 160:
+            raise ValueError("source must be a non-empty string of at most 160 characters")
+        if isinstance(weight, bool) or not isinstance(weight, (int, float)) or not math.isfinite(weight) or weight <= 0:
+            raise ValueError("weight must be a finite positive number")
+        return self._mutate_source(source, "__register__", dict(enabled=True, admission_allowed=True, weight=weight))
 
     def set_weight(self, source: str, weight: Any) -> int:
         """Atomically update one configured source with a dashboard-safe weight."""
@@ -633,10 +647,44 @@ class Broker:
                 self._refresh_health_cache_locked()
             self.completed.notify_all()
 
+    @staticmethod
+    def _target_profile(name, payload):
+        return replace(PROFILES[name], model=payload.get("model", PROFILES[name].model))
+
+    def _validate_model_options(self, name, payload):
+        model = payload.get("model", PROFILES[name].model)
+        if not isinstance(model, str) or not model.strip() or len(model) > 256:
+            raise ValueError("model must be a non-empty bounded id")
+        options = payload.get("options", {})
+        if not isinstance(options, dict):
+            raise ValueError("options must be an object")
+        known = [p.max_context for p in PROFILES.values() if p.model == model and p.max_context]
+        limit = max(known) if known else None
+        if limit is None:
+            try:
+                metadata = self.ollama.show(model, timeout_seconds=5).get("model_info", {})
+            except (AttributeError, OSError, RuntimeError, ValueError) as exc:
+                raise ValueError(f"physical context limit unavailable for model {model}") from exc
+            if not isinstance(metadata, dict):
+                raise ValueError(f"physical context limit unavailable for model {model}")
+            limits = [v for k, v in metadata.items() if k.endswith(".context_length") and type(v) is int and v > 0]
+            if not limits:
+                raise ValueError(f"physical context limit unavailable for model {model}")
+            limit = min(limits)
+        defaults = {"num_ctx": PROFILES[name].default_context or PROFILES[name].max_context,
+                    "num_predict": PROFILES[name].max_output}
+        for field in ("num_ctx", "num_predict"):
+            value = options.get(field, defaults[field])
+            if field in options and (type(value) is not int or value <= 0):
+                raise ValueError(f"{field} must be a positive integer")
+            if value is not None and value > limit:
+                raise ValueError(f"requested {field}={value} exceeds physical limit {limit} for model {model}")
+
     def submit(self, profile: str, kind: str, payload: dict, source: str | None = None,
                source_item_id: str | None = None,
                external_id: str | None = None,
-               producer_storage: dict[str, Any] | None = None) -> dict:
+               producer_storage: dict[str, Any] | None = None,
+               model: str | None = None, options: dict | None = None, weight=None) -> dict:
         if profile not in PROFILES:
             raise ValueError("unknown profile")
         if kind not in {"chat", "generate", "transcribe"}:
@@ -648,6 +696,30 @@ class Broker:
                 raise ValueError("ASR requires configured executor, dedicated profile and idempotency key")
             payload = validate_asr_payload(payload)
         source = source or profile
+        if kind == "transcribe" and (model is not None or options is not None):
+            raise ValueError("transcription uses its dedicated executor contract")
+        if not isinstance(payload, dict):
+            raise ValueError("payload must be an object")
+        payload = deepcopy(payload)
+        legacy_payload = deepcopy(payload)
+        requested_model = model if model is not None else payload.get("model")
+        if model is not None:
+            payload["model"] = model
+        if options is not None:
+            if not isinstance(options, dict):
+                raise ValueError("options must be an object")
+            payload["options"] = {**payload.get("options", {}), **options}
+        if kind != "transcribe":
+            self._validate_model_options(profile, payload)
+        # Keep synchronous adapter contracts, while /v1/jobs runtime overrides
+        # are applied after their schema/media validation.
+        if model is not None or options is not None:
+            if profile not in OPENCLAW_PROFILE_NAMES | EVALUATION_PROFILE_NAMES | NIGHTLY_PROFILE_NAMES and profile != "interactive" and profile != "cron":
+                payload = legacy_payload
+                if options is not None:
+                    adapter_options = {k: v for k, v in options.items() if k not in {"num_ctx", "num_predict"}}
+                    if adapter_options:
+                        payload["options"] = {**payload.get("options", {}), **adapter_options}
         if source == "local-voice" or profile in VOICE_PROFILE_NAMES:
             if source != "local-voice" or profile not in VOICE_PROFILE_NAMES or kind != "transcribe":
                 raise ValueError("voice requires local-voice source, voice profile and transcribe kind")
@@ -683,16 +755,12 @@ class Broker:
                     or not isinstance(source_item_id, str) or re.fullmatch(r"[0-9]{1,128}", source_item_id) is None):
                     raise ValueError("Gemma26 requires bounded exact correlation/file identities")
             payload = validate_nextcloud_payload(payload, profile)
-        if source == "openclaw" and profile not in OPENCLAW_PROFILE_NAMES:
-            raise ValueError("source openclaw requires the OpenClaw profile")
-        if profile in OPENCLAW_PROFILE_NAMES and (source != "openclaw" or kind != "chat"):
+        if (source == "openclaw" or profile in OPENCLAW_PROFILE_NAMES) and kind != "chat":
             raise ValueError("OpenClaw profile requires source openclaw and kind chat")
-        if profile in OPENCLAW_PROFILE_NAMES:
+        if source == "openclaw" or profile in OPENCLAW_PROFILE_NAMES:
             if producer_storage is not None or not isinstance(payload, dict):
                 raise ValueError("OpenClaw requires inline chat payload")
-            if "model" in payload and payload["model"] != PROFILES[profile].model:
-                raise ValueError("OpenClaw payload model must match its profile")
-            payload = normalize_openclaw_request({**payload, "model": PROFILES[profile].model})
+            payload = normalize_openclaw_request({**payload, "model": payload.get("model", PROFILES[profile].model)}, profile_override=self._target_profile(profile, payload))
         if profile == "shutterstock-canary":
             if source != profile:
                 raise ValueError("shutterstock-canary must use its dedicated source")
@@ -746,8 +814,14 @@ class Broker:
                 payload = validate_uncensored_eval_payload(payload)
             except CompatibilityError as exc:
                 raise ValueError(str(exc)) from exc
+        if requested_model is not None and requested_model != PROFILES[profile].model:
+            payload["model"] = requested_model
+        if options is not None:
+            payload["options"] = {**payload.get("options", {}), **options}
         source_item_id = self._correlation_value("source_item_id", source_item_id)
         external_id = self._correlation_value("external_id", external_id)
+        if self.source_policy is not None and source not in self.source_policy.snapshot()["sources"]:
+            self.source_policy.register(source, 5 if weight is None else weight)
         job_id, now = str(uuid.uuid4()), self.clock()
         with self.lock, self.db:
             existing = None
@@ -1360,7 +1434,7 @@ class Broker:
         if policy is not None:
             allowed = policy.enabled_sources()
         running = db.execute(
-            "SELECT profile FROM jobs WHERE state IN ('running','cancel_requested')" +
+            "SELECT profile,json_extract(payload, '$.model') AS target_model FROM jobs WHERE state IN ('running','cancel_requested')" +
             ("" if include_producer_storage else " AND " + PUBLIC_JOB_PREDICATE) +
             " LIMIT 1"
         ).fetchone()
@@ -1409,7 +1483,7 @@ class Broker:
                 "job_id": picked["id"],
                 "source": picked["source"],
                 "profile": picked["profile"],
-                "model": PROFILES[picked["profile"]].model,
+                "model": self._lane_key(picked)[1],
                 "weight": (policy.weight(picked["source"]) or 1.0) if policy else 1.0,
                 "mode": mode,
                 "reason": reason,
@@ -1427,7 +1501,7 @@ class Broker:
                 "read-only time-batch projection; non-preemptive boundaries use recent "
                 "execution estimates and change as jobs are admitted, complete or policy reloads"
             ),
-            "current_model": PROFILES[running["profile"]].model if running else None,
+            "current_model": (running["target_model"] or PROFILES[running["profile"]].model) if running else None,
             "next_selections": selections,
         }
 
@@ -1589,7 +1663,7 @@ class Broker:
         # projection narrow for both observers and the real dispatcher avoids
         # materializing every queued request while sorting a large backlog.
         query = (
-            "SELECT id,profile,source,created,queued_at,attempt_count "
+            "SELECT id,profile,source,created,queued_at,attempt_count,json_extract(payload, '$.model') AS target_model "
             "FROM jobs INDEXED BY jobs_queued_candidates WHERE state='queued'"
         )
         values: tuple = ()
@@ -1601,8 +1675,8 @@ class Broker:
             query += " AND " + PUBLIC_JOB_PREDICATE
         if limit_per_source is not None:
             query = (
-                "SELECT id,profile,source,created,queued_at,attempt_count FROM ("
-                "SELECT id,profile,source,created,queued_at,attempt_count,"
+                "SELECT id,profile,source,created,queued_at,attempt_count,target_model FROM ("
+                "SELECT id,profile,source,created,queued_at,attempt_count,target_model,"
                 "row_number() OVER (PARTITION BY source ORDER BY queued_at,id) AS source_rank "
                 "FROM (" + query + ")"
                 ") WHERE source_rank<=? ORDER BY queued_at,id"
@@ -1629,7 +1703,7 @@ class Broker:
 
     @staticmethod
     def _lane_key(row) -> tuple[str, str]:
-        return (str(row["source"]), PROFILES[row["profile"]].model)
+        return (str(row["source"]), (row["target_model"] if "target_model" in row.keys() else json.loads(row["payload"]).get("model")) or PROFILES[row["profile"]].model)
 
     @staticmethod
     def _source_heads(candidates) -> dict[tuple[str, str], Any]:
@@ -2166,7 +2240,7 @@ class Broker:
             result = self.whisper_executor.run(self, row)
             self._finish_execution(row, result, "Whisper transcription completed; GPU fence tracked independently")
             return
-        profile = PROFILES[row["profile"]]
+        profile = self._target_profile(row["profile"], json.loads(row["payload"]))
         if row["profile"] == syncopia_daily.PROFILE:
             payload = json.loads(row["payload"])
             if (row["source"] != syncopia_daily.SOURCE or row["kind"] != "chat"
@@ -2188,7 +2262,7 @@ class Broker:
         if row["profile"] in NIGHTLY_PROFILE_NAMES:
             payload = json.loads(row["payload"])
             nightly_eval.normalize_request(payload, row["profile"])
-            nightly_evidence = nightly_eval.native_contract(self.ollama, row["profile"], payload["think"])
+            nightly_evidence = nightly_eval.native_contract(self.ollama, row["profile"], payload["think"], profile.model, payload["options"])
             if nightly_evidence["native_thinking"] != payload["native_thinking"]:
                 raise ValueError("native thinking metadata changed since freeze")
         models = self.ollama.ps().get("models", [])
@@ -2229,8 +2303,8 @@ class Broker:
         payload = json.loads(row["payload"])
         options = dict(payload.get("options", {}))
         default_context = profile.default_context or profile.max_context
-        options["num_ctx"] = min(int(options.get("num_ctx", default_context)), profile.max_context)
-        options["num_predict"] = min(int(options.get("num_predict", profile.max_output)), profile.max_output)
+        options["num_ctx"] = options.get("num_ctx", default_context)
+        options["num_predict"] = options.get("num_predict", profile.max_output)
         request = {k: v for k, v in payload.items() if k not in {"model", "keep_alive"}}
         if nightly_evidence is not None:
             request.pop("native_thinking", None)
@@ -2249,7 +2323,7 @@ class Broker:
         if row["profile"] in EVALUATION_PROFILE_NAMES:
             validate_evaluation_result(result, profile.model)
         if nightly_evidence is not None:
-            context = nightly_eval.resident_context(self.ollama, profile.model)
+            context = nightly_eval.resident_context(self.ollama, profile.model, options["num_ctx"], nightly_evidence["model_digest"])
             result = nightly_eval.project_result(result, profile.model)
             result["execution_evidence"] = nightly_eval.project_evidence(
                 dict(nightly_evidence, runtime_context_length=context))

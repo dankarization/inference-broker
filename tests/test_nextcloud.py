@@ -121,8 +121,7 @@ class NextcloudTests(unittest.TestCase):
             self.submit()
         self.policy_path.write_text('{"sources": {"openclaw": {"weight": 1}}}')
         self.broker.use_source_policy(SourcePolicy(self.policy_path))
-        with self.assertRaises(SourceAdmissionBlocked):
-            self.submit()
+        self.assertEqual(self.submit()["state"], "queued")
 
     def test_concurrent_same_key_and_restart_keep_one_job(self):
         jobs = []
