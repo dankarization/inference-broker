@@ -493,7 +493,7 @@ class DashboardTests(unittest.TestCase):
 
         body, _ = get("/v1/dashboard")
         data = json.loads(body)
-        self.assertEqual(set(data), {"timestamp", "maintenance", "sources", "active_jobs",
+        self.assertEqual(set(data), {"timestamp", "maintenance", "queue_paused", "sources", "active_jobs",
                                      "overall", "forecast", "history", "observation"})
         self.assertEqual(data, broker.dashboard(policy, include_producer_storage=False))
         source = next(item for item in data["sources"] if item["source"] == "dashboard-source")

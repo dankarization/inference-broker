@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
 <meta name="color-scheme" content="dark">
-<title>Ollama broker queue</title>
+<title>Inference broker queue</title>
 <link rel="stylesheet" href="/dashboard/assets/dashboard.css?v=__VERSION_dashboard.css__">
 <script src="/dashboard/assets/table_sort.js?v=__VERSION_table_sort.js__" defer></script>
 <script src="/dashboard/assets/dashboard.js?v=__VERSION_dashboard.js__" defer></script>
@@ -14,7 +14,7 @@
   <div class="topbar-in">
     <div class="brand">
       <span class="dot" aria-hidden="true"></span>
-      <h1>Ollama inference broker queue</h1>
+      <h1>Inference broker queue</h1>
     </div>
     <div class="spacer"></div>
     <span class="stamp">Snapshot: <code id="snapshot-timestamp">—</code></span>
@@ -31,6 +31,8 @@
 <p id="stale" class="error" hidden></p>
 <p id="summary" class="summary"></p>
 
+<button id="queue-pause" type="button">Pause queue</button>
+<span id="queue-pause-status" role="status"></span>
 <h2>Sources</h2>
 <div class="table-scroll"><table id="sources-table">
 <thead><tr>
@@ -73,7 +75,7 @@
 <h2>Forecast</h2>
 <p id="forecast-error" class="error" hidden></p>
 <div id="forecast-live">
-<p class="note">Current model: <b id="current-model"></b> · Lower Weight gets more GPU time (reciprocal shares); contiguous model batches, FIFO within a source. Active jobs are not interrupted.</p>
+<p class="note">Current model: <b id="current-model"></b></p>
 <div class="table-scroll"><table id="forecast-table">
 <thead><tr>
 <th data-sort-key="job"><button type="button" class="sort-btn">Job<span class="sort-mark" aria-hidden="true">↕</span></button></th>
@@ -87,7 +89,7 @@
 </tr></thead>
 <tbody id="forecast-body"></tbody>
 </table></div>
-<p class="note"><small id="contingency"></small></p>
+<p class="note" hidden><small id="contingency"></small></p>
 </div>
 </section>
 

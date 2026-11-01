@@ -1,4 +1,4 @@
-# Локальный брокер инференса
+# Inference broker queue
 
 Это приватный control plane для одного GPU-хоста с Ollama. Брокер предотвращает
 конкуренцию локальных задач за VRAM и предоставляет durable FIFO-очередь с
@@ -456,3 +456,16 @@ jobs и вернуть прежний broker release; другие sources и SQ
 
 Exact queue route, reasoning semantics, context ceiling and evaluation procedure:
 [docs/bolt-e4b.md](docs/bolt-e4b.md). No default/catalog changes.
+
+## Global queue pause
+
+Dashboard **Pause queue** (or `POST /v1/queue/pause` with
+`{"paused":true}`) prevents all new execution, independently of per-source
+dispatch controls. Enqueue remains available. An active job completes normally,
+then loaded GPU models are unloaded. Backend unload failures are retried without
+resuming dispatch. The pause is stored in SQLite and survives restarts.
+Resume with `{"paused":false}` or **Resume queue**.
+
+Repository: https://github.com/dankarization/inference-broker
+The existing `ollama-inference-broker.service`, state directory and Python
+package `broker` intentionally retain their compatibility names.

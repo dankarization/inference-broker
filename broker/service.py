@@ -311,6 +311,9 @@ class Broker:
         self.wal_autocheckpoint_pages = int(wal_autocheckpoint_pages)
         self.journal_size_limit_bytes = int(journal_size_limit_bytes)
         self._init_db()
+        with self.db:
+            self.db.execute("CREATE TABLE IF NOT EXISTS queue_control (id INTEGER PRIMARY KEY CHECK(id=1), paused INTEGER NOT NULL)")
+            self.db.execute("INSERT OR IGNORE INTO queue_control VALUES(1,0)")
         self.storage = StorageManager(
             self.db, self.database, self.lock, self.clock, self._audit,
             lambda: self.source_policy,
@@ -1431,6 +1434,7 @@ class Broker:
                     db, now=now, policy_snapshot=policy_snapshot,
                     include_producer_storage=include_producer_storage,
                 ),
+                "queue_paused": bool(db.execute("SELECT paused FROM queue_control WHERE id=1").fetchone()[0]),
                 "forecast": self._forecast(
                     db, policy, now, 10,
                     include_producer_storage=include_producer_storage,
@@ -1890,6 +1894,32 @@ class Broker:
         self._publish_scheduler_snapshot()
         return selected
 
+    def queue_paused(self) -> bool:
+        with self.lock:
+            return bool(self.db.execute("SELECT paused FROM queue_control WHERE id=1").fetchone()[0])
+
+    def set_queue_paused(self, paused: bool) -> dict:
+        if not isinstance(paused, bool):
+            raise ValueError("paused must be a boolean")
+        with self.lock, self.db:
+            self.db.execute("UPDATE queue_control SET paused=? WHERE id=1", (int(paused),))
+        return {"paused": paused}
+
+    def _unload_if_paused(self) -> None:
+        # Serialize resume/claims with unloading; never touch an active attempt.
+        with self.lock:
+            if not self.queue_paused() or self.db.execute(
+                "SELECT 1 FROM jobs WHERE state IN ('running','cancel_requested') LIMIT 1"
+            ).fetchone():
+                return
+            try:
+                for model in self.ollama.ps().get("models", []):
+                    self.ollama.unload(model["name"])
+                self._loaded_models_cache = []
+            except Exception:
+                # Backend outages must not kill the dispatcher; retry next tick.
+                LOGGER.warning("Paused queue GPU unload failed; will retry", exc_info=True)
+
     def dispatch_once(self, allowed_sources: frozenset[str] | None = None, policy: SourcePolicy | None = None, drain_check: bool = False) -> bool:
         """Claim the next eligible job, or report that none can start.
 
@@ -1904,6 +1934,9 @@ class Broker:
             if drain_check:
                 return bool(occupants)
             if occupants:
+                return False
+            if self.queue_paused():
+                self._unload_if_paused()
                 return False
             row = self._next(allowed_sources, policy)
             if not row: return False
@@ -1993,6 +2026,12 @@ class Broker:
                 )
                 self._refresh_health_cache_locked()
                 self.completed.notify_all()
+        try:
+            self._unload_if_paused()
+        except Exception:
+            # A later dispatcher tick retries backend unload without changing
+            # the completed job outcome or permitting queued execution.
+            pass
         return True
 
     def _execute(self, row):

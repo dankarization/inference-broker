@@ -69,7 +69,7 @@ class DashboardAssetTests(unittest.TestCase):
             self.assertEqual(reads, [target])
             stat = target.stat()
             # Same-size edit, explicitly advance only mtime.
-            target.write_bytes(first.content.replace(b"#18212b", b"#ffffff"))
+            target.write_bytes(first.content.replace(b"#14181a", b"#ffffff"))
             os.utime(target, ns=(stat.st_atime_ns, stat.st_mtime_ns + 1_000_000))
             second = self.assets.read("dashboard.css")
             self.assertNotEqual(first.etag, second.etag)
@@ -109,7 +109,7 @@ class DashboardAssetTests(unittest.TestCase):
         api_status, api_body, api_headers = self.get("/v1/dashboard")
         before = json.loads(api_body)
         self.assertEqual(api_status, 200)
-        self.assertEqual(set(before), {"timestamp", "maintenance", "sources", "active_jobs",
+        self.assertEqual(set(before), {"timestamp", "maintenance", "queue_paused", "sources", "active_jobs",
                                       "overall", "forecast", "history", "observation"})
         self.assertEqual(before, self.broker.dashboard(include_producer_storage=False))
         instance = self.server

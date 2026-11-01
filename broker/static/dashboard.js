@@ -99,7 +99,7 @@ function renderDashboard(data) {
   timestamp(byId('snapshot-timestamp'), data.timestamp ?? observation.observed_at);
   if (observation.state === 'unavailable') {
     setLive(false);
-    document.title = 'Ollama broker queue unavailable';
+    document.title = 'Inference broker queue unavailable';
     error.textContent = 'Dashboard data unavailable: ' + (observation.reason || 'observer read failed') + '.';
     return false;
   }
@@ -131,6 +131,10 @@ function renderDashboard(data) {
     cell(item.id, true), cell(item.source), cell(item.weight), cell(item.state),
     timestamp(cell(null), item.started), timestamp(cell(null), item.lease_until),
     cell(item.attempt_count, true), cell(item.retry_count)])), 8);
+  const pause = byId('queue-pause');
+  pause.dataset.paused = String(Boolean(data.queue_paused));
+  pause.textContent = data.queue_paused ? 'Resume queue' : 'Pause queue';
+  byId('queue-pause-status').textContent = data.queue_paused ? 'Paused — active job finishes before GPU unload; new jobs may enqueue.' : '';
   const forecast = data.forecast;
   byId('forecast').hidden = !forecast;
   if (forecast) {
@@ -157,7 +161,7 @@ function setLive(available) {
   const live = byId('dashboard-live');
   if (live) live.hidden = !available;
   byId('dashboard-error').hidden = available;
-  if (available) document.title = 'Ollama broker queue';
+  if (available) document.title = 'Inference broker queue';
 }
 
 // Every refresh replaces the rows, so each table must re-apply the sort the
@@ -322,3 +326,14 @@ document.addEventListener('visibilitychange', () => {
 const dashboardReady = loadDashboard();
 // Keep the DOM patched in the background; a hidden tab does not poll.
 syncRefreshTimer();
+
+byId('queue-pause')?.addEventListener('click', async () => {
+  const button = byId('queue-pause');
+  button.disabled = true;
+  try {
+    const response = await fetch('/v1/queue/pause', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({paused: button.dataset.paused !== 'true'})});
+    if (!response.ok) throw new Error('Queue control failed');
+    await loadDashboard();
+  } catch (error) { byId('queue-pause-status').textContent = error.message; }
+  finally { button.disabled = false; }
+});

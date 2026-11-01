@@ -315,5 +315,10 @@ const durationCases = JSON.parse(
   const recovered = await boot(fixture, true);
   assert.equal(recovered.context.reloaded, true);
   assert.equal(recovered.active().length, 0);
+  const pausedQueue = await boot({...fixture, queue_paused: true});
+  assert.equal(pausedQueue.id('queue-pause').textContent, 'Resume queue');
+  assert.equal(pausedQueue.id('queue-pause').dataset.paused, 'true');
+  assert.match(pausedQueue.id('queue-pause-status').textContent, /active job finishes/);
+  assert.equal(id('queue-pause').textContent, 'Pause queue');
   console.log('dashboard frontend contract PASS');
 })().catch(error => { console.error(error); process.exitCode = 1; });

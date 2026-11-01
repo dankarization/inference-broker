@@ -189,7 +189,12 @@ def serve(broker, host="127.0.0.1", port=8088, policy=None, storage_token=None):
                 self._json(400, {"error": "request body must be JSON"})
                 return
             path = urlsplit(self.path).path
-            if path == "/v1/jobs":
+            if path == "/v1/queue/pause":
+                if not isinstance(body, dict) or set(body) != {"paused"} or not isinstance(body["paused"], bool):
+                    self._json(400, {"error": "body must contain only boolean paused"})
+                    return
+                self._json(200, broker.set_queue_paused(body["paused"]))
+            elif path == "/v1/jobs":
                 if (
                     isinstance(body, dict) and body.get("producer_storage") is not None
                     and not self._storage_authorized()

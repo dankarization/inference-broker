@@ -1,4 +1,4 @@
-/* Ollama broker dashboard — dark control-room theme.
+/* Inference broker dashboard — dark control-room theme.
    Design tokens adapted from the AI Usage Dashboard (OpenCodex design system,
    MIT): role-based colour tokens, a 10/11/12/13/14 type scale, a 4px spacing
    base and 6/8/12/pill radii, so both dashboards read as one product family.
@@ -215,3 +215,11 @@ footer p { margin: var(--s2) 0; }
   #sources-table th[data-sort-key="completed_1h"], #sources-table td:nth-child(13) { display: none; }
   .table-scroll { margin-left: calc(-1 * var(--s2)); margin-right: calc(-1 * var(--s2)); }
 }
+
+/* Small viewport gutters, retaining full-width blocks. */
+.wrap, .topbar-in, footer { padding-left: clamp(12px, 2vw, 32px); padding-right: clamp(12px, 2vw, 32px); }
+/* Scheduler implementation details stay in the API, off the queue page. */
+#forecast-table th[data-sort-key="mode"],
+#forecast-table th[data-sort-key="reason"],
+#forecast-table td:nth-child(6),
+#forecast-table td:nth-child(7) { display: none; }

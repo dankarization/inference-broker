@@ -1,5 +1,5 @@
 [Unit]
-Description=Local Ollama inference broker (source-scoped pilot dispatch)
+Description=Local Inference broker (source-scoped pilot dispatch)
 After=default.target
 
 [Service]
