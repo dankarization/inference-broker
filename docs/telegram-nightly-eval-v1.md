@@ -30,8 +30,9 @@ Byte caps do not prove token occupancy. Existing 31 profiles, their limits,
 model routes and all existing source-specific guards are unchanged.
 
 Admission is fail-closed without an explicit dedicated enabled/admitting policy.
-One outstanding job per dedicated source; **at most 32 distinct jobs over this
-source's lifetime**, counting retained tombstones. Idempotent replay requires
+There is no broker-side job-count admission cap: any number of jobs may queue.
+The 32-cell/one-outstanding campaign contract lives in the runner helper journal
+(broker/nightly_client.py), not in broker admission. Idempotent replay requires
 identical profile/kind/item/hash and is checked before policy/budget gates.
 This lane refuses individual and bulk retries: failed/unknown/length outcomes
 consume the original cell; there is no make-up cell or automatic resubmission.

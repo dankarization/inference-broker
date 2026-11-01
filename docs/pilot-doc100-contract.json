@@ -30,20 +30,19 @@
       }
     },
     "nextcloud": {
-      "active_eval_jobs": 256,
       "active_eval_payload_bytes": 268435456,
-      "legacy_route_outstanding_jobs": 2,
+      "job_count_cap": null,
       "scope": "separate Nextcloud guard, NOT pilot capacity"
     },
     "pilot": {
-      "active_jobs": 512,
+      "active_jobs": null,
       "active_normalized_payload_bytes": 536870912,
       "active_states": [
         "queued",
         "running",
         "cancel_requested"
       ],
-      "full_queue_http": 429,
+      "full_byte_budget_http": 429,
       "job_body_storage": "SQLite broker_temporary inline; no producer refs/external spool bypass",
       "keyed_replay": "same source/external_id/profile/kind/input_hash/source_item_id returns existing before admission gates",
       "normalized_bytes_formula": "storage.content_evidence(normalized_payload)[1], includes base64 expansion",
@@ -53,7 +52,7 @@
   },
   "deployment_status": "SOURCE_ONLY_NOT_LIVE",
   "doc100": {
-    "all_at_once_requires": "existing_pilot_active+400<=512 AND active_payload_bytes+planned_normalized_bytes<=512MiB AND source policy open AND disk/retention guards pass",
+    "all_at_once_requires": "active_payload_bytes+planned_normalized_bytes<=512MiB AND source policy open AND disk/retention guards pass; no job-count cap",
     "cloud_lane": "independent; never wait local completion or success as a cloud admission barrier",
     "documents": 100,
     "jobs": 400,

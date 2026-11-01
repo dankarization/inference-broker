@@ -27,10 +27,11 @@ requests are limited to 2 MiB; vision requests to 32 MiB, at most 16 images
 and 24 MiB decoded images. Tools are limited to 512 KiB. Byte limits protect
 SQLite/HTTP and can narrow oversized image turns; exact token budget
 остаётся ответственностью OpenClaw/Ollama, поэтому `truncate` и `shift`
-запрещены. Queue admission ограничен восемью незавершёнными jobs и восемью
-одновременными HTTP waiters; сверх лимита — HTTP 429. Запросы проходят обычный
-source scheduler, model switch и durable result storage; route не вызывает
-Ollama напрямую.
+запрещены. Queue admission не ограничивает количество накопленных jobs: backlog
+любого размера накапливается и планируется scheduler-ом. Защита остаётся
+байтовой (2 MiB text / 32 MiB vision, disk reserve, WAL) и per-profile
+max_concurrency на исполнении. Запросы проходят обычный source scheduler,
+model switch и durable result storage; route не вызывает Ollama напрямую.
 
 `stream=false` возвращает настоящий Ollama JSON после terminal completion.
 `stream=true` возвращает Ollama NDJSON: пустые heartbeat-кадры примерно каждые

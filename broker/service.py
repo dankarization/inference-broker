@@ -35,7 +35,7 @@ from . import voice
 from .evaluation import normalize_request as normalize_evaluation_request
 from .evaluation import validate_result as validate_evaluation_result
 from .asr import PROFILE as ASR_PROFILE, validate_payload as validate_asr_payload
-from .openclaw import (MAX_OUTSTANDING, normalize_request as normalize_openclaw_request,
+from .openclaw import (normalize_request as normalize_openclaw_request,
                        validate_result as validate_openclaw_result)
 from .policy import (
     RETENTION_DEFAULTS,
@@ -647,14 +647,6 @@ class Broker:
                 self._refresh_health_cache_locked()
             self.completed.notify_all()
 
-    def _ensure_openclaw_capacity_locked(self, additional: int = 1) -> None:
-        outstanding = self.db.execute(
-            "SELECT count(*) FROM jobs WHERE source='openclaw' "
-            "AND state IN ('queued','running','cancel_requested')"
-        ).fetchone()[0]
-        if outstanding + additional > MAX_OUTSTANDING:
-            raise SourceQueueFull("openclaw has 8 outstanding jobs")
-
     @staticmethod
     def _target_profile(name, payload):
         return replace(PROFILES[name], model=payload.get("model", PROFILES[name].model))
@@ -916,43 +908,28 @@ class Broker:
                          if self.source_policy is not None else None)
                 if not entry or not entry["enabled"] or not entry["admission_allowed"]:
                     raise SourceAdmissionBlocked(source)
-                total = self.db.execute(
-                    "SELECT count(*) FROM (SELECT id FROM jobs WHERE source=? UNION "
-                    "SELECT job_id FROM job_retention_tombstones WHERE source=?)", (source, source),
-                ).fetchone()[0]
-                active = self.db.execute(
-                    "SELECT count(*) FROM jobs WHERE source=? AND state IN "
-                    "('queued','running','cancel_requested')", (source,),
-                ).fetchone()[0]
-                if total >= nightly_eval.MAX_CALLS or active:
-                    raise SourceQueueFull("nightly: at most 32 lifetime cells and one outstanding job")
             if source == "pilot-mainpc":
-                from .evaluation import PILOT_MAX_ACTIVE_JOBS, PILOT_MAX_ACTIVE_INPUT_BYTES
+                from .evaluation import PILOT_MAX_ACTIVE_INPUT_BYTES
                 entry = (self.source_policy.snapshot()["sources"].get(source)
                          if self.source_policy is not None else None)
                 if not entry or not entry["enabled"] or not entry["admission_allowed"]:
                     raise SourceAdmissionBlocked(source)
                 outstanding = self.db.execute(
-                    "SELECT count(*),coalesce(sum(input_bytes),0) FROM jobs WHERE source='pilot-mainpc' "
+                    "SELECT coalesce(sum(input_bytes),0) FROM jobs WHERE source='pilot-mainpc' "
                     "AND state IN ('queued','running','cancel_requested')"
-                ).fetchone()
-                if outstanding[0] >= PILOT_MAX_ACTIVE_JOBS or outstanding[1] + content_evidence(payload)[1] > PILOT_MAX_ACTIVE_INPUT_BYTES:
-                    raise SourceQueueFull("pilot-mainpc budget: 512 active jobs / 512 MiB")
+                ).fetchone()[0]
+                if outstanding + content_evidence(payload)[1] > PILOT_MAX_ACTIVE_INPUT_BYTES:
+                    raise SourceQueueFull("pilot-mainpc budget: 512 MiB active normalized payload")
             if source == "nextcloud":
                 if self.source_policy is None or source not in self.source_policy.snapshot()["sources"]:
                     raise SourceAdmissionBlocked(source)
-                if profile == "nextcloud-qwen3-vl" and self.db.execute(
-                    "SELECT count(*) FROM jobs WHERE source='nextcloud' "
-                    "AND state IN ('queued','running','cancel_requested')"
-                ).fetchone()[0] >= 2:
-                    raise SourceQueueFull("nextcloud has 2 outstanding jobs")
                 if profile in {"nextcloud-eval-qwen", "nextcloud-verify-gemma26", QWEN64_PROFILE}:
                     outstanding = self.db.execute(
-                        "SELECT count(*),coalesce(sum(input_bytes),0) FROM jobs WHERE source='nextcloud' "
+                        "SELECT coalesce(sum(input_bytes),0) FROM jobs WHERE source='nextcloud' "
                         "AND state IN ('queued','running','cancel_requested')"
-                    ).fetchone()
-                    if outstanding[0] >= 256 or outstanding[1] + content_evidence(payload)[1] > 256 * 1024**2:
-                        raise SourceQueueFull("nextcloud evaluation budget: 256 jobs / 256 MiB")
+                    ).fetchone()[0]
+                    if outstanding + content_evidence(payload)[1] > 256 * 1024**2:
+                        raise SourceQueueFull("nextcloud evaluation budget: 256 MiB active normalized payload")
             storage_fields = self.storage.prepare_admission(source, payload, producer_storage)
             if self.source_policy is not None and not self.source_policy.admission_allowed(source):
                 self._audit(
@@ -967,13 +944,6 @@ class Broker:
                 # Rejection itself is durable observability, despite aborting admission.
                 self.db.commit()
                 raise SourceAdmissionBlocked(source)
-            if source == ASR_PROFILE:
-                count = self.db.execute("SELECT count(*) FROM jobs WHERE source=? AND state IN "
-                                        "('queued','running','cancel_requested')", (ASR_PROFILE,)).fetchone()[0]
-                if count >= 32:
-                    raise SourceQueueFull("ASR queue full")
-            if source == "openclaw":
-                self._ensure_openclaw_capacity_locked()
             self.db.execute(
                 "INSERT INTO jobs(id,profile,kind,source,payload,state,created,"
                 "queued_at,source_item_id,external_id,input_storage_mode,input_ref,input_hash,"
@@ -1071,8 +1041,6 @@ class Broker:
                 raise StorageAuthorizationRequired
             if any(row["compaction_state"] != "full" for row in rows):
                 raise ValueError("one or more failed jobs have expired retry bodies")
-            if source == "openclaw" and rows:
-                self._ensure_openclaw_capacity_locked(len(rows))
             for row in rows:
                 attempt_no = row["attempt_count"] or None
                 self._audit(
@@ -1282,14 +1250,9 @@ class Broker:
                 raise ValueError("job retry retention has expired")
             if self.source_policy is not None and not self.source_policy.admission_allowed(row["source"]):
                 raise SourceAdmissionBlocked(row["source"])
-            if row["source"] == "openclaw":
-                self._ensure_openclaw_capacity_locked()
             if row['source'] == ASR_PROFILE:
                 if self.source_policy is not None and not self.source_policy.admission_allowed(ASR_PROFILE):
                     raise SourceAdmissionBlocked(ASR_PROFILE)
-                if self.db.execute("SELECT count(*) FROM jobs WHERE source=? AND state IN "
-                                   "('queued','running','cancel_requested')", (ASR_PROFILE,)).fetchone()[0] >= 32:
-                    raise SourceQueueFull('ASR queue full')
             now = self.clock()
             self._audit(
                 "job.retry_requested", job_id=job_id, source=row["source"],

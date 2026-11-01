@@ -18,15 +18,15 @@ temp0/thinkfalse/streamfalse. Nextcloud Gemma26 generate uses ctx16384/output409
 HTTP JSON parsing: `/v1/jobs` has no global preparse Content-Length hard cap.
 Do not expose the existing LAN service to untrusted callers based on these bounds.
 
-The pilot independently admits at most 512 active jobs and 512MiB normalized
-payload bytes (including base64), counting queued/running/cancel_requested. Full
-budget returns429; exact keyed replay still returns the retained job. Closed or
-unknown source returns403. This is not a reservation for400 jobs: all400 fit only
-if existing occupancy +400 <=512 AND existing bytes + actual planned bytes
-<=512MiB, source is open, and shared storage guards pass. Large images can
-require bounded admission/collection sweeps. Never borrow Nextcloud256 capacity,
-change source names, or bypass queues. Cloud admission/completion is independent
-of all local outcomes, including backpressure and failures.
+The pilot admits any number of active jobs within its 512MiB normalized payload
+byte budget (including base64), counting queued/running/cancel_requested. There
+is no job-count cap; the byte budget full returns429; exact keyed replay still
+returns the retained job. Closed or unknown source returns403. All400 doc100 jobs
+fit if existing bytes + actual planned bytes <=512MiB, source is open, and shared
+storage guards pass. Large images can require bounded admission/collection
+sweeps. Never borrow the Nextcloud byte budget, change source names, or bypass
+queues. Cloud admission/completion is independent of all local outcomes,
+including backpressure and failures.
 
 There is NO global hard active count/byte/spool quota. The common disk admission
 guard reserves max(configured minimum (default2GiB),5% total filesystem); storage
