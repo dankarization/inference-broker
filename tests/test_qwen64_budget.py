@@ -88,6 +88,8 @@ class Qwen64Tests(Worker004Tests):
 
     def test_qwen64_shared_byte_cap_and_replay_at_cap(self):
         job=self.admit64()
+        # No job-count cap: several eval jobs accumulate before the byte budget.
+        self.admit64('second');self.admit64('third')
         self.broker.db.execute('UPDATE jobs SET input_bytes=? WHERE id=?',(256*1024**2,job['id']))
         self.broker.db.commit()
         with self.assertRaises(SourceQueueFull):self.admit('overflow-old')

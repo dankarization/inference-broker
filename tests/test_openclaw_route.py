@@ -12,7 +12,7 @@ from urllib.request import Request, ProxyHandler, build_opener
 from broker.http import openclaw_wait_seconds, serve
 from broker.openclaw import MODEL, normalize_request
 from broker.profiles import OPENCLAW_PROFILES_BY_MODEL, PROFILES, VOICE_PROFILE_NAMES
-from broker.service import Broker, SourceQueueFull
+from broker.service import Broker
 
 
 class FakeWol:
@@ -357,20 +357,25 @@ class OpenClawRouteTests(unittest.TestCase):
         different = normalize_request({**self.sample(), "messages": [{"role": "user", "content": "other"}]})
         with self.assertRaisesRegex(ValueError, "idempotency key"):
             self.broker.submit("openclaw", "chat", different, external_id="turn-1")
-        for n in range(8):
+        # No job-count admission cap: a backlog far above the old limit of 8
+        # accumulates instead of returning 429.
+        for n in range(20):
             self.broker.submit("openclaw", "chat", payload, external_id=f"turn-{n+2}")
-        with self.assertRaises(HTTPError) as caught:
-            self.opener.open(self.request(self.sample()))
-        self.assertEqual(caught.exception.code, 429)
+        # A further direct submit still has no count cap: total 22 queued.
+        self.broker.submit("openclaw", "chat", payload, external_id="turn-22")
+        self.assertEqual(self.broker.health()["queue_depth"], 21)
+        self.assertGreater(self.broker.health()["queue_depth"], 8)  # above the old cap
+        # And the generic /v1/jobs route also admits a 23rd backlog job: 202, not 429.
         generic = Request(
             f"http://127.0.0.1:{self.server.server_port}/v1/jobs",
             data=json.dumps({"profile": "openclaw", "kind": "chat", "source": "openclaw",
-                             "payload": payload}).encode(),
+                             "payload": payload, "external_id": "generic-backlog"}).encode(),
             headers={"Content-Type": "application/json"}, method="POST",
         )
-        with self.assertRaises(HTTPError) as generic_error:
-            self.opener.open(generic)
-        self.assertEqual(generic_error.exception.code, 429)
+        with self.opener.open(generic, timeout=5) as response:
+            self.assertEqual(response.status, 202)
+            self.assertEqual(json.loads(response.read())["state"], "queued")
+        self.assertEqual(self.broker.health()["queue_depth"], 22)
         self.ollama.result = {"done": False, "message": {"role": "assistant", "content": "partial"}}
         self.broker.dispatch_once(frozenset({"openclaw"}))
         self.assertEqual(self.broker.status(self.broker.db.execute(
@@ -428,7 +433,7 @@ class OpenClawRouteTests(unittest.TestCase):
             self.assertEqual(caught.exception.code, 410)
             self.assertIn("expired", caught.exception.read().decode())
 
-    def test_openclaw_retries_respect_outstanding_limit_atomically(self):
+    def test_openclaw_retries_are_not_count_limited(self):
         payload = normalize_request(self.sample())
         cancelled = self.broker.submit("openclaw", "chat", payload)
         self.broker.cancel(cancelled["id"])
@@ -438,29 +443,16 @@ class OpenClawRouteTests(unittest.TestCase):
                 self.broker.db.execute(
                     "UPDATE jobs SET state='failed' WHERE id=?", (job["id"],),
                 )
-        active = [self.broker.submit("openclaw", "chat", payload) for _ in range(8)]
-        with self.assertRaises(SourceQueueFull):
-            self.broker.retry(cancelled["id"])
-        retry_request = Request(
-            f"http://127.0.0.1:{self.server.server_port}/v1/jobs/{cancelled['id']}/retry",
-            data=b"{}", headers={"Content-Type": "application/json"}, method="POST",
-        )
-        with self.assertRaises(HTTPError) as caught:
-            self.opener.open(retry_request)
-        self.assertEqual(caught.exception.code, 429)
-        with self.assertRaises(SourceQueueFull):
-            self.broker.bulk_retry_failed("openclaw")
+        # A queued backlog far above the old 8-job cap no longer blocks retry.
+        active = [self.broker.submit("openclaw", "chat", payload) for _ in range(20)]
+        self.assertEqual(self.broker.retry(cancelled["id"])["state"], "queued")
+        result = self.broker.bulk_retry_failed("openclaw")
+        self.assertEqual(result["retried"], 2)
         self.assertEqual(
             [self.broker.status(job["id"])["state"] for job in failed],
-            ["failed", "failed"],
+            ["queued", "queued"],
         )
         self.broker.cancel(active[-1]["id"])
-        with self.assertRaises(SourceQueueFull):
-            self.broker.bulk_retry_failed("openclaw")
-        self.assertEqual(
-            [self.broker.status(job["id"])["state"] for job in failed],
-            ["failed", "failed"],
-        )
 
     def test_poll_pending_openclaw_job_does_not_hydrate_payload(self):
         job = self.broker.submit("openclaw", "chat", normalize_request(self.sample()))

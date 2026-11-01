@@ -230,22 +230,27 @@ class NightlyTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'never retries'):
             self.broker.bulk_retry_failed(lane.SOURCE)
 
-    def test_lifetime_32_and_single_outstanding_real_admissions(self):
-        for i in range(32):
+    def test_backlog_admission_has_no_job_count_cap(self):
+        # Broker admission no longer enforces the campaign's 32-lifetime-cell /
+        # one-outstanding contract; any backlog accumulates and is scheduled.
+        for i in range(40):
             job = self.submit(str(i))
-            with self.assertRaises(SourceQueueFull):
-                self.submit('parallel')
-            self.run_job()
-        with self.assertRaises(SourceQueueFull):
-            self.submit('33')
-        self.assertEqual(self.submit('31')['id'], job['id'])
-        self.assertEqual(len(self.gpu.requests), 32)
-        # Tombstones remain in lifetime accounting, and never recreate a key.
+        self.assertEqual(self.broker.db.execute(
+            "SELECT count(*) FROM jobs WHERE source=? AND state='queued'",
+            (lane.SOURCE,)).fetchone()[0], 40)
+        # Exact keyed replay works with no cap gate in front of it.
+        self.assertEqual(self.submit('31')['id'], self.broker.db.execute(
+            "SELECT id FROM jobs WHERE external_id='31'").fetchone()[0])
+        # The runner helper journal keeps the bounded 32-cell campaign contract.
+        self.assertEqual(lane.MAX_CALLS, 32)
+        self.run_job()  # one job dispatches; 39 remain queued
+        self.assertEqual(self.broker.db.execute(
+            "SELECT count(*) FROM jobs WHERE source=? AND state='queued'",
+            (lane.SOURCE,)).fetchone()[0], 39)
+        # Tombstones still never recreate a key.
         with self.broker.db:
             self.broker.db.execute("INSERT INTO job_retention_tombstones(job_id,source,external_id,profile,kind,final_state,input_hash,created,purged_at) SELECT id,source,external_id,profile,kind,state,input_hash,created,0 FROM jobs WHERE external_id='0'")
             self.broker.db.execute("DELETE FROM jobs WHERE external_id='0'")
-        with self.assertRaises(SourceQueueFull):
-            self.submit('34')
         with self.assertRaisesRegex(ValueError, 'retention expired'):
             self.submit('0')
 

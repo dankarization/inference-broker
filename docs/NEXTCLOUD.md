@@ -21,8 +21,9 @@ The separate native OpenClaw route remains unchanged and uses source `openclaw`.
 
 A configured source policy is mandatory. Operators merge a dedicated nextcloud
 entry with weight7; existing policy files/weights are never modified by this code.
-Maximum two queued/running/cancel-requested jobs for the new source. Exact replay
-is available even when current admission closes or this queue limit is reached.
+There is no job-count admission cap: any number of queued jobs accumulates.
+Exact replay is available even when current admission closes. Byte budgets
+(evaluation 256 MiB active normalized payload, request byte limits) still apply.
 
 `external_id` and `source_item_id` are required. Admission persists identity before
 returning; exact retries reuse the same job. Reusing a key with another payload,
