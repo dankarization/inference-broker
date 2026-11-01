@@ -243,7 +243,8 @@ def serve(broker, host="127.0.0.1", port=8088, policy=None, storage_token=None, 
                         raise ValueError("unsupported projection")
                     result = broker.submit(body["profile"], body["kind"], body.get("payload", {}),
                                            body.get("source"), body.get("source_item_id"),
-                                           body.get("external_id"), body.get("producer_storage"))
+                                           body.get("external_id"), body.get("producer_storage"),
+                                           model=body.get("model"), options=body.get("options"), weight=body.get("weight"))
                     self._json(202, broker.nextcloud_projection(result) if projection else result)
                 except SourceAdmissionBlocked as error: self._admission_blocked(error)
                 except SourceQueueFull as error: self._json(429, {"error": str(error)})

@@ -225,3 +225,23 @@ python3 -m unittest discover -s tests -v
 ```
 
 Тесты используют заглушки Ollama и Wake-on-LAN и не запускают реальный инференс. Границы rollout описаны в [ROADMAP.md](ROADMAP.md).
+
+### Queue job runtime overrides
+
+`POST /v1/jobs` accepts optional top-level `model`, `options` (including
+`num_ctx` and `num_predict`), and `weight`. Job runtime values take precedence
+over profile defaults; absent values keep the legacy profile behavior. Sources
+are scheduling identities, not model owners. New sources are registered atomically
+in the configured source-policy file, enabled and admission-allowed, with weight
+5 unless the introducing job supplies a finite positive weight. Existing source
+entries and maintenance/admission controls are retained.
+
+Token budgets are never silently clamped: requests above the target model's
+configured physical context ceiling fail with HTTP 400 containing the requested
+value, limit, and model id. Known models use the largest server-configured context
+ceiling for that model (not the submitting profile's smaller default). Unknown
+models require native `/api/show` context metadata; unavailable metadata fails
+closed. These limits do not enable multi-job GPU execution. Pilot and nightly
+jobs retain dedicated source/correlation and media/thinking safety contracts,
+but testers can select model and token budgets. Synchronous compatibility routes
+continue to apply their own input contracts.

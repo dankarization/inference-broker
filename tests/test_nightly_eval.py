@@ -194,7 +194,7 @@ class NightlyTests(unittest.TestCase):
                 self.submit(profile=profile)
         for changes in (dict(images=[]), dict(format='json'), dict(tools=[]), dict(keep_alive=0),
                         dict(model='uninstalled'), dict(think=0), dict(think=None), dict(stream=True),
-                        dict(truncate=True), dict(shift=True), dict(options=dict(lane.OPTIONS, num_ctx=65536)),
+                        dict(truncate=True), dict(shift=True), dict(options=dict(lane.OPTIONS, num_ctx=999999)),
                         dict(options=dict(lane.OPTIONS, num_predict=8192.0)),
                         dict(messages=[dict(role='assistant', content='history')]),
                         dict(messages=[dict(role='user', content='x', thinking=SECRET)])):

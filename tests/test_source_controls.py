@@ -93,7 +93,8 @@ class SourceControlsTests(unittest.TestCase):
         existing = self.submit('alpha')
         self.broker.cancel(existing['id'])
         self.assertEqual(self.request('/v1/jobs', {'profile': 'interactive', 'kind': 'generate',
-            'source': 'unregistered', 'payload': {'prompt': 'synthetic'}})[0], 403)
+            'source': 'unregistered', 'payload': {'prompt': 'synthetic'}})[0], 202)
+        self.assertEqual(self.policy.weight('unregistered'), 5)
         self.policy.set_admission_allowed('alpha', False)
         self.assertEqual(self.request('/v1/jobs/'+existing['id']+'/retry', {})[0], 403)
         self.assertEqual(self.request('/v1/sources/alpha/failed/retry', {'confirm': True})[0], 403)

@@ -262,7 +262,7 @@ class BrokerTests(unittest.TestCase):
         self.assertEqual(response["body"]["broker"]["state"], "completed")
     def test_wol_readiness_unload_and_server_limits(self):
         b=self.make(["incompatible-model:1"])
-        job=b.submit("interactive", "generate", {"model":"evil", "prompt":"x", "keep_alive":"forever", "options":{"num_ctx":999999,"num_predict":999999}})["id"]
+        job=b.submit("interactive", "generate", {"prompt":"x", "keep_alive":"forever"})["id"]
         b.dispatch_once()
         self.assertEqual(b.status(job)["state"], "completed")
         self.assertLess(self.calls.index(("unload", "incompatible-model:1")), next(i for i,x in enumerate(self.calls) if isinstance(x,tuple) and x[0]=="run"))
@@ -272,7 +272,7 @@ class BrokerTests(unittest.TestCase):
         self.assertEqual(self.calls[0], "wake")
     def test_shutterstock_video_switches_to_nemotron_with_server_owned_limits(self):
         b=self.make(["incompatible-model:1"])
-        job=b.submit("shutterstock-video", "generate", {"prompt":"video", "options":{"num_ctx":999999,"num_predict":999999}})["id"]
+        job=b.submit("shutterstock-video", "generate", {"prompt":"video"})["id"]
         b.dispatch_once()
         self.assertEqual(b.status(job)["state"], "completed")
         self.assertEqual(b.status(job)["switch_reason"], "unloaded incompatible model before switch")

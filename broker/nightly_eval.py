@@ -6,6 +6,7 @@ No static claim that false/true (or named levels) work on a local artifact.
 from __future__ import annotations
 import json
 import math
+import re
 from .profiles import NIGHTLY_PROFILE_NAMES, PROFILES
 
 SOURCE = "telegram-nightly-eval-20261028-v1"
@@ -67,48 +68,48 @@ def normalize_request(request, profile_name):
     profile = PROFILES[profile_name]
     if set(request) - {"messages", "model", "think", "options", "stream", "truncate", "shift", "native_thinking"}:
         raise ValueError("nightly accepts text/freeform chat only")
-    if request.get("model", profile.model) != profile.model:
-        raise ValueError("nightly exact model required")
     if not think_value(request.get("think")):
         raise ValueError("explicit native boolean/level required; no default coercion")
     for field in ("stream", "truncate", "shift"):
         if request.get(field, False) is not False:
             raise ValueError("nightly disables streaming, truncation and context shift")
-    options = request.get("options", OPTIONS)
+    options = {**OPTIONS, **request.get("options", {})} if isinstance(request.get("options", {}), dict) else None
     if (not isinstance(options, dict) or set(options) != set(OPTIONS)
             or any(type(options[k]) not in (int, float) or type(options[k]) is bool
-                   or options[k] != OPTIONS[k] or
+                   or (options[k] <= 0 if k != "temperature" else not math.isfinite(options[k])) or
                    (k != "temperature" and type(options[k]) is not int) for k in OPTIONS)):
-        raise ValueError("nightly requires exact 32768/8192/temperature 0")
+        raise ValueError("nightly requires positive integer context/output and finite temperature")
     messages = request.get("messages")
     validate_messages(messages)
     metadata = thinking_metadata({"thinking": request.get("native_thinking")})
     if not supports(metadata, request["think"]):
         raise ValueError("requested native mode unsupported in accepted metadata")
-    result = dict(messages=messages, think=request["think"], native_thinking=metadata, options=dict(OPTIONS),
+    result = dict(messages=messages, think=request["think"], native_thinking=metadata, options=dict(options),
                   truncate=False, shift=False)
+    if "model" in request:
+        result["model"] = request["model"]
     if len(json.dumps(result, ensure_ascii=False).encode()) > MAX_INPUT_BYTES:
         raise ValueError("nightly input byte bound exceeded (not a token estimate)")
     return result
 
 
-def native_contract(executor, profile_name, think):
+def native_contract(executor, profile_name, think, model=None, options=None):
     """Only during explicitly dispatched job; metadata calls never infer."""
-    model = PROFILES[profile_name].model
+    model = model or PROFILES[profile_name].model
     tags = executor.tags(timeout_seconds=5)
     rows = tags.get("models") if isinstance(tags, dict) else None
     matches = [r for r in rows if isinstance(r, dict) and r.get("name") == model] if isinstance(rows, list) else []
     digest = matches[0].get("digest") if len(matches) == 1 else None
-    if not isinstance(digest, str) or digest.removeprefix("sha256:") != MODEL_DIGESTS[model]:
+    if not isinstance(digest, str) or re.fullmatch(r"(?:sha256:)?[a-f0-9]{64}", digest) is None or (model in MODEL_DIGESTS and digest.removeprefix("sha256:") != MODEL_DIGESTS[model]):
         raise ValueError("nightly installed model identity mismatch")
     metadata = thinking_metadata(executor.show(model, timeout_seconds=5))
     if not supports(metadata, think):
         raise ValueError("unsupported native thinking mode; off is not a named level")
-    return dict(schema=SCHEMA, model=model, model_digest=MODEL_DIGESTS[model],
-                native_thinking=metadata, think=think, request_options=dict(OPTIONS))
+    return dict(schema=SCHEMA, model=model, model_digest=digest.removeprefix("sha256:"),
+                native_thinking=metadata, think=think, request_options=dict(options or OPTIONS))
 
 
-def resident_context(executor, model):
+def resident_context(executor, model, expected_context=32768, expected_digest=None):
     raw = executor.ps(timeout_seconds=5)
     rows = raw.get("models") if isinstance(raw, dict) else None
     if not isinstance(rows, list) or len(rows) != 1 or not isinstance(rows[0], dict):
@@ -116,8 +117,8 @@ def resident_context(executor, model):
     row = rows[0]
     digest = row.get("digest")
     if (row.get("name") != model or not isinstance(digest, str)
-            or digest.removeprefix("sha256:") != MODEL_DIGESTS[model]
-            or type(row.get("context_length")) is not int or row["context_length"] != OPTIONS["num_ctx"]):
+            or digest.removeprefix("sha256:") != (expected_digest or MODEL_DIGESTS.get(model))
+            or type(row.get("context_length")) is not int or row["context_length"] != expected_context):
         raise ValueError("nightly effective model/context mismatch")
     return row["context_length"]
 
@@ -151,15 +152,18 @@ def project_evidence(value):
     if not isinstance(value, dict) or value.get("schema") != SCHEMA:
         raise ValueError("nightly execution evidence missing")
     model = value.get("model")
-    if (model not in MODEL_DIGESTS or value.get("model_digest") != MODEL_DIGESTS[model]
-            or value.get("request_options") != OPTIONS or value.get("runtime_context_length") != 32768):
+    if (not isinstance(model, str) or not isinstance(value.get("model_digest"), str)
+            or re.fullmatch(r"[a-f0-9]{64}", value["model_digest"]) is None
+            or (model in MODEL_DIGESTS and value["model_digest"] != MODEL_DIGESTS[model])
+            or not isinstance(value.get("request_options"), dict)
+            or value.get("runtime_context_length") != value["request_options"].get("num_ctx")):
         raise ValueError("nightly execution limits/identity mismatch")
     metadata = thinking_metadata({"thinking": value.get("native_thinking")})
     if not supports(metadata, value.get("think")):
         raise ValueError("nightly native mode mismatch")
-    return dict(schema=SCHEMA, model=model, model_digest=MODEL_DIGESTS[model],
-                think=value["think"], native_thinking=metadata, request_options=dict(OPTIONS),
-                runtime_context_length=32768, effective_output_limit=None,
+    return dict(schema=SCHEMA, model=model, model_digest=value["model_digest"],
+                think=value["think"], native_thinking=metadata, request_options=dict(value["request_options"]),
+                runtime_context_length=value["runtime_context_length"], effective_output_limit=None,
                 output_limit_evidence="request num_predict only; native effective ceiling unavailable")
 
 
@@ -179,7 +183,7 @@ def projection(job):
         result[name] = max(0, result[end] - result[start]) if result[start] is not None and result[end] is not None else None
     result["projection"] = SCHEMA
     if isinstance(job.get("result"), dict):
-        result["result"] = project_result(job["result"], PROFILES[job["profile"]].model)
+        result["result"] = project_result(job["result"], job["result"].get("model", PROFILES[job["profile"]].model))
         result["execution_evidence"] = project_evidence(job["result"].get("execution_evidence", job.get("execution_evidence")))
     return result
 

@@ -25,8 +25,8 @@ class Profile:
     default_context: int | None = None
 
 
-# This is deliberately server-owned. Callers can select a profile, never a model
-# or unbounded generation parameters.
+# Server-owned execution defaults and slot/media contracts. Jobs may override
+# the model and token budgets subject to target-model physical validation.
 PROFILES = {
     "nextcloud-eval-qwen-64k-v1": Profile(
         "nextcloud-eval-qwen-64k-v1", "qwen3-vl:30b", 65_536, 16_384, 300,
