@@ -92,10 +92,11 @@ class DailyCapacityTests(unittest.TestCase):
                         "result": {"mode": "hybrid", "schema_version": "freeform-v1"}})
 
     def test_additive_profile_preserves_every_prior_profile(self):
-        added_fields = {'executor', 'occupancy_class', 'occupancy_cohort',
+        added_fields = {'default_context', 'executor', 'occupancy_class', 'occupancy_cohort',
                         'occupancy_max_jobs', 'occupancy_peak_vram_bytes', 'occupancy_evidence'}
         old = {k: {field: value for field, value in asdict(v).items() if field not in added_fields}
-               for k, v in PROFILES.items() if k != daily.PROFILE and k not in VOICE_PROFILE_NAMES}
+               for k, v in PROFILES.items() if k != daily.PROFILE and k not in VOICE_PROFILE_NAMES
+               and k != "stt-whisper" and not k.startswith("uncensored-eval-")}
         self.assertEqual(len(old), 35)
         self.assertEqual(hashlib.sha256(json.dumps(old, sort_keys=True, separators=(",", ":")).encode()).hexdigest(),
                          "71073b5b7f598194832a1d9b57316b78ee64f6607ce79f98105e56ad8ce10147")

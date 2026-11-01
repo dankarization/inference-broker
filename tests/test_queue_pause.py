@@ -96,3 +96,19 @@ class QueuePauseTests(unittest.TestCase):
                 thread.join(5)
             self.assertFalse(thread.is_alive())
         self.assertFalse(self.broker.dashboard()['queue_paused'])
+
+    def test_pause_releases_only_idle_whisper_owner_before_ollama_unload(self):
+        executor = Mock()
+        executor.can_release.return_value = False
+        executor.release_idle.return_value = False
+        self.broker.whisper_executor = executor
+        self.broker.set_executor_fence('warm-owner', 'finished-job')
+        self.broker.set_queue_paused(True)
+        self.assertFalse(self.broker.dispatch_once())
+        executor.release_idle.assert_called_once_with(self.broker)
+        self.backend.unload.assert_not_called()
+        self.assertIsNotNone(self.broker.executor_fence())
+        executor.can_release.return_value = True
+        self.assertFalse(self.broker.dispatch_once())
+        self.assertIsNone(self.broker.executor_fence())
+        self.backend.unload.assert_called_once_with('qwen3.5:9b')

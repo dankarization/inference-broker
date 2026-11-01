@@ -5,6 +5,7 @@ import signal
 from pathlib import Path
 from .adapters import OllamaHTTP, WakeOnLan
 from .http import serve
+from .local_config import load_local_config, mainpc_mac, ollama_url
 from .service import Broker, Dispatcher, SourcePolicy
 
 
@@ -92,6 +93,7 @@ def main() -> None:
         level=os.environ.get("BROKER_LOG_LEVEL", "INFO").upper(),
         format="%(message)s",
     )
+    local_config = load_local_config()
     configured_storage_token = storage_token(
         os.environ.get("BROKER_STORAGE_TOKEN_FILE")
     )
@@ -102,10 +104,13 @@ def main() -> None:
     broker = Broker(
         os.environ.get("BROKER_DB", "broker.sqlite3"),
         OllamaHTTP(
-            os.environ.get("OLLAMA_URL", "http://192.168.2.5:11434"),
+            ollama_url(local_config),
             float(os.environ.get("OLLAMA_TIMEOUT_SECONDS", "300")),
         ),
-        WakeOnLan(os.environ["MAINPC_MAC"]),
+        WakeOnLan(
+            mainpc_mac(local_config),
+            os.environ.get("WOL_BROADCAST", "255.255.255.255"),
+        ),
         wal_autocheckpoint_pages=positive_integer(
             os.environ.get("BROKER_WAL_AUTOCHECKPOINT_PAGES"), 4096,
             "BROKER_WAL_AUTOCHECKPOINT_PAGES",
@@ -127,7 +132,19 @@ def main() -> None:
             "BROKER_MIN_FREE_SPACE_BYTES",
         ),
         source_policy=policy,
+        asr_release_on_llm_demand=dispatch_enabled(os.environ.get('BROKER_ASR_RELEASE_ON_LLM_DEMAND','false')),
     )
+    asr_api = None
+    if os.environ.get("BROKER_ASR_SPOOL"):
+        from .asr import ASRAPI, Spool, WhisperExecutor, WhisperHTTP
+        api_token = storage_token(os.environ.get("BROKER_ASR_TOKEN_FILE"))
+        worker_token = storage_token(os.environ.get("BROKER_WHISPER_TOKEN_FILE"))
+        if not api_token or not worker_token:
+            raise ValueError("ASR and worker token files are required")
+        executor = WhisperExecutor(Spool(os.environ["BROKER_ASR_SPOOL"]),
+                                   WhisperHTTP(os.environ["BROKER_WHISPER_URL"], worker_token))
+        broker.whisper_executor = executor
+        asr_api = ASRAPI(broker, executor, api_token)
     dispatcher = None
     if dispatch_enabled(os.environ.get("BROKER_DISPATCH_ENABLED")):
         allowed_sources = None
@@ -149,6 +166,7 @@ def main() -> None:
         int(os.environ.get("BROKER_PORT", "8088")),
         policy=policy,
         storage_token=configured_storage_token,
+        asr_api=asr_api,
     ).serve_forever()
 
 

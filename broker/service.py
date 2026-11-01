@@ -19,19 +19,20 @@ from .dashboard import history_display, snapshot as dashboard_snapshot
 from .qwen_budget import (PROFILE as QWEN64_PROFILE, CONTRACT as QWEN64_CONTRACT,
                           snapshot as qwen64_snapshot, evidence as qwen64_evidence,
                           project as project_qwen64_evidence)
-from .compat import (CompatibilityError, NEXTCLOUD_PROFILES, GEMMA26_CONTRACT,
+from .compat import (CompatibilityError, UNCENSORED_EVAL_PROFILES, NEXTCLOUD_PROFILES, GEMMA26_CONTRACT,
                      validate_nextcloud_payload,
                      validate_olya_decision_payload,
                      validate_olya_vision_payload,
                      validate_shutterstock_canary_payload,
                      validate_shutterstock_video_payload,
-                     validate_syncopia_memory_payload)
+                     validate_syncopia_memory_payload, validate_uncensored_eval_payload)
 from .profiles import EVALUATION_PROFILE_NAMES, OPENCLAW_PROFILE_NAMES, PROFILES
 from . import nightly_eval, syncopia_daily
 from .profiles import NIGHTLY_PROFILE_NAMES, VOICE_PROFILE_NAMES
 from . import voice
 from .evaluation import normalize_request as normalize_evaluation_request
 from .evaluation import validate_result as validate_evaluation_result
+from .asr import PROFILE as ASR_PROFILE, validate_payload as validate_asr_payload
 from .openclaw import (MAX_OUTSTANDING, normalize_request as normalize_openclaw_request,
                        validate_result as validate_openclaw_result)
 from .policy import (
@@ -277,8 +278,14 @@ class Broker:
                  wal_budget_bytes=DEFAULT_WAL_BUDGET_BYTES,
                  checkpoint_interval_seconds=DEFAULT_CHECKPOINT_INTERVAL_SECONDS,
                  min_free_space_bytes=DEFAULT_MIN_FREE_SPACE_BYTES,
-                 source_policy: SourcePolicy | None = None):
+                 source_policy: SourcePolicy | None = None, whisper_executor=None,
+                 asr_release_on_llm_demand=False):
         self.ollama, self.wol, self.clock, self.lease_seconds = ollama, wol, clock, lease_seconds
+        self.whisper_executor = whisper_executor
+        self._asr_ready_after = 0.0
+        self._idle_fence_probe_after = 0.0
+        self.asr_release_on_llm_demand = bool(asr_release_on_llm_demand)
+        self._asr_release_retry_after = 0.0
         self.database = str(database)
         self.db = sqlite3.connect(self.database, check_same_thread=False)
         self.db.row_factory = sqlite3.Row
@@ -314,6 +321,18 @@ class Broker:
         with self.db:
             self.db.execute("CREATE TABLE IF NOT EXISTS queue_control (id INTEGER PRIMARY KEY CHECK(id=1), paused INTEGER NOT NULL)")
             self.db.execute("INSERT OR IGNORE INTO queue_control VALUES(1,0)")
+            self.db.execute("CREATE TABLE IF NOT EXISTS gpu_executor_fences "
+                            "(resource TEXT PRIMARY KEY, request_id TEXT NOT NULL, job_id TEXT NOT NULL)")
+            self.db.execute("CREATE TABLE IF NOT EXISTS asr_receipts "
+                            "(job_id TEXT PRIMARY KEY, acknowledged_at REAL NOT NULL, external_id TEXT)")
+            if 'external_id' not in {row[1] for row in self.db.execute('PRAGMA table_info(asr_receipts)')}:
+                self.db.execute('ALTER TABLE asr_receipts ADD COLUMN external_id TEXT')
+            self.db.execute("UPDATE asr_receipts SET external_id=COALESCE("
+                            "(SELECT external_id FROM jobs WHERE id=asr_receipts.job_id),"
+                            "(SELECT external_id FROM job_retention_tombstones WHERE job_id=asr_receipts.job_id)) "
+                            "WHERE external_id IS NULL")
+            self.db.execute('CREATE UNIQUE INDEX IF NOT EXISTS asr_receipt_external_id ON asr_receipts(external_id) WHERE external_id IS NOT NULL')
+        self._gpu_fence = self.executor_fence()
         self.storage = StorageManager(
             self.db, self.database, self.lock, self.clock, self._audit,
             lambda: self.source_policy,
@@ -483,11 +502,9 @@ class Broker:
                 "ON jobs(source,external_id) WHERE source='syncopia-telegram-memory' "
                 "AND external_id IS NOT NULL"
             )
-            self.db.execute(
-                "CREATE UNIQUE INDEX IF NOT EXISTS jobs_openclaw_external "
-                "ON jobs(source,external_id) WHERE source='openclaw' "
-                "AND external_id IS NOT NULL"
-            )
+            # Existing ordinary source='openclaw' rows may reuse external_id.
+            # The broker lock serializes new idempotent admissions; do not impose
+            # a retroactive uniqueness constraint on durable legacy history.
 
             self.db.execute(
                 "CREATE UNIQUE INDEX IF NOT EXISTS jobs_nextcloud_external "
@@ -615,6 +632,15 @@ class Broker:
             if expired:
                 self._refresh_health_cache_locked()
             self.completed.notify_all()
+
+    def _ensure_openclaw_capacity_locked(self, additional: int = 1) -> None:
+        outstanding = self.db.execute(
+            "SELECT count(*) FROM jobs WHERE source='openclaw' "
+            "AND state IN ('queued','running','cancel_requested')"
+        ).fetchone()[0]
+        if outstanding + additional > MAX_OUTSTANDING:
+            raise SourceQueueFull("openclaw has 8 outstanding jobs")
+
     def submit(self, profile: str, kind: str, payload: dict, source: str | None = None,
                source_item_id: str | None = None,
                external_id: str | None = None,
@@ -623,8 +649,14 @@ class Broker:
             raise ValueError("unknown profile")
         if kind not in {"chat", "generate", "transcribe"}:
             raise ValueError("kind must be chat, generate or transcribe")
+        if (kind == "transcribe" and profile not in VOICE_PROFILE_NAMES) or profile == ASR_PROFILE or source == ASR_PROFILE:
+            if (kind != "transcribe" or profile != ASR_PROFILE
+                    or (source or profile) != ASR_PROFILE or producer_storage is not None
+                    or self.whisper_executor is None or not external_id):
+                raise ValueError("ASR requires configured executor, dedicated profile and idempotency key")
+            payload = validate_asr_payload(payload)
         source = source or profile
-        if source == "local-voice" or profile in VOICE_PROFILE_NAMES or kind == "transcribe":
+        if source == "local-voice" or profile in VOICE_PROFILE_NAMES:
             if source != "local-voice" or profile not in VOICE_PROFILE_NAMES or kind != "transcribe":
                 raise ValueError("voice requires local-voice source, voice profile and transcribe kind")
             if profile == voice.voice_cpu.PROFILE and (not external_id or not source_item_id):
@@ -715,6 +747,13 @@ class Broker:
                 })
             except CompatibilityError as exc:
                 raise ValueError(str(exc)) from exc
+        if profile in UNCENSORED_EVAL_PROFILES:
+            if source != "uncensored-eval":
+                raise ValueError("uncensored evaluation profiles must use source uncensored-eval")
+            try:
+                payload = validate_uncensored_eval_payload(payload)
+            except CompatibilityError as exc:
+                raise ValueError(str(exc)) from exc
         source_item_id = self._correlation_value("source_item_id", source_item_id)
         external_id = self._correlation_value("external_id", external_id)
         job_id, now = str(uuid.uuid4()), self.clock()
@@ -734,7 +773,7 @@ class Broker:
                         (source, external_id),
                     ).fetchone()
                     tombstone_is_idempotent = tombstone is not None and (
-                        source in {"olya-vision", "olya-decision", "syncopia-telegram-memory", "openclaw", "nextcloud", "pilot-mainpc", "local-voice", nightly_eval.SOURCE}
+                        source in {"olya-vision", "olya-decision", "syncopia-telegram-memory", "openclaw", "nextcloud", "pilot-mainpc", "local-voice", nightly_eval.SOURCE, ASR_PROFILE}
                         or producer_storage is not None
                         or tombstone["producer_attempt_id"] is not None
                     )
@@ -763,7 +802,7 @@ class Broker:
                         or existing["result_storage_mode"] != "broker_temporary"
                     )
                     if (
-                        source in {"olya-vision", "olya-decision", "syncopia-telegram-memory", "openclaw", "nextcloud", "pilot-mainpc", "local-voice", nightly_eval.SOURCE}
+                        source in {"olya-vision", "olya-decision", "syncopia-telegram-memory", "openclaw", "nextcloud", "pilot-mainpc", "local-voice", nightly_eval.SOURCE, ASR_PROFILE}
                         or producer_storage is not None
                         or existing_has_producer_storage
                     ):
@@ -790,7 +829,7 @@ class Broker:
                                 raise ValueError(
                                     "producer storage idempotency conflict for existing correlation"
                                 )
-                        if source in {"openclaw", "nextcloud", "pilot-mainpc", "local-voice", nightly_eval.SOURCE} and (
+                        if source in {"openclaw", "nextcloud", "pilot-mainpc", "local-voice", nightly_eval.SOURCE, ASR_PROFILE} and (
                             existing["profile"] != profile or existing["kind"] != kind
                             or existing["input_hash"] != content_evidence(payload)[0]
                         ):
@@ -854,11 +893,13 @@ class Broker:
                 # Rejection itself is durable observability, despite aborting admission.
                 self.db.commit()
                 raise SourceAdmissionBlocked(source)
-            if source == "openclaw" and self.db.execute(
-                "SELECT count(*) FROM jobs WHERE source='openclaw' "
-                "AND state IN ('queued','running','cancel_requested')"
-            ).fetchone()[0] >= MAX_OUTSTANDING:
-                raise SourceQueueFull("openclaw has 8 outstanding jobs")
+            if source == ASR_PROFILE:
+                count = self.db.execute("SELECT count(*) FROM jobs WHERE source=? AND state IN "
+                                        "('queued','running','cancel_requested')", (ASR_PROFILE,)).fetchone()[0]
+                if count >= 32:
+                    raise SourceQueueFull("ASR queue full")
+            if source == "openclaw":
+                self._ensure_openclaw_capacity_locked()
             self.db.execute(
                 "INSERT INTO jobs(id,profile,kind,source,payload,state,created,"
                 "queued_at,source_item_id,external_id,input_storage_mode,input_ref,input_hash,"
@@ -956,6 +997,8 @@ class Broker:
                 raise StorageAuthorizationRequired
             if any(row["compaction_state"] != "full" for row in rows):
                 raise ValueError("one or more failed jobs have expired retry bodies")
+            if source == "openclaw" and rows:
+                self._ensure_openclaw_capacity_locked(len(rows))
             for row in rows:
                 attempt_no = row["attempt_count"] or None
                 self._audit(
@@ -1165,6 +1208,14 @@ class Broker:
                 raise ValueError("job retry retention has expired")
             if self.source_policy is not None and not self.source_policy.admission_allowed(row["source"]):
                 raise SourceAdmissionBlocked(row["source"])
+            if row["source"] == "openclaw":
+                self._ensure_openclaw_capacity_locked()
+            if row['source'] == ASR_PROFILE:
+                if self.source_policy is not None and not self.source_policy.admission_allowed(ASR_PROFILE):
+                    raise SourceAdmissionBlocked(ASR_PROFILE)
+                if self.db.execute("SELECT count(*) FROM jobs WHERE source=? AND state IN "
+                                   "('queued','running','cancel_requested')", (ASR_PROFILE,)).fetchone()[0] >= 32:
+                    raise SourceQueueFull('ASR queue full')
             now = self.clock()
             self._audit(
                 "job.retry_requested", job_id=job_id, source=row["source"],
@@ -1913,6 +1964,9 @@ class Broker:
             ).fetchone():
                 return
             try:
+                if self.executor_fence() and not self.reconcile_executor_fence():
+                    if not self.whisper_executor or not self.whisper_executor.release_idle(self):
+                        return
                 for model in self.ollama.ps().get("models", []):
                     self.ollama.unload(model["name"])
                 self._loaded_models_cache = []
@@ -1920,30 +1974,138 @@ class Broker:
                 # Backend outages must not kill the dispatcher; retry next tick.
                 LOGGER.warning("Paused queue GPU unload failed; will retry", exc_info=True)
 
-    def dispatch_once(self, allowed_sources: frozenset[str] | None = None, policy: SourcePolicy | None = None, drain_check: bool = False) -> bool:
-        """Claim the next eligible job, or report that none can start.
-
-        ``drain_check=True`` turns this into a readiness probe for the one-shot
-        drain: it claims nothing and returns True while an attempt is still in
-        flight, so the caller knows to keep the drain flag until it clears.
-        """
+    def set_executor_fence(self, request_id, job_id):
         with self.lock, self.db:
-            occupants = [r["profile"] for r in self.db.execute(
-                "SELECT profile FROM jobs WHERE state IN ('running','cancel_requested')"
-            )]
+            self.db.execute("INSERT INTO gpu_executor_fences VALUES('mainpc-gpu',?,?)",
+                            (request_id, job_id))
+            self._gpu_fence = {"request_id": request_id, "job_id": job_id}
+
+    def replace_executor_fence(self, request_id, job_id, expected_request_id):
+        """Move an existing warm Whisper ownership fence to the next job."""
+        with self.lock, self.db:
+            cursor = self.db.execute(
+                "UPDATE gpu_executor_fences SET request_id=?, job_id=? "
+                "WHERE resource='mainpc-gpu' AND request_id=?",
+                (request_id, job_id, expected_request_id),
+            )
+            if cursor.rowcount != 1:
+                raise RuntimeError("Whisper warm ownership fence missing")
+            self._gpu_fence = {"request_id": request_id, "job_id": job_id}
+
+    def clear_executor_fence(self, request_id):
+        with self.lock, self.db:
+            self.db.execute("DELETE FROM gpu_executor_fences WHERE resource='mainpc-gpu' AND request_id=?",
+                            (request_id,))
+            self._gpu_fence = self.executor_fence()
+
+    def executor_fence(self):
+        with self.lock:
+            row = self.db.execute("SELECT * FROM gpu_executor_fences WHERE resource='mainpc-gpu'").fetchone()
+            return dict(row) if row else None
+
+    def reconcile_executor_fence(self):
+        fence = self.executor_fence()
+        if fence is None:
+            return True
+        if self.whisper_executor and self.whisper_executor.can_release(fence["request_id"]):
+            self.clear_executor_fence(fence["request_id"])
+            return self.executor_fence() is None
+        return False
+
+    def dispatch_once(self, allowed_sources: frozenset[str] | None = None, policy: SourcePolicy | None = None, drain_check: bool = False) -> bool:
+        with self.lock:
             if drain_check:
-                return bool(occupants)
-            if occupants:
-                return False
+                return bool(self.db.execute("SELECT 1 FROM jobs WHERE state IN ('running','cancel_requested') LIMIT 1").fetchone())
             if self.queue_paused():
                 self._unload_if_paused()
                 return False
+            if self.db.execute("SELECT 1 FROM jobs WHERE state IN ('running','cancel_requested') LIMIT 1").fetchone():
+                return False
+            ready_sources = frozenset(row[0] for row in self.db.execute(
+                "SELECT DISTINCT source FROM jobs WHERE state='queued'"))
+        permitted = (allowed_sources if allowed_sources is not None else
+                     policy.enabled_sources() if policy is not None else ready_sources)
+        if not ready_sources.intersection(permitted):
+            # No dispatch is possible. Do not poll an otherwise idle worker at
+            # the scheduler tick rate; reconcile a real pending fence at most
+            # every five seconds so an idle release still becomes visible.
+            if self.executor_fence() and time.monotonic() >= self._idle_fence_probe_after:
+                self._idle_fence_probe_after = time.monotonic() + 5.0
+                self.reconcile_executor_fence()
+            return False
+        fence = self.executor_fence()
+        if (fence is None and self.whisper_executor
+                and self.whisper_executor.allocation_pending()):
+            # A resident Whisper model without a durable broker owner is
+            # fail-closed: never schedule ASR or Ollama concurrently.
+            return False
+        fence_blocked = not self.reconcile_executor_fence()
+        fence = self.executor_fence()
+        if (fence_blocked and self.asr_release_on_llm_demand
+                and (ready_sources & permitted) - {ASR_PROFILE}
+                and time.monotonic() >= self._asr_release_retry_after):
+            # Explicit opt-in policy: yield only our idle, exact fenced owner.
+            # Never interrupt inference or unload an unrelated Ollama model.
+            self._asr_release_retry_after = time.monotonic() + 5.0
+            try:
+                if self.whisper_executor and self.whisper_executor.release_idle(self):
+                    fence_blocked = False
+                    fence = self.executor_fence()
+            except Exception as error:
+                LOGGER.warning('ASR idle handoff unconfirmed (%s)', type(error).__name__)
+        if fence_blocked:
+            # A warm Whisper model owns the GPU but can safely serve another
+            # queued Whisper job. Non-ASR work remains blocked until the
+            # worker's idle monitor confirms unload and the fence clears.
+            warm_asr = bool(
+                self.whisper_executor
+                and self.whisper_executor.can_reuse(self.executor_fence())
+                and self.db.execute(
+                    "SELECT 1 FROM jobs WHERE source=? AND state='queued' LIMIT 1",
+                    (ASR_PROFILE,),
+                ).fetchone()
+            )
+            if not warm_asr:
+                return False
+            # Filter before scheduling: an older LLM head cannot prevent safe
+            # warm ASR reuse while that LLM remains blocked by the fence.
+            allowed_sources = permitted & {ASR_PROFILE}
+        # Probe outside both the broker mutex and SQLite transaction. Slow
+        # private HTTP endpoints must not block submissions/status/cancel.
+        with self.lock:
+            queued_sources = frozenset(row[0] for row in self.db.execute(
+                "SELECT DISTINCT source FROM jobs WHERE state='queued'"))
+        if (ASR_PROFILE in queued_sources and ASR_PROFILE in permitted
+                and (policy is None or ASR_PROFILE in policy.enabled_sources())):
+            asr_ready = False
+            if self.whisper_executor and time.monotonic() >= self._asr_ready_after:
+                asr_ready = self.whisper_executor.available(self.ollama)
+                if not asr_ready:
+                    self._asr_ready_after = time.monotonic() + 5.0
+                    try:
+                        self.wol.wake()
+                    except (OSError, ValueError) as error:
+                        # A transient broadcast failure must not terminate the
+                        # dispatcher or charge an execution attempt. Keep the
+                        # same backoff and let ready non-ASR lanes proceed.
+                        LOGGER.warning("ASR wake attempt failed (%s)", type(error).__name__)
+            if not asr_ready:
+                permitted = (allowed_sources if allowed_sources is not None else
+                             policy.enabled_sources() if policy is not None else queued_sources)
+                allowed_sources = permitted - {ASR_PROFILE}
+        with self.lock, self.db:
+            if self.queue_paused():
+                return False
+            if self.executor_fence() != fence:
+                return False
+            if self.db.execute("SELECT 1 FROM jobs WHERE state IN ('running','cancel_requested')").fetchone():
+                return False
             row = self._next(allowed_sources, policy)
             if not row: return False
-            # Hook for the measured occupancy policy; the single-worker guard
-            # above remains until concurrent execution/accounting is implemented.
-            from .occupancy import can_admit
-            if not can_admit(row["profile"], occupants, PROFILES):
+            if fence_blocked and row["source"] != ASR_PROFILE:
+                # _next may select a non-ASR lane even when an ASR job also
+                # exists; warm ownership must never let that job bypass the
+                # unresolved GPU fence.
                 return False
             now = self.clock()
             attempt_no = int(row["attempt_count"] or 0) + 1
@@ -2008,7 +2170,7 @@ class Broker:
             with self.lock, self.db:
                 finished = self.clock()
                 error_summary = ("nightly execution failed; no raw executor detail retained"
-                                 if row["source"] == nightly_eval.SOURCE else bounded_error_summary(exc))
+                                 if row["source"] == nightly_eval.SOURCE else "ASR execution failed (" + type(exc).__name__ + ")" if execution_row["kind"] == "transcribe" else bounded_error_summary(exc))
                 self._complete_time_batch(row["id"], finished)
                 self.db.execute("UPDATE jobs SET state='failed',finished=?,lease_until=NULL,error=? WHERE id=?", (finished, error_summary, row["id"]))
                 self.storage.record_terminal_retention(
@@ -2035,6 +2197,12 @@ class Broker:
         return True
 
     def _execute(self, row):
+        if row["profile"] == ASR_PROFILE:
+            if self.whisper_executor is None:
+                raise RuntimeError("ASR executor disabled")
+            result = self.whisper_executor.run(self, row)
+            self._finish_execution(row, result, "Whisper transcription completed; GPU fence tracked independently")
+            return
         profile = PROFILES[row["profile"]]
         if row["profile"] == syncopia_daily.PROFILE:
             payload = json.loads(row["payload"])
@@ -2097,7 +2265,8 @@ class Broker:
         qwen64_before = qwen64_snapshot(self.ollama) if row["profile"] == QWEN64_PROFILE else None
         payload = json.loads(row["payload"])
         options = dict(payload.get("options", {}))
-        options["num_ctx"] = min(int(options.get("num_ctx", profile.max_context)), profile.max_context)
+        default_context = profile.default_context or profile.max_context
+        options["num_ctx"] = min(int(options.get("num_ctx", default_context)), profile.max_context)
         options["num_predict"] = min(int(options.get("num_predict", profile.max_output)), profile.max_output)
         request = {k: v for k, v in payload.items() if k not in {"model", "keep_alive"}}
         if nightly_evidence is not None:
@@ -2158,12 +2327,23 @@ class Broker:
             self._refresh_health_cache_locked()
             self.completed.notify_all()
 
-    def wait_for_terminal(self, job_id: str, timeout_seconds: float) -> dict | None:
-        """Wait for a persisted terminal state; executor dispatch remains external."""
+    def wait_for_terminal(
+        self, job_id: str, timeout_seconds: float, *, hydrate_pending: bool = True,
+    ) -> dict | None:
+        """Wait for a persisted terminal state; optionally poll state without payload."""
         deadline = time.monotonic() + timeout_seconds
         with self.completed:
             while True:
-                job = self.status(job_id)
+                if hydrate_pending:
+                    job = self.status(job_id)
+                else:
+                    row = self.db.execute(
+                        "SELECT state FROM jobs WHERE id=?", (job_id,)
+                    ).fetchone()
+                    state = row["state"] if row else None
+                    job = self.status(job_id) if state is None or state in {
+                        "completed", "failed", "cancelled"
+                    } else {"id": job_id, "state": state}
                 if job is None or job["state"] in {"completed", "failed", "cancelled"}:
                     return job
                 remaining = deadline - time.monotonic()
@@ -2196,7 +2376,14 @@ class Broker:
         # Do not touch SQLite or wait for the dispatcher here.  Assignment of
         # the small immutable replacement mapping is atomic under CPython, so
         # this local probe remains available while a large DB transaction runs.
-        return dict(self._health_cache)
+        status = dict(self._health_cache)
+        fence = self._gpu_fence
+        if fence:
+            status["gpu_executor"] = "awaiting_worker_release"
+            status["blocked_job_id"] = fence["job_id"]
+            if status["active_job_id"] is None:
+                status["status"] = "blocked"
+        return status
 
 
 class Dispatcher(threading.Thread):

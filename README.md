@@ -54,419 +54,174 @@ Active jobs, Forecast и History. Данные обновляются в фон�
 
 ![Inference broker queue: dashboard при 1920 px](docs/images/dashboard-1920.png)
 
-## Запуск и API
 
-Локальный запуск (dispatch настраивается отдельно):
+[English](#english) · [Русский](#russian)
 
-```bash
-MAINPC_MAC=2c:f0:5d:74:6a:44 python -m broker
+<a id="english"></a>
+## English
+
+A local admission and scheduling service for one Ollama GPU executor. It keeps jobs in a durable SQLite WAL queue, runs at most one inference job at a time, and keeps model selection and limits on the server side. It does not replace Ollama or route cloud workloads.
+
+An optional [Whisper executor](docs/WHISPER_EXECUTOR.md) shares this GPU queue
+through a separately authenticated ASR API. It is disabled by default and requires
+the matching worker, private artifact storage, and explicit deployment configuration.
+
+<a id="architecture"></a>
+### Architecture
+
+```mermaid
+flowchart LR
+    C["Local producers"] --> A["HTTP admission API"]
+    A --> Q[("SQLite WAL<br/>jobs, attempts, audit")]
+    Q --> S["Dispatcher<br/>source policy + FIFO heads"]
+    P["Runtime source policy<br/>dispatch / admission / weight"] --> A
+    P --> S
+    S -->|"one lease at a time"| W["Wake-on-LAN + model readiness"]
+    W --> O["Ollama executor<br/>one GPU"]
+    O -->|"result / terminal state"| Q
+    Q --> V["Local dashboard + read-only APIs"]
 ```
 
-По умолчанию сервер слушает localhost и не изменяет конфигурации OpenClaw,
-Ollama, Shutterstock, M101 или MAIN-PC.
+The broker and SQLite queue live on an always-on host; the Ollama executor may sleep. Wake-on-LAN, model readiness, unload/load, and inference happen only when dispatch is enabled and an eligible job is selected. `GET /healthz` does not contact the executor.
 
-### Локальный user-service: admission без dispatch
+With a runtime source policy, the scheduler takes the oldest eligible job from each source, groups ready source/model lanes into contiguous model-aware batches, and allocates a recurring 60-minute execution-time horizon in **inverse proportion** to their positive weights. Jobs are non-preemptive, so a final job may exceed its lane's budget. A source that becomes ready mid-cycle receives a share of the remaining horizon. Without a policy, eligible jobs use global FIFO.
 
-В `systemd/ollama-inference-broker.service` намеренно зафиксированы loopback
-`127.0.0.1:8088`, локальный SQLite в `~/.local/state/ollama-inference-broker`
-и `BROKER_DISPATCH_ENABLED=false`. В таком режиме service переживает сбой,
-принимает и устойчиво сохраняет jobs, но не запускает dispatcher: WOL, `/api/ps`
-и любой запрос к MAIN-PC/Ollama невозможны. Это безопасный deployment state до
-отдельного разрешения на canary dispatch.
+### Local start (admission only)
+
+Python 3.11+ is required. Copy `config/local.example.json` to `config/local.json` in this checkout, set `ollama_url` to the executor's reachable HTTP origin and `mainpc_mac` to its Wake-on-LAN MAC, then restrict the file to the owner. The broker reads this untracked file at startup, even in admission-only mode. No wake or Ollama request is made while dispatch is disabled. There is no localhost fallback for the executor.
 
 ```bash
-install -d -m 0700 ~/.local/state/ollama-inference-broker
-python3 -c 'import pathlib,secrets; pathlib.Path.home().joinpath(".local/state/ollama-inference-broker/storage-api.token").open("x",encoding="utf-8").write(secrets.token_urlsafe(48)+"\n")'
-chmod 0600 ~/.local/state/ollama-inference-broker/storage-api.token
-install -D -m 0644 systemd/ollama-inference-broker.service \
-  ~/.config/systemd/user/ollama-inference-broker.service
-systemctl --user daemon-reload
-systemctl --user enable --now ollama-inference-broker.service
+cp config/local.example.json config/local.json
+# Edit config/local.json for your executor before starting.
+chmod 600 config/local.json
+BROKER_LOCAL_CONFIG=./config/local.json BROKER_DISPATCH_ENABLED=false BROKER_DB=./broker.sqlite3 python3 -m broker
+```
+
+In another terminal:
+
+```bash
 curl --fail http://127.0.0.1:8088/healthz
 ```
 
-Rollback: `systemctl --user disable --now ollama-inference-broker.service`.
-Удаление SQLite state не требуется для остановки и должно выполняться только
-после отдельной проверки queued jobs.
+The API binds to `127.0.0.1:8088` by default. Keep it on a trusted local interface: legacy job APIs are not a public authentication boundary. The supplied systemd units are templates: create owner-only `~/.config/ollama-inference-broker/broker.env` (and `report.env` if using the report timer) for other deployment settings before installing them. For deployment, place the same JSON at `~/.config/ollama-inference-broker/local.json` with owner-only permissions: both broker and reporter read this stable path by default, independently of their release directories. `BROKER_LOCAL_CONFIG` selects another file for development. `OLLAMA_URL` and `MAINPC_MAC` override its broker values, and `BROKER_OLLAMA_URL` overrides its reporter URL. Set `WOL_BROADCAST` separately if needed. Dispatch is disabled in the broker template until explicitly enabled.
 
-- `POST /v1/jobs` принимает `{ "profile":"interactive", "kind":"chat|generate", "payload":{...} }` и возвращает сохранённое задание (`202`).
-- `GET /v1/jobs/{id}`, `POST /v1/jobs/{id}/cancel` и `GET /v1/metrics` дают доступ к жизненному циклу и данным MAIN-PC `/api/ps`. Для producer-storage jobs чтение, cancel и retry требуют owner-only storage bearer token; legacy jobs сохраняют прежний контракт.
-- `GET /v1/analytics`, `/v1/audit-events`, `/v1/jobs/{id}/attempts` и
-  `/v1/correlations` дают payload-free историю очереди, попыток, correlation и
-  scheduler fairness. Определения метрик и пример 8:3 — в
-  [docs/ANALYTICS.md](docs/ANALYTICS.md).
-- `GET /dashboard` — локальная HTML-панель очереди: данные обновляются в фоне
-  каждые 30 секунд (fetch `/v1/dashboard`, патч DOM без перезагрузки страницы;
-  таймер на паузе при скрытой вкладке, сортировка и скролл сохраняются),
-  ETag/304 для неизменившегося состояния и без payload,
-  результатов и ошибок. HTML/CSS/JS загружаются с диска и обновляются без рестарта
-  процесса: [архитектура и обновление UI](docs/DASHBOARD.md). Таблицы рисуются
-  в браузере из `/v1/dashboard`. Она показывает policy (`enabled`, `weight`),
-  состояния, lease, retry/delay, активные jobs, completed total/1h/24h и
-  read-only **Forecast** под активными jobs: текущую модель и список следующих
-  десяти выборов в непрерывных model batches с обратными долями Weight,
-  с Source, Profile и Model. History показывает Profile, Model и Model turn:
-  время от started до finished завершённого задания, включая подготовку модели,
-  но без ожидания в очереди. Для cancelled, failed и незапущенных заданий
-  длительность не заявляется (—). Длительности выводятся единообразно:
-  `mm:ss`, от часа — `h:mm:ss` (например `00:42`, `02:30`, `1:05:00`),
-  одинаково в Python и в браузере. Finished на всех страницах History имеет
-  единый формат `DD/MM/YYYY, HH:MM:SS` в Asia/Tbilisi. Forecast помечен как
-  contingent: он меняется при новых admissions, завершениях и hot reload
-  policy, и никогда не мутирует очередь/leases/аккумуляторы. Машинный
-  payload-free снимок доступен как `GET /v1/dashboard` (тот же `forecast`),
-  отдельно — `GET /v1/forecast`. После запуска
-  broker откройте `http://127.0.0.1:8088/dashboard` (или его настроенный host
-  и port). Снимок содержит `observation.state`: `live` — текущие данные,
-  `stale` — последний успешный снимок при временно недоступном observer-read,
-  `unavailable` — HTTP 503 без вымышленных нулевых счётчиков. `dead` всегда
-  ноль: в текущей модели broker исчерпанная работа —
-  terminal `failed`, отдельного state `dead` нет.
-- `GET /v1/forecast` — read-only проекция ближайших выборов scheduler
-  (bounded, по умолчанию 10, максимум 20): текущая модель и следующие
-  selections с source/model/weight/mode/reason/wait. Проекция
-  не пишет в БД и не меняет состояние scheduler; при занятой БД возвращает
-  `unavailable` вместо вымышленной пустоты.
-- `GET /healthz` проверяет только локальное состояние broker: очередь, активную lease и timestamp. Он не отправляет WOL и не обращается к MAIN-PC/Ollama.
-- `/api/chat` и `/api/generate` реализуют локальный compatibility contract:
-  обязателен server-side `profile`, а `stream=true` возвращает NDJSON admission
-  frame. Endpoint только ставит job в очередь и не dispatch-ит его; реальный
-  model output не обещается до отдельной integration/canary фазы.
-- `POST /v1/shutterstock-canary/generate` — отдельный синхронный VLM contract
-  для canary: принимает совместимые с Ollama `prompt`, base64 `images` и JSON
-  Schema в `format`, а после terminal completion возвращает исходный JSON-ответ
-  Ollama плюс `broker.job_id` для наблюдения job lifecycle. Он не запускает dispatcher сам: без отдельного allowlist job остаётся
-  durable `queued`, а HTTP-запрос завершится timeout.
+### Installing the systemd templates
 
-Сервер сам выбирает профиль, модель, контекст, лимит вывода и keepalive.
-Переданные caller значения `model`, `num_ctx`, `num_predict` и `keep_alive` не
-могут повысить эти лимиты. SQLite использует WAL. Без source policy dispatch
-выполняется в глобальном FIFO-порядке; с policy — по обратным временным долям weight источника и FIFO
-внутри выбранного источника.
+Both units set `WorkingDirectory=%h/.local/share/ollama-inference-broker`. Put a checkout at **that exact path** before enabling them; copying only the unit files will fail with systemd `CHDIR`. For example, on a fresh host:
 
-Каждое принятое задание и scheduler decision сохраняются в durable
-audit/attempt history. `POST /v1/jobs` опционально принимает
-`source_item_id`/`external_id`; private payload и значения correlation не
-копируются в structured logs. `external_id` остаётся idempotency key только для
-специализированных Olya/Syncopia contracts и producer-storage jobs; остальные
-legacy sources могут независимо принять несколько jobs с одним значением.
-Существующие request/response поля не удалены.
+```bash
+mkdir -p "$HOME/.local/share" "$HOME/.config/ollama-inference-broker" "$HOME/.config/systemd/user"
+git clone https://github.com/dankarization/ollama-inference-broker.git "$HOME/.local/share/ollama-inference-broker"
+cd "$HOME/.local/share/ollama-inference-broker"
+cp config/local.example.json "$HOME/.config/ollama-inference-broker/local.json"
+# Edit the executor URL and MAC in local.json, then restrict it to the owner.
+chmod 600 "$HOME/.config/ollama-inference-broker/local.json"
+touch "$HOME/.config/ollama-inference-broker/broker.env"
+chmod 600 "$HOME/.config/ollama-inference-broker/broker.env"
+cp systemd/ollama-inference-broker*.service systemd/ollama-inference-broker-report.timer "$HOME/.config/systemd/user/"
+systemctl --user daemon-reload
+```
 
-Рабочий source `shutterstock` намеренно не имеет broker profile и не может
-получить lease. Новый `shutterstock-canary` — отдельное имя source, а не
-переименование или включение рабочего Shutterstock. Он использует
-`qwen3-vl:30b` с максимум четырьмя изображениями, суммарно 8 MiB decoded,
-JSON Schema до 16 KiB, concurrency `1`, не чаще одного job в 60 секунд и
-server-side timeout 300 секунд. `shutterstock-video` — отдельный локальный workload на
-`nemotron3:33b`. Ключ `olya` — только имя источника, а не интеграция. Job
-admission не принимает scheduling-параметров: source weight задаётся только
-runtime policy.
+The report timer is optional. Before enabling it, copy `config/report.env.example` to `~/.config/ollama-inference-broker/report.env`, replace the chat and thread placeholders, and `chmod 600` the file. `OPENCLAW_CONFIG_PATH` defaults to `~/.openclaw/openclaw.json`; it must point to an existing OpenClaw JSON with `channels.telegram.accounts.<account>.botToken` (or `token`). `BROKER_REPORT_TELEGRAM_ACCOUNT` defaults to `default`. The report unit reads `broker.env` before `report.env`, so it uses the broker's `BROKER_SOURCES_POLICY` path to display scheduler weights; set the optional `BROKER_SOURCES_POLICY` in `report.env` only if the reporter needs a different path. The example uses the shared `local.json` for the Ollama health URL; `BROKER_OLLAMA_URL` is an optional reporter-only override. Never put the bot token in `report.env` or Git.
 
-Для Ollama при смене модели broker будит MAIN-PC, читает `/api/ps`, выгружает несовместимую
-модель, запрашивает и проверяет готовность целевой модели и только затем
-запускает задание. Просроченная running lease возвращается в очередь при
-перезапуске broker.
+### Key contracts
 
-`OLLAMA_TIMEOUT_SECONDS` задаёт предел одного вызова Ollama; production unit
-использует 300 секунд, чтобы холодная загрузка большой модели не превращалась в
-ложную terminal failure через короткий HTTP timeout.
+- The opt-in OpenClaw native chat route waits on the same durable queue and returns an Ollama-compatible response; it does not change legacy admission-only endpoints. See [OpenClaw route](docs/OPENCLAW_ROUTE.md) for its wire contract and rollout boundary.
 
-Если `BROKER_DISPATCH_ENABLED=true`, обязательно задаётся непустой
-`BROKER_DISPATCH_SOURCES` с точными именами источников через запятую. Dispatcher
-берёт lease только у заданий из этого allowlist; все остальные задания остаются
-durable `queued`. Это позволяет включить обратимый pilot без миграции либо
-активации других callers.
+- `POST /v1/jobs` durably admits a server-owned profile and returns HTTP 202. `GET /v1/jobs/{id}` and `POST /v1/jobs/{id}/cancel` expose the job lifecycle.
+- `/api/chat` and `/api/generate` are admission-compatible endpoints, **not** direct Ollama streaming proxies. A streaming request returns an admission frame, not immediate model output.
+- `GET /dashboard`, `GET /v1/dashboard`, `GET /v1/forecast`, `GET /v1/analytics`, and `GET /v1/audit-events` expose local operational views. Forecast is read-only and contingent, with 10 selections by default (maximum 20). Observer failure is reported as stale or unavailable, not as invented zeroes.
+- `BROKER_DISPATCH_ENABLED=true` starts the dispatcher. Without `BROKER_SOURCES_POLICY`, an explicit `BROKER_DISPATCH_SOURCES` allowlist is required. With a policy, enabled sources form the dispatch allowlist.
+- A policy source's `enabled=false` pauses new dispatch leases; `admission_allowed=false` rejects new jobs with HTTP 403 before insertion. The source controls API supports dispatch pause/resume, admission allow/block, weight changes, and confirmed bulk cancellation of queued or retry of failed jobs. Existing running work is not preempted.
+- Producer-owned storage is opt-in per source and admission. Its status, receipt, and mutation APIs require an owner-only bearer token; legacy jobs keep their previous contract. Compaction requires explicit guards and a matching durable ACK. See [producer storage](docs/PRODUCER_STORAGE.md) and [analytics](docs/ANALYTICS.md).
 
-### Runtime source policy (веса без рестарта)
-
-Вместо статичного env-allowlist можно включить weighted scheduler через
-`BROKER_SOURCES_POLICY=<path.json>`. Файл читается на каждом dispatch-шаге и
-перечитывается при изменении mtime (атомарная замена temp+rename), поэтому
-добавление/удаление источников и изменение весов не требуют остановки
-сервиса или drain очереди; queued/in-flight jobs остаются durable.
+An illustrative **non-production** policy:
 
 ```json
 {
   "version": 1,
   "sources": {
-    "shutterstock-video": {"enabled": true, "admission_allowed": true, "weight": 2.0},
-    "pilot-mainpc":      {"enabled": true, "admission_allowed": true, "weight": 1.0}
+    "interactive": {"enabled": true, "admission_allowed": true, "weight": 2},
+    "cron": {"enabled": true, "admission_allowed": true, "weight": 1}
   }
 }
 ```
 
-При наличии policy GPU execution time делится в 60-минутном горизонте
-пропорционально `1 / weight`: `1` важнее `7`, получает большую долю и
-первый batch. Готовые модели обслуживаются непрерывными batches, внутри
-source — FIFO; waiting time не повышает долю. Running и cancel-requested
-job не прерываются. При новом меньшем weight batch перестраивается:
-совместимая модель — следующий dispatch, другая — после одного оставшегося
-turn текущей модели (или сразу, если текущая очередь пуста). Больший weight
-не вытесняет уже ожидающую меньшую долю. Hard eligibility не меняется.
+Only configured, eligible sources dispatch when a policy is active. Configure the executor address and secrets outside this example. For a lossless dispatcher drain, use `systemctl --user reload ollama-inference-broker.service`: the unit signals only the broker MainPID. Do not use `systemctl --user kill -s SIGUSR1 ollama-inference-broker.service`, which can signal an active inference child process.
 
-### Safe dispatcher drain
-
-Для lossless drain dispatcher используйте только:
+### Validation
 
 ```bash
-systemctl --user reload ollama-inference-broker.service
+python3 -m unittest discover -s tests -v
 ```
 
-`ExecReload` посылает `SIGUSR1` исключительно broker `MainPID`: новые claims
-останавливаются, HTTP admissions и текущий inference продолжаются до обычного
-завершения. Не используйте `systemctl --user kill -s SIGUSR1 …`: по умолчанию
-эта команда сигнализирует весь service cgroup, включая дочерний `curl` активного
-inference, и может прервать job.
+Tests use fakes for the executor and Wake-on-LAN; they do not start live inference. See [ROADMAP.md](ROADMAP.md) for rollout boundaries.
 
-Drain одноразовый и самовосстанавливающийся: первый цикл, не обнаруживший
-in-flight попытки, сам возобновляет dispatch и пишет событие
-`dispatcher.resumed`. Перезапускать сервис для возврата к работе не нужно —
-это устраняет прежний сбой, после которого `SIGUSR1` останавливал диспетчер
-до рестарта процесса.
+---
 
-Hard eligibility по-прежнему включает enabled, per-source concurrency и
-min-interval backpressure; меньший weight не обходит эти ограничения.
-Итоговый allowlist берётся из `enabled`-записей файла, а не из env.
-`GET /v1/sources` отдаёт текущий снапшот политики (без секретов). При
-отсутствии policy поведение — env-allowlist + global FIFO.
+<a id="russian"></a>
+## Русский
 
-### Runtime controls: dispatch и admission — разные состояния
+Локальный сервис приёма и планирования заданий для одного GPU-исполнителя Ollama. Задания сохраняются в SQLite WAL, одновременно исполняется не более одного задания, а выбор модели и ограничения задаются сервером. Брокер не заменяет Ollama и не маршрутизирует облачные нагрузки.
 
-`enabled=false` означает **dispatch pause**: уже queued jobs не меняются,
-текущий running job не прерывается, но после его завершения source не получает
-новую lease. `POST /v1/sources/{source}/dispatch` принимает только
-`{"paused":true|false}`; старый `POST .../enabled` сохраняется без изменения
-контракта. Resume применяется на следующем scheduler tick без рестарта.
+[Схема архитектуры](#architecture) показывает путь от HTTP API через устойчивую очередь и диспетчер к пробуждаемому GPU-исполнителю. Брокер и очередь работают на постоянно включённом хосте. WOL, проверка готовности и инференс происходят только после включения dispatch и выбора допустимого задания. `GET /healthz` не обращается к исполнителю.
 
-`admission_allowed=false` означает **admission block**: все HTTP endpoints,
-которые создают job для этого source, отклоняются до durable job insert с HTTP
-`403` и `error.code="source_admission_blocked"`. Существующая очередь и running
-job не меняются. Поле обратно совместимо: если `admission_allowed` отсутствует
-(или source отсутствует в policy), admission разрешён. Управление:
-`POST /v1/sources/{source}/admission` с `{"allowed":true|false}`.
+С runtime policy планировщик берёт старейшее допустимое задание каждого source, собирает непрерывные группы по целевой модели и делит повторяющийся 60-минутный бюджет **времени исполнения** прямо пропорционально положительным весам. Задания не прерываются на границе бюджета; вновь доступный source получает долю оставшегося времени. Без policy действует глобальный FIFO.
 
-Bulk operations требуют точное имя configured source и серверное подтверждение
-`{"confirm":true}`:
+### Локальный запуск без dispatch
 
-- `POST /v1/sources/{source}/queued/cancel` переводит только `queued` этого
-  source в `cancelled` и возвращает `cancelled` count;
-- `POST /v1/sources/{source}/failed/retry` переводит только `failed` этого
-  source в новый dispatchable `queued`, увеличивает `retry_count`, сохраняет
-  `attempt_count`, `job_attempts` и audit history и возвращает `retried` count.
-
-Обе операции транзакционны, идемпотентны при повторе и не затрагивают jobs
-другого source либо состояния `running`, `cancel_requested`, `completed` и
-`cancelled`. Каждая policy mutation сериализована, записывается через
-fsync + atomic rename + directory fsync и hot-reloadится. Dashboard показывает
-Dispatch, Admission, counts и подтверждение перед bulk-действиями. Audit events
-содержат только source/job/state/count metadata — payload, result, correlation
-values и error text в control events не копируются.
-
-Канонический production policy хранится в `config/sources.production.json`:
-веса Shutterstock Video / Olya Vision / Olya Decision остаются `3/8/6`, а
-отдельный source `syncopia-telegram-memory` имеет scheduler weight ровно `4`.
-`weight` — единственный scheduling-параметр: меньшее значение выбирается раньше
-среди eligible queued jobs. Policy с неизвестным ключом отклоняется, чтобы конфигурация не могла
-молча стать default `1.0`.
-
-### Producer-owned storage: additive safe rollout
-
-Broker поддерживает opt-in capability `producer_storage` при `POST /v1/jobs`,
-payload-free `GET /v1/jobs/{id}/status`, durable result receipt через
-`POST /v1/jobs/{id}/ack` и recovery через `GET /v1/jobs/{id}/receipt`.
-`GET /v1/jobs/{id}` сохраняет прежнюю форму ответа, но completed payload после
-исполнения равен `{}`: identity/hash/bytes остаются в metadata. Result доступен
-до producer ACK/compaction либо до явного broker-temporary TTL. Для
-producer-storage job endpoint требует тот же owner-only bearer token. Без
-токена history/audit/correlation reads исключают такие jobs и их storage
-evidence; legacy jobs остаются доступны как прежде до окончания их TTL.
-
-Production policy allowlist уже описывает допустимый storage mode каждого
-известного producer, но безопасные начальные флаги остаются
-`ack_required=false`, `compaction_enabled=false` и
-`legacy_result_fallback=true`. Поэтому deployment схемы и receipt API сам по
-себе не удаляет данные. Quarantine/compaction требует отдельного source-scoped
-переключения всех guard-флагов, matching ACK и двух grace periods.
-
-Retention-bounded режим также opt-in: `retention_enabled=false` по умолчанию.
-Он добавляет конечные TTL, source byte budget, bounded maintenance и
-idempotency tombstones. Queued/running/retryable payload остаётся inline;
-completed payload очищается после execution, broker-temporary result — после
-явного TTL, producer-owned result — только после durable ACK. Физический
-repack всегда создаётся в новом SQLite-файле, live DB не вакуумится на месте.
-
-WAL ограничивается `wal_autocheckpoint=4096`,
-`journal_size_limit=67108864`, alert budget 128 MiB и периодическим
-`PASSIVE` checkpoint. Текущая политика и метрики доступны через
-`GET /v1/storage/health`; точный контракт, migration copy tooling и
-lossless rollout/rollback описаны в
-[docs/PRODUCER_STORAGE.md](docs/PRODUCER_STORAGE.md).
-
-### User-facing Weight (1 most important … 10 least important)
-
-Weight — единственный soft scheduling input. **1 — самая большая доля
-execution time, 10 — самая маленькая**. Weight не является deadline и не
-меняется с возрастом job.
-
-`POST /v1/shutterstock-video/generate` — синхронный bounded контракт локального
-видео-чанка (profile `shutterstock-video`, `nemotron3:33b`): принимает `prompt`,
-base64 `images` (до 12 кадров, 32 MiB) и JSON Schema в `format` (до 32 KiB),
-возвращает результат Ollama плюс `broker.job_id`. Dispatch источника включается
-только через policy/allowlist; без этого job остаётся durable `queued`.
-
-`POST /v1/olya-vision/generate` — синхронный photos-only контракт источника
-`olya-vision`: принимает только `gemma4:12b` или `qwen3-vl:30b`, до 16
-base64-изображений (64 MiB), JSON Schema (64 KiB) и correlation
-`source_item_id`/`external_id`. Повтор того же `external_id` возвращает
-существующий durable job; результат и attempt history переживают restart.
-Runtime-параметры моделей задаёт broker, caller не может их расширить.
-
-`POST /v1/olya-decision/generate` — отдельный синхронный text-only contract
-`olya-decision`. Он принимает fixed decision prompt и JSON Schema, но запускает
-только server-owned `qwen3.8:ad-iq2-xs` с bounded context/output и `think=low`.
-`source_item_id` связывает recommendation с broker job, стабильный `external_id`
-обеспечивает idempotent resume. Этот source независим от `olya-vision`.
-
-`POST /v1/syncopia-memory/extract` — отдельный синхронный text-only contract
-для локального Phase-2 extractor. Он требует `tools=[]`, `stream=false`, ровно
-system+user messages, запускает только
-`qwen3.8:ad-iq2-xs` с `num_ctx=65536`, `num_predict=8192` и source
-`syncopia-telegram-memory`. Request hash используется caller как idempotency
-key; Olya/Shutterstock endpoints и profiles не переиспользуются.
-
-Для свободной текстовой сводки на том же `syncopia-memory-qwen38` необходимо
-**не передавать** оба поля `format`/`response_format` и задать `think="low"`.
-Этот явный freeform mode не добавляет JSON forcing, не усекает messages и
-передаёт `think="low"` в Ollama. Лимиты и options остаются теми же:
-`temperature=0`, `num_ctx=65536`, `num_predict=8192`; сообщения свыше 196608
-UTF-8 JSON bytes отклоняются, а не обрезаются. Schema mode по-прежнему требует
-`format` как JSON Schema object, допускает отсутствующий/`null` response_format
-или `{"type":"json_object"}` и принудительно использует `think=false`.
-Null/частичные format-поля не выбирают freeform mode. Оба режима поддерживаются
-также через `POST /v1/jobs` на выделенных profile/source; producer-storage
-требует прежний bearer, canonical normalized input hash и ACK, без изменения
-storage identity или правил защиты.
-
-Отдельный opt-in full-day capacity proposal —
-[`syncopia-memory-qwen38-128k-v1`](docs/SYNCOPIA_DAILY_128K_V1.md):
-131072/8192/temp0/low через существующий protected source и producer storage.
-Это source-only контракт; старый64K и Astra16 не меняются, rollout не выполнен.
-
-## Проверка и разработка
-
-Безопасная canary-проверка использует mock или staging задания `interactive`,
-`cron`, `shutterstock` и `olya`. Следует проверить один удалённый запрос за раз,
-weighted source selection/FIFO, WOL/readiness, unload перед
-сменой модели, восстановление просроченной lease и отмену queued задания.
-Ни один live caller не мигрируется до успешной проверки; откат — остановить
-broker без изменения routes.
-
-### Planned VLM canary rollout (not executed by this change)
-
-Перед единственным реальным запросом оператор должен убедиться, что
-`qwen3-vl:30b` установлен на MAIN-PC, временно добавить **только**
-`shutterstock-canary` в `BROKER_DISPATCH_SOURCES`, перезапустить user-service
-и отправить один bounded image+schema request на endpoint выше. Проверяются
-`queued → running → completed`, сохранённый `result` по `GET /v1/jobs/{id}` и
-состояние после service restart. Откат: удалить `shutterstock-canary` из
-allowlist (либо выключить dispatch), выполнить `daemon-reload` и restart
-service; source `shutterstock` при этом не добавляется никогда. Это изменение
-не выполняет ни один из этих шагов.
-
-Перед live canary оператор обязан проверить, что на MAIN-PC уже установлены
-все модели server-side local-GPU profiles. Для `shutterstock-video` нужна
-`nemotron3:33b`; cloud photo через OmniRoute этой проверки не требует и в
-broker не подключается. Если целевой модели нет в `/api/tags`, canary
-прекращается до dispatch, WOL, unload или попытки pull модели.
+Нужен Python 3.11+. Скопируйте `config/local.example.json` в `config/local.json` этого checkout, укажите в `ollama_url` доступный HTTP-адрес исполнителя, а в `mainpc_mac` — его Wake-on-LAN MAC, затем ограничьте доступ к файлу. Брокер читает этот неотслеживаемый файл при запуске, даже без dispatch. Пока dispatch выключен, WOL и запросов Ollama нет. Для исполнителя нет fallback на localhost.
 
 ```bash
-python -m unittest discover -s tests -v
+cp config/local.example.json config/local.json
+# Перед запуском задайте параметры исполнителя в config/local.json.
+chmod 600 config/local.json
+BROKER_LOCAL_CONFIG=./config/local.json BROKER_DISPATCH_ENABLED=false BROKER_DB=./broker.sqlite3 python3 -m broker
 ```
 
-Тесты используют адаптеры-заглушки и не отправляют WOL либо запросы Ollama.
+В другом терминале:
 
-## Границы MVP
+```bash
+curl --fail http://127.0.0.1:8088/healthz
+```
 
-Broker владеет admission, порядком, residency моделей, request profiles и
-операционной телеметрией. Ollama остаётся inference runtime. Проект не заменяет
-cloud routing, task orchestration или бизнес-логику callers.
+По умолчанию API слушает `127.0.0.1:8088`. Не открывайте legacy API недоверенной сети: он не является публичной границей аутентификации. Приложенные systemd units — шаблоны: до установки создайте доступный только владельцу `~/.config/ollama-inference-broker/broker.env` (и `report.env` для таймера отчёта) для остальных настроек развёртывания. Для развёртывания поместите тот же JSON в `~/.config/ollama-inference-broker/local.json` с правами только для владельца: брокер и отчёт читают этот стабильный путь независимо от каталогов релизов. `BROKER_LOCAL_CONFIG` позволяет указать другой файл при разработке. `OLLAMA_URL` и `MAINPC_MAC` переопределяют значения брокера, `BROKER_OLLAMA_URL` — адрес для отчёта. При необходимости задайте `WOL_BROADCAST` отдельно. В шаблоне брокера dispatch отключён до явного включения.
 
-Подробный поэтапный план — в [ROADMAP.md](ROADMAP.md).
+### Установка шаблонов systemd
 
-### OpenClaw agentTurn через durable queue (opt-in)
+Оба unit-файла задают `WorkingDirectory=%h/.local/share/ollama-inference-broker`. До включения unit поместите checkout **именно по этому пути**: установка только unit-файлов завершится ошибкой systemd `CHDIR`. На новом хосте выполните команды из раздела [Installing the systemd templates](#installing-the-systemd-templates): они создают checkout, локальный JSON, обязательный `broker.env` и устанавливают unit-файлы, но не запускают dispatch.
 
-Broker route `POST /openclaw/api/chat` реализует **нативный Ollama chat** для
-выбранных OpenClaw turns. Это отдельный путь: старые `/api/chat` и
-`/api/generate` остаются асинхронными admission-only endpoints с ответом `202`.
-Провайдер OpenClaw использует `api: "ollama"` и `baseUrl` вида
-`http://127.0.0.1:8088/openclaw`; OpenClaw добавляет `/api/chat`. Внутренний
-broker source остаётся `openclaw` при любом OpenClaw-facing provider key.
-Wire model обязан совпадать с одним из девяти server-owned профилей:
+Таймер отчёта необязателен. До его включения скопируйте `config/report.env.example` в `~/.config/ollama-inference-broker/report.env`, замените chat/thread placeholders и установите права `0600`. `OPENCLAW_CONFIG_PATH` по умолчанию равен `~/.openclaw/openclaw.json` и должен указывать на существующий OpenClaw JSON с `channels.telegram.accounts.<account>.botToken` (либо `token`). `BROKER_REPORT_TELEGRAM_ACCOUNT` по умолчанию — `default`. Unit отчёта читает `broker.env` перед `report.env`, поэтому берёт из него путь `BROKER_SOURCES_POLICY` для отображения весов; укажите необязательный `BROKER_SOURCES_POLICY` в `report.env` только если отчёту нужен другой путь. Адрес Ollama для проверки здоровья берётся из общего `local.json`; `BROKER_OLLAMA_URL` позволяет переопределить его только для отчёта. Не записывайте токен бота в `report.env` или Git.
 
-| Wire model | Broker profile | Context/output | Image |
-| --- | --- | --- | --- |
-| `gemma4:12b` | `openclaw-gemma4` | 262144/16384 | yes |
-| `gemma4:26b` | `openclaw-gemma4-26b` | 262144/8192 | yes |
-| `qwen3-vl:30b` | `openclaw-qwen3-vl` | 212992/16384 | yes |
-| `nemotron3:33b` | `openclaw-nemotron3` | 131072/8192 | yes |
-| `qwen3.8:ad-iq2-xs` | `openclaw` (legacy queue compatibility) | 131072/16384 | no |
-| `qwen3.8:unc-rvn-iq2xxs` | `openclaw-unc-rvn-iq2xxs` | 131072/16384 | no |
-| `frob/ministral-3:14b-thinking-q4_K_M` | `openclaw-ministral3` | 262144/16384 | yes |
-| `nemotron-3-nano:30b-a3b-q4_K_M` | `openclaw-nemotron-nano` | 262144/16384 | no |
-| `gpt-oss:20b` | `openclaw-gpt-oss` | 131072/16384 | no |
+### Основные контракты
 
-The original eight profiles retain their configured limits and modalities.
-`gemma4:26b` admits the native 262144-token context ceiling and 8192-token output
-ceiling; these are limits, not measured occupied context or a quality claim.
-Smaller `num_ctx`/`num_predict` requests
-(including 8192/512 with `think=false`) are preserved. Each profile pins
-model, keepalive 300 s and executor
-timeout 900 s, except Gemma 26B: 3600 s for bounded long prefill.
-Admission preserves up to 512 messages and 128 tools. Text JSON
-requests are limited to 2 MiB; vision requests to 32 MiB, at most 16 images
-and 24 MiB decoded images. Tools are limited to 512 KiB. Byte limits protect
-SQLite/HTTP and can narrow oversized image turns; exact token budget
-остаётся ответственностью OpenClaw/Ollama, поэтому `truncate` и `shift`
-запрещены. Queue admission ограничен восемью незавершёнными jobs и восемью
-одновременными HTTP waiters; сверх лимита — HTTP 429. Запросы проходят обычный
-source scheduler, model switch и durable result storage; route не вызывает
-Ollama напрямую.
+- Дополнительный OpenClaw native chat route ждёт результат в той же устойчивой очереди и возвращает Ollama-совместимый ответ; старые admission-only endpoints не меняются. См. [маршрут OpenClaw](docs/OPENCLAW_ROUTE.md) и границы его rollout.
 
-`stream=false` возвращает настоящий Ollama JSON после terminal completion.
-`stream=true` возвращает Ollama NDJSON: пустые heartbeat-кадры примерно каждые
-2 s во время queue/model wait и один итоговый `done=true` кадр с text,
-thinking, tool calls и usage. Это корректный поток для OpenClaw agentTurn,
-но **не** progressive token streaming: executor получает целый non-stream
-ответ Ollama до записи durable result. `Idempotency-Key` (опциональный HTTP
-header, не генерируется OpenClaw автоматически) привязывает повтор к тому же
-job и отвергает другое содержимое с HTTP 400. При отключении клиента без ключа
-queued job отменяется, running получает `cancel_requested` и освобождает GPU
-после возврата Ollama; с ключом durable job остаётся доступным для повторного
-ожидания. Время ожидания HTTP — 1800 s (Gemma 26B: 3900 s), затем HTTP 504 / NDJSON error; для
-keyed request job сохраняется. Для OpenClaw provider timeout нужен >1800 s (>3900 s для Gemma 26B),
-а timeout выбранного cron agentTurn также должен покрывать очередь и inference.
+- `POST /v1/jobs` сохраняет задание с серверным профилем и возвращает HTTP 202. `GET /v1/jobs/{id}` и `POST /v1/jobs/{id}/cancel` показывают и изменяют состояние задания.
+- `/api/chat` и `/api/generate` принимают задания, но не являются прямыми streaming-прокси Ollama. При `stream=true` возвращается кадр подтверждения приёма, а не немедленный результат модели.
+- `GET /dashboard`, `GET /v1/dashboard`, `GET /v1/forecast`, `GET /v1/analytics` и `GET /v1/audit-events` дают локальную наблюдаемость. Forecast не изменяет очередь и зависит от будущих событий: по умолчанию 10 выборов, максимум 20. Ошибка чтения отображается как stale/unavailable, а не как вымышленные нули.
+- `BROKER_DISPATCH_ENABLED=true` запускает диспетчер. Без `BROKER_SOURCES_POLICY` обязателен явный `BROKER_DISPATCH_SOURCES`. При наличии policy allowlist задают включённые sources.
+- `enabled=false` останавливает новые leases источника; `admission_allowed=false` отклоняет новые задания с HTTP 403 до записи. API управления позволяет ставить dispatch на паузу, запрещать приём, менять вес и с подтверждением отменять queued либо повторять failed задания. Текущее исполнение не прерывается.
+- Хранение результатов у producer включается отдельно для source и задания. API состояния, receipts и mutations требуют owner-only bearer token; контракт старых jobs сохраняется. Compaction требует явных защитных флагов и подтверждённого ACK. См. [хранение producer](docs/PRODUCER_STORAGE.md) и [аналитику](docs/ANALYTICS.md).
 
-Перед rollout main/ops отдельно добавляет `openclaw` в **live** source policy с
-нужными `enabled`, `admission_allowed` и weight, обновляет broker release и
-переключает OpenClaw provider/models. Ни код, ни этот документ не меняют live
-policy или automations. Rollback: вернуть прежний provider/model routing,
-закрыть admission для `openclaw`, дождаться/отменить его
-jobs и вернуть прежний broker release; другие sources и SQLite не удалять.
+Пример policy **не для production**:
 
-## Nemotron Bolt E4B (opt-in)
+```json
+{
+  "version": 1,
+  "sources": {
+    "interactive": {"enabled": true, "admission_allowed": true, "weight": 2},
+    "cron": {"enabled": true, "admission_allowed": true, "weight": 1}
+  }
+}
+```
 
-Exact queue route, reasoning semantics, context ceiling and evaluation procedure:
-[docs/bolt-e4b.md](docs/bolt-e4b.md). No default/catalog changes.
+С policy исполняются только настроенные и допустимые sources. Адрес исполнителя и секреты задаются отдельно. Для остановки новых claims без потери текущего задания используйте `systemctl --user reload ollama-inference-broker.service`: unit посылает сигнал только broker MainPID. Не используйте `systemctl --user kill -s SIGUSR1 ollama-inference-broker.service`, чтобы не сигнализировать дочернему процессу активного инференса.
 
-## Global queue pause
+### Проверка
 
-Dashboard **Pause queue** (or `POST /v1/queue/pause` with
-`{"paused":true}`) prevents all new execution, independently of per-source
-dispatch controls. Enqueue remains available. An active job completes normally,
-then loaded GPU models are unloaded. Backend unload failures are retried without
-resuming dispatch. The pause is stored in SQLite and survives restarts.
-Resume with `{"paused":false}` or **Resume queue**.
+```bash
+python3 -m unittest discover -s tests -v
+```
 
-Repository: https://github.com/dankarization/inference-broker
-The existing `ollama-inference-broker.service`, state directory and Python
-package `broker` intentionally retain their compatibility names.
+Тесты используют заглушки Ollama и Wake-on-LAN и не запускают реальный инференс. Границы rollout описаны в [ROADMAP.md](ROADMAP.md).

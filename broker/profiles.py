@@ -21,6 +21,8 @@ class Profile:
     occupancy_max_jobs: int = 1
     occupancy_peak_vram_bytes: int | None = None
     occupancy_evidence: str | None = None
+    # Retained for durable jobs admitted with legacy evaluation profiles.
+    default_context: int | None = None
 
 
 # This is deliberately server-owned. Callers can select a profile, never a model
@@ -61,6 +63,8 @@ PROFILES = {
         "nextcloud-qwen3-vl", "qwen3-vl:30b", 16_384, 8_192, 300,
         max_images=4, request_timeout_seconds=900,
     ),
+    "stt-whisper": Profile("stt-whisper", "whisper-medium-int8-mainpc-cuda", 0, 0, 0,
+                           request_timeout_seconds=960),
     "interactive": Profile("interactive", "nemotron3:33b", 16_384, 2_048, 180),
     "cron": Profile("cron", "nemotron3:33b", 8_192, 1_024, 120),
     # Preserve the original profile name for already-queued agent turns.
@@ -146,6 +150,37 @@ PROFILES = {
     "syncopia-memory-qwen38-128k-v1": Profile(
         "syncopia-memory-qwen38-128k-v1", "qwen3.8:ad-iq2-xs", 131_072, 8_192, 1_800,
         max_concurrency=1, request_timeout_seconds=900,
+    ),
+    # Seven isolated, text-only comparison lanes.  They deliberately share one
+    # source so their evaluations cannot borrow any production caller's share.
+    # 64k is the normal comparison default; 128k is an explicit stress ceiling.
+    "uncensored-eval-rvn-iq2m": Profile(
+        "uncensored-eval-rvn-iq2m", "qwen3.8:unc-rvn-iq2m", 131_072, 8_192, 1_800,
+        max_concurrency=1, request_timeout_seconds=7_200, default_context=65_536,
+    ),
+    "uncensored-eval-rvn-iq2s": Profile(
+        "uncensored-eval-rvn-iq2s", "qwen3.8:unc-rvn-iq2s", 131_072, 8_192, 1_800,
+        max_concurrency=1, request_timeout_seconds=7_200, default_context=65_536,
+    ),
+    "uncensored-eval-rvn-iq2xs": Profile(
+        "uncensored-eval-rvn-iq2xs", "qwen3.8:unc-rvn-iq2xs", 131_072, 8_192, 1_800,
+        max_concurrency=1, request_timeout_seconds=7_200, default_context=65_536,
+    ),
+    "uncensored-eval-rvn-iq2xxs": Profile(
+        "uncensored-eval-rvn-iq2xxs", "qwen3.8:unc-rvn-iq2xxs", 131_072, 8_192, 1_800,
+        max_concurrency=1, request_timeout_seconds=7_200, default_context=65_536,
+    ),
+    "uncensored-eval-huihui-q2kxl": Profile(
+        "uncensored-eval-huihui-q2kxl", "qwen3.8:unc-huihui-q2kxl", 131_072, 8_192, 1_800,
+        max_concurrency=1, request_timeout_seconds=7_200, default_context=65_536,
+    ),
+    "uncensored-eval-unleashed-q2kxl": Profile(
+        "uncensored-eval-unleashed-q2kxl", "qwen3.8:unc-unleashed-q2kxl", 131_072, 8_192, 1_800,
+        max_concurrency=1, request_timeout_seconds=7_200, default_context=65_536,
+    ),
+    "uncensored-eval-hauhau-iq2m": Profile(
+        "uncensored-eval-hauhau-iq2m", "qwen3.8:unc-hauhau-iq2m", 131_072, 8_192, 1_800,
+        max_concurrency=1, request_timeout_seconds=7_200, default_context=65_536,
     ),
     "batch-video": Profile("batch-video", "nemotron3:33b", 8_192, 512, 120),
     # This is an intentionally separate source from the active Shutterstock

@@ -12,7 +12,7 @@ from urllib.parse import parse_qs, unquote, urlsplit
 from .compat import (CompatibilityError, stream_frames, submit as submit_compatibility,
                      submit_olya_decision, submit_olya_vision, submit_shutterstock_canary,
                      submit_shutterstock_video, submit_syncopia_memory)
-from .profiles import OPENCLAW_PROFILES_BY_MODEL, PROFILES
+from .profiles import OPENCLAW_PROFILES_BY_MODEL, PROFILES, VOICE_PROFILE_NAMES
 from .dashboard_assets import DashboardAssets
 from .policy import SourcePolicyError
 from .service import SourceAdmissionBlocked, SourceQueueFull, StorageAuthorizationRequired
@@ -27,7 +27,7 @@ def openclaw_wait_seconds(profile):
     return max(MAX_WAIT_SECONDS, profile.request_timeout_seconds + 300)
 
 
-def serve(broker, host="127.0.0.1", port=8088, policy=None, storage_token=None):
+def serve(broker, host="127.0.0.1", port=8088, policy=None, storage_token=None, asr_api=None):
     broker.use_source_policy(policy)
     openclaw_slots = threading.BoundedSemaphore(MAX_OUTSTANDING)
     dashboard_assets = DashboardAssets()
@@ -127,6 +127,9 @@ def serve(broker, host="127.0.0.1", port=8088, policy=None, storage_token=None):
                     self._json(429, {"error": str(error)})
                     return
                 streaming = request.get("stream", True)
+                if job["state"] == "completed" and "result" not in job:
+                    self._json(410, {"error": "broker result has expired", "job_id": job["id"]})
+                    return
                 deadline = time.monotonic() + openclaw_wait_seconds(PROFILES[job["profile"]])
                 try:
                     if streaming:
@@ -152,14 +155,24 @@ def serve(broker, host="127.0.0.1", port=8088, policy=None, storage_token=None):
                             if key is None:
                                 broker.cancel(job["id"])
                             return
-                        job = broker.wait_for_terminal(job["id"], min(HEARTBEAT_SECONDS, remaining))
+                        job = broker.wait_for_terminal(
+                            job["id"], min(HEARTBEAT_SECONDS, remaining),
+                            hydrate_pending=False,
+                        )
                         if job is None:
                             raise RuntimeError("submitted OpenClaw job disappeared")
                         if streaming and job["state"] not in {"completed", "failed", "cancelled"}:
                             self.wfile.write(heartbeat())
                             self.wfile.flush()
                     if job["state"] == "completed":
-                        if streaming:
+                        if "result" not in job:
+                            if streaming:
+                                self.wfile.write(error_frame(410, "broker result has expired"))
+                                self.wfile.flush()
+                            else:
+                                self._json(410, {"error": "broker result has expired",
+                                                 "job_id": job["id"]})
+                        elif streaming:
                             self.wfile.write(terminal_frame(job["result"]))
                             self.wfile.flush()
                         else:
@@ -178,7 +191,20 @@ def serve(broker, host="127.0.0.1", port=8088, policy=None, storage_token=None):
             finally:
                 openclaw_slots.release()
 
+        def _asr_route(self):
+            path = urlsplit(self.path).path
+            if not path.startswith("/v1/transcriptions"):
+                return False
+            if asr_api is None:
+                self.close_connection = True
+                self._json(503, {"error": "ASR not configured"})
+            else:
+                asr_api.handle(self)
+            return True
+
         def do_POST(self):
+            if self._asr_route():
+                return
             if urlsplit(self.path).path == "/openclaw/api/chat":
                 self._openclaw_chat()
                 return
@@ -189,6 +215,16 @@ def serve(broker, host="127.0.0.1", port=8088, policy=None, storage_token=None):
                 self._json(400, {"error": "request body must be JSON"})
                 return
             path = urlsplit(self.path).path
+            # Keep the legacy unauthenticated mutations away from the ASR lane.
+            asr_job = None
+            if path.startswith("/v1/jobs/"):
+                asr_job = broker.status(path.split("/")[3])
+            if ((isinstance(body, dict) and ((body.get("kind") == "transcribe" and body.get("profile") not in VOICE_PROFILE_NAMES)
+                     or body.get("profile") == "stt-whisper" or body.get("source") == "stt-whisper"))
+                    or unquote(path).startswith("/v1/sources/stt-whisper/")
+                    or (asr_job and asr_job.get("profile") == "stt-whisper")):
+                self._json(403, {"error": "use authenticated ASR API"})
+                return
             if path == "/v1/queue/pause":
                 if not isinstance(body, dict) or set(body) != {"paused"} or not isinstance(body["paused"], bool):
                     self._json(400, {"error": "body must contain only boolean paused"})
@@ -274,6 +310,7 @@ def serve(broker, host="127.0.0.1", port=8088, policy=None, storage_token=None):
                     result=broker.retry(job_id); self._json(200 if result else 404, result or {"error":"not found"})
                 except SourceAdmissionBlocked as error: self._admission_blocked(error)
                 except ValueError as e: self._json(409, {"error":str(e)})
+                except SourceQueueFull as e: self._json(429, {"error":str(e)})
             elif path.startswith("/v1/sources/") and path.endswith("/weight"):
                 source = unquote(path[len("/v1/sources/"):-len("/weight")]).strip("/")
                 try:
@@ -362,6 +399,8 @@ def serve(broker, host="127.0.0.1", port=8088, policy=None, storage_token=None):
                     self._admission_blocked(error)
                 except (SourcePolicyError, ValueError) as error:
                     self._json(400, {"error": str(error)})
+                except SourceQueueFull as error:
+                    self._json(429, {"error": str(error)})
             elif path in {"/api/chat", "/api/generate"}:
                 try:
                     job=submit_compatibility(broker, path.rsplit("/", 1)[-1], body)
@@ -479,6 +518,8 @@ def serve(broker, host="127.0.0.1", port=8088, policy=None, storage_token=None):
                 except CompatibilityError as e: self._json(400, {"error":str(e)})
             else: self._json(404, {"error":"not found"})
         def do_GET(self):
+            if self._asr_route():
+                return
             parsed = urlsplit(self.path)
             path = parsed.path
             query = parse_qs(parsed.query)
