@@ -42,18 +42,16 @@ class FourPilotTests(unittest.TestCase):
         with self.assertRaises(PilotRejected) as caught:
             client.submit('new','doc','eval-gemma4-12b',self.payload('eval-gemma4-12b'))
         self.assertEqual(caught.exception.status,403)
-    def test_pilot_count_bytes_disk_backpressure_and_replay_at_cap(self):
+    def test_pilot_bytes_disk_backpressure_and_replay_at_cap(self):
+        # Job-count cap removed: any backlog accumulates. Only the 512MiB byte
+        # budget, disk reserve and storage contract still reject admission.
         self.assertEqual((PILOT_MAX_ACTIVE_JOBS,PILOT_MAX_ACTIVE_INPUT_BYTES),(512,512*1024**2))
         client=self.client();p=self.payload('eval-gemma4-26b');profile='eval-gemma4-26b'
         first=client.submit('cap','doc',profile,p)
-        # Synthetic occupancy fixture, not512 claimed admissions; preserve real cap path.
-        row=dict(self.broker.db.execute('SELECT * FROM jobs WHERE id=?',(first['id'],)).fetchone())
-        columns=list(row);sql='INSERT INTO jobs('+','.join(columns)+') VALUES('+','.join('?' for _ in columns)+')'
-        with self.broker.db:
-            self.broker.db.executemany(sql,[[str(uuid.uuid4()) if c=='id' else
-                'seed-'+str(i) if c=='external_id' else row[c] for c in columns] for i in range(511)])
-        with self.assertRaises(PilotRejected) as caught:client.submit('over','doc',profile,p)
-        self.assertEqual(caught.exception.status,429)
+        # A backlog far above the old 512-job count cap is admitted (cheap payloads).
+        for i in range(520):
+            client.submit('over-count-'+str(i),'doc'+str(i),profile,self.payload('eval-gemma4-12b'))
+        self.assertEqual(self.broker.db.execute("SELECT count(*) FROM jobs WHERE source='pilot-mainpc' AND state='queued'").fetchone()[0],521)
         self.assertEqual(client.submit('cap','doc',profile,p)['id'],first['id'])
         with self.broker.lock,self.broker.db:
             self.broker.db.execute("UPDATE jobs SET state='failed' WHERE id<>?",(first['id'],))
@@ -101,7 +99,7 @@ class FourPilotTests(unittest.TestCase):
             self.assertEqual(r['intended_model_digest'],PILOT_MODEL_DIGESTS[r['profile']])
             self.assertEqual(r['options'],dict(num_ctx=p.max_context,num_predict=p.max_output,temperature=0))
             self.assertEqual((r['max_images'],r['timeout_seconds']),(p.max_images,p.request_timeout_seconds))
-        self.assertEqual(doc['capacity']['pilot']['active_jobs'],PILOT_MAX_ACTIVE_JOBS)
+        self.assertIsNone(doc['capacity']['pilot']['active_jobs'])
         self.assertEqual(doc['capacity']['pilot']['active_normalized_payload_bytes'],PILOT_MAX_ACTIVE_INPUT_BYTES)
         self.assertIsNone(doc['capacity']['global_limits']['active_job_count_hard_cap'])
         self.assertEqual(doc['nextcloud_verifier']['profile'],'nextcloud-verify-gemma26')

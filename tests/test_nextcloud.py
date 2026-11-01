@@ -107,11 +107,13 @@ class NextcloudTests(unittest.TestCase):
                         {'options': {'num_ctx': 999999}}, {'tools': []}, {'stream': True}):
             with self.subTest(changes=changes), self.assertRaises(ValueError):
                 self.submit(payload=self.payload | changes)
-        self.submit(); self.submit('version2')
-        with self.assertRaises(SourceQueueFull):
-            self.submit('version3')
+        # No job-count admission cap: a backlog above the old 2-job limit accumulates.
+        for n in range(5):
+            self.submit(f'backlog-{n}')
+        self.assertEqual(self.broker.health()['queue_depth'], 5)
+        # 'backlog-0' used source_item_id='3'; a different item with the same key conflicts.
         with self.assertRaisesRegex(ValueError, 'item conflict'):
-            self.submit(source_item_id='other')
+            self.submit('backlog-0', source_item_id='other')
 
     def test_unknown_source_policy_fails_closed(self):
         self.broker.use_source_policy(None)

@@ -42,10 +42,13 @@ class Worker004Tests(unittest.TestCase):
         with self.assertRaises(ValueError):self.submit('missing-think',profile='nextcloud-eval-qwen')
 
     def test_finite_bulk_budget_legacy_cap_and_replay_at_capacity(self):
+        # Job-count cap removed: a bulk admission above the old 256-job count cap
+        # is accepted; only the 256MiB byte budget still rejects. Exact keyed
+        # replay still returns the retained job in every state below.
         before=self.policy_path.read_bytes();first=self.admit()
-        for i in range(1,256):self.admit('bulk-'+str(i))
-        with self.assertRaises(SourceQueueFull):self.admit('overflow')
-        with self.assertRaises(SourceQueueFull):self.submit('legacy-at-cap')
+        for i in range(1,300):self.admit('bulk-'+str(i))
+        self.assertEqual(self.broker.db.execute(
+            "SELECT count(*) FROM jobs WHERE source='nextcloud' AND state='queued'").fetchone()[0],300)
         self.assertEqual(self.admit()['id'],first['id'])
         self.assertEqual(self.policy_path.read_bytes(),before)
         self.assertEqual(len(self.gpu.requests),0)

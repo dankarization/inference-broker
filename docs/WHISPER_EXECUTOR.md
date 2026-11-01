@@ -61,7 +61,7 @@ Every request below requires `Authorization: Bearer ...` from the ASR token file
 
 The legacy queue submission and mutation routes reject ASR operations. Public
 status/dashboard data contains only artifact references, never raw audio or text.
-The spool allows 512 MiB of staged files and 32 outstanding ASR jobs. Uploads are
+The spool allows 512 MiB of staged files. There is no ASR job-count admission cap. Uploads are
 serialized, capped at 60 seconds and two admitted HTTP handlers. Abandoned files
 older than 24 hours are pruned on the next authenticated upload; queued/running
 artifacts and all artifacts while a fence exists are preserved. There is no
