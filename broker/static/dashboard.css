@@ -44,6 +44,8 @@ h1 { font-size: 14px; margin: 0; font-weight: 700; letter-spacing: -.01em; white
 .brand .mark { font-weight: 800; color: var(--accent); letter-spacing: -.02em; }
 .spacer { flex: 1 1 auto; }
 .stamp { color: var(--faint); font-size: 11px; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.queue-control { display: flex; align-items: center; justify-content: flex-end; gap: var(--s2); flex: 0 1 auto; min-width: 0; }
+#queue-pause-status { color: var(--faint); font-size: 11px; }
 
 /* ---------- layout ---------- */
 .wrap { max-width: 100%; margin: 0 auto; padding: var(--s4) var(--s4) 0; }
@@ -58,6 +60,12 @@ h2 {
 .error:not([hidden]) {
   background: rgba(248,113,113,.08); border: 1px solid rgba(248,113,113,.35);
   border-radius: var(--radius-sm); padding: var(--s2) var(--s3);
+}
+/* An empty status must not paint the red bubble. Visibility is not display:none
+   so the pre-media display contract stays limited to [hidden]. */
+.error:empty {
+  background: transparent; border-color: transparent; padding: 0; margin: 0;
+  min-height: 0;
 }
 
 /* ---------- tables ---------- */
@@ -91,6 +99,18 @@ th {
   color: var(--muted);
   font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: .03em;
   border-bottom: 1px solid var(--line);
+}
+/* Active, Forecast and History share one header format. Body .compact must not
+   leak a monospace/faint header onto only some of these tables. */
+#active-table thead th,
+#forecast-table thead th,
+#history-table thead th {
+  font-family: var(--font-ui);
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--muted);
+  letter-spacing: .03em;
+  text-transform: uppercase;
 }
 /* Keep every cell on one line so rows stay short; the scroll box absorbs any
    horizontal overflow, and columns hug their content (no stretched cells). */
@@ -198,8 +218,17 @@ footer p { margin: var(--s2) 0; }
 @media (max-width: 640px) {
   body { font-size: 12px; }
   .wrap, .topbar-in, footer { padding-left: var(--s2); padding-right: var(--s2); }
+  .topbar-in { flex-wrap: wrap; align-items: center; }
+  .brand { flex: 1 1 auto; }
+  h1 { white-space: normal; }
+  .spacer { display: none; }
+  .queue-control { margin-left: auto; flex: 0 1 auto; }
+  .stamp { flex: 1 0 100%; margin-left: 16px; white-space: normal; }
   th, td { padding: 4px 5px; }
   .sort-btn { font-size: 10px; }
+  #active-table thead .sort-btn,
+  #forecast-table thead .sort-btn,
+  #history-table thead .sort-btn { font-size: 10px; font-weight: 600; color: var(--muted); }
   .summary { font-size: 12px; }
   /* Least-actionable columns: keep the counters that operators page on. */
   #sources-table th[data-sort-key="lease"], #sources-table td:nth-child(7),

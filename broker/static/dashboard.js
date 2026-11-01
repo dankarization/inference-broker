@@ -157,10 +157,18 @@ function renderDashboard(data) {
   return true;
 }
 
+function setNotice(id, text) {
+  const node = byId(id);
+  if (!node) return;
+  node.textContent = text || '';
+  node.hidden = !node.textContent.trim();
+}
+
 function setLive(available) {
   const live = byId('dashboard-live');
   if (live) live.hidden = !available;
-  byId('dashboard-error').hidden = available;
+  const error = byId('dashboard-error');
+  if (error) error.hidden = available || !error.textContent.trim();
   if (available) document.title = 'Inference broker queue';
 }
 
@@ -263,9 +271,9 @@ function observeHistory() {
         byId('history-table')._tableSort.addRow(tr);
       });
       sentinel.dataset.cursor = page.next_cursor || '';
-      byId('history-error').textContent = '';
+      setNotice('history-error', '');
     } catch (error) {
-      byId('history-error').textContent = error.message || 'History unavailable';
+      setNotice('history-error', error.message || 'History unavailable');
     } finally { loading = false; }
   }).observe(sentinel);
 }
@@ -283,8 +291,8 @@ async function loadDashboard() {
       if (!renderedOnce) { renderedOnce = true; observeHistory(); }
     }
   } catch (error) {
+    setNotice('dashboard-error', 'Dashboard data unavailable: ' + (error.message || 'request failed') + '.');
     setLive(false);
-    byId('dashboard-error').textContent = 'Dashboard data unavailable: ' + (error.message || 'request failed') + '.';
   } finally {
     inFlight = false;
   }

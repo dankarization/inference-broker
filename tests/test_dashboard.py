@@ -152,11 +152,17 @@ class DashboardTests(unittest.TestCase):
             self.assertNotIn('http-equiv', page.lower())
             self.assertIn('every 30 seconds in the background', page)
         self.assertIn('refreshes every 30 seconds', html)
+        self.assertIn('<footer>', html)
+        self.assertLess(html.index('</main>'), html.index('Data refreshes every 30 seconds'))
+        self.assertNotIn('Finished: Asia/Tbilisi', html)
+        self.assertEqual(html.count('id="queue-pause"'), 1)
+        self.assertLess(html.index('<h1>'), html.index('id="queue-pause"'))
+        self.assertLess(html.index('id="queue-pause"'), html.index('<main'))
         # Wide tables scroll in their own box instead of stretching the page.
         self.assertEqual(html.count('<div class="table-scroll">'), 4)
         for name in ('sources-table', 'active-table', 'forecast-table', 'history-table'):
             self.assertIn(f'<div class="table-scroll"><table id="{name}">', html)
-        self.assertIn('mm:ss', html)
+        self.assertIn('mm:ss', (Path(__file__).resolve().parents[1] / 'broker/static/dashboard.js').read_text(encoding='utf-8'))
         self.assertIn('Dashboard data unavailable', unavailable.content.decode())
         self.assertNotIn('Completed:', unavailable.content.decode())
 
@@ -184,6 +190,13 @@ class DashboardTests(unittest.TestCase):
         # Narrow-screen rules exist and never touch the wide default layout.
         self.assertIn('@media (max-width: 900px)', css)
         self.assertIn('@media (max-width: 640px)', css)
+        self.assertIn('.error:empty', css)
+        narrow = css[css.index('@media (max-width: 640px)'):]
+        self.assertIn('.topbar-in { flex-wrap: wrap;', narrow)
+        self.assertIn('.stamp { flex: 1 0 100%;', narrow)
+        self.assertIn('#active-table thead th', css)
+        self.assertIn('#forecast-table thead th', css)
+        self.assertIn('#history-table thead th', css)
         self.assertIn('@media (max-width: 480px)', css)
         self.assertLess(css.index('.table-scroll'), css.index('@media'))
         # Column hiding is scoped to the narrow queries only (the [hidden]

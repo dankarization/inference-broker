@@ -159,6 +159,16 @@ const durationCases = JSON.parse(
   assert.equal(page.requests[0].url, '/v1/dashboard');
   assert.equal(id('dashboard-live').hidden, false);
   assert.equal(id('dashboard-error').hidden, true);
+  assert.equal(document.querySelector('header #queue-pause'), id('queue-pause'));
+  assert.equal(document.querySelectorAll('#queue-pause').length, 1);
+  assert.match(document.querySelector('footer').textContent, /Data refreshes every 30 seconds/);
+  assert.doesNotMatch(document.querySelector('.wrap').textContent, /Data refreshes every 30 seconds/);
+  assert.doesNotMatch(document.querySelector('body').textContent, /Finished: Asia\/Tbilisi/);
+  assert.equal(id('history-error').hidden, true);
+  assert.equal(id('history-error').textContent, '');
+  for (const tableId of ['active-table', 'forecast-table', 'history-table']) {
+    assert.equal(id(tableId).querySelector('thead .compact'), null, tableId);
+  }
   assert.equal(id('stale').hidden, false);
   assert.equal(id('stale').textContent, 'Showing stale data: <locked>.');
   assert.equal(id('maintenance').hidden, false);
@@ -251,6 +261,7 @@ const durationCases = JSON.parse(
   context.fetch = async () => { throw new Error('history offline'); };
   await page.observerCallbacks[0]([{isIntersecting: true}]);
   assert.match(id('history-error').textContent, /history offline/);
+  assert.equal(id('history-error').hidden, false);
   context.fetch = async () => ({ok: true, json: async () => ({
     items: [history('job-<one>'), history('next-history'), history('cancelled', null)], next_cursor: null
   })});
@@ -260,6 +271,7 @@ const durationCases = JSON.parse(
   assert.equal(id('history-body').rows[2].cells[6].textContent, '—');
   assert.equal(id('history-sentinel').dataset.cursor, '');
   assert.equal(id('history-error').textContent, '');
+  assert.equal(id('history-error').hidden, true);
 
   // Policy controls retain serialized latest-desired writes and failure recovery.
   const weightForm = document.querySelector('.weight-form'), select = weightForm.elements.weight;
