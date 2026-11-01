@@ -14,6 +14,13 @@ class Profile:
     request_timeout_seconds: int = 300
     max_images: int = 0
     max_schema_bytes: int = 0
+    executor: str = "ollama"
+    # Unknown occupancy is exclusive until a specific coexistence cohort is proven.
+    occupancy_class: str = "unknown"
+    occupancy_cohort: str | None = None
+    occupancy_max_jobs: int = 1
+    occupancy_peak_vram_bytes: int | None = None
+    occupancy_evidence: str | None = None
     # Retained for durable jobs admitted with legacy evaluation profiles.
     default_context: int | None = None
 
@@ -21,6 +28,41 @@ class Profile:
 # This is deliberately server-owned. Callers can select a profile, never a model
 # or unbounded generation parameters.
 PROFILES = {
+    "nextcloud-eval-qwen-64k-v1": Profile(
+        "nextcloud-eval-qwen-64k-v1", "qwen3-vl:30b", 65_536, 16_384, 300,
+        max_images=4, request_timeout_seconds=1800,
+    ),
+    "eval-gemma4-12b": Profile(
+        "eval-gemma4-12b", "gemma4:12b", 8_192, 2_048, 300,
+        request_timeout_seconds=900, max_images=4,
+    ),
+    "eval-gemma4-26b": Profile(
+        "eval-gemma4-26b", "gemma4:26b", 8_192, 2_048, 300,
+        request_timeout_seconds=900, max_images=4,
+    ),
+    # Opt-in independent visual verification. Qualification belongs to caller.
+    "nextcloud-verify-gemma26": Profile(
+        "nextcloud-verify-gemma26", "gemma4:26b", 16_384, 4_096, 300,
+        max_images=4, request_timeout_seconds=900,
+    ),
+    # Worker004 generate lane, distinct from isolated pilot image-chat evaluation.
+    "nextcloud-eval-qwen": Profile(
+        "nextcloud-eval-qwen", "qwen3-vl:30b", 16_384, 8_192, 300,
+        max_images=4, request_timeout_seconds=900,
+    ),
+    # Explicit opt-in technical-document evaluation; never an OpenClaw route.
+    "eval-qwen3-vl-2b": Profile(
+        "eval-qwen3-vl-2b", "qwen3-vl:2b-instruct-q4_K_M", 8_192, 2_048, 300,
+        request_timeout_seconds=900, max_images=4,
+    ),
+    "eval-qwen3-vl-30b": Profile(
+        "eval-qwen3-vl-30b", "qwen3-vl:30b", 16_384, 8_192, 300,
+        request_timeout_seconds=900, max_images=4,
+    ),
+    "nextcloud-qwen3-vl": Profile(
+        "nextcloud-qwen3-vl", "qwen3-vl:30b", 16_384, 8_192, 300,
+        max_images=4, request_timeout_seconds=900,
+    ),
     "stt-whisper": Profile("stt-whisper", "whisper-medium-int8-mainpc-cuda", 0, 0, 0,
                            request_timeout_seconds=960),
     "interactive": Profile("interactive", "nemotron3:33b", 16_384, 2_048, 180),
@@ -30,6 +72,10 @@ PROFILES = {
                         request_timeout_seconds=900),
     "openclaw-gemma4": Profile("openclaw-gemma4", "gemma4:12b", 262_144, 16_384, 300,
                                request_timeout_seconds=900, max_images=16),
+    # Native metadata ceiling, not a claim of validated occupied context.
+    # Bound long-prefill attempts to one hour; other model lanes are unchanged.
+    "openclaw-gemma4-26b": Profile("openclaw-gemma4-26b", "gemma4:26b", 262_144, 8_192, 300,
+                                   request_timeout_seconds=3600, max_images=16),
     "openclaw-qwen3-vl": Profile("openclaw-qwen3-vl", "qwen3-vl:30b", 212_992, 16_384, 300,
                                 request_timeout_seconds=900, max_images=16),
     "openclaw-nemotron3": Profile("openclaw-nemotron3", "nemotron3:33b", 131_072, 8_192, 300,
@@ -42,6 +88,25 @@ PROFILES = {
                                       262_144, 16_384, 300, request_timeout_seconds=900),
     "openclaw-gpt-oss": Profile("openclaw-gpt-oss", "gpt-oss:20b", 131_072, 16_384, 300,
                                 request_timeout_seconds=900),
+    # Exact artifact metadata ceiling; not measured context/vision acceptance.
+    "openclaw-bolt-e4b": Profile(
+        "openclaw-bolt-e4b", "nemotron-3.5-bolt:e4b", 65_536, 8_192, 300,
+        request_timeout_seconds=1800, max_images=4,
+    ),
+    # Opt-in bounded smoke lanes only. Admission does not establish executor
+    # vision support or agent/tool compatibility for these model artifacts.
+    "openclaw-qwen3-vl-2b": Profile(
+        "openclaw-qwen3-vl-2b", "qwen3-vl:2b-instruct-q4_K_M", 8_192, 2_048, 300,
+        request_timeout_seconds=600, max_images=4,
+    ),
+    "openclaw-smolvlm2-2b": Profile(
+        "openclaw-smolvlm2-2b", "hf.co/ggml-org/SmolVLM2-2.2B-Instruct-GGUF:Q4_K_M",
+        8_192, 2_048, 300, request_timeout_seconds=600, max_images=4,
+    ),
+    "openclaw-smolvlm2-500m": Profile(
+        "openclaw-smolvlm2-500m", "hf.co/ggml-org/SmolVLM2-500M-Video-Instruct-GGUF:Q8_0",
+        8_192, 2_048, 300, request_timeout_seconds=600, max_images=4,
+    ),
     # Shutterstock photos stay on cloud/OmniRoute and deliberately have no
     # broker profile. Only the local video workload may acquire MAIN-PC.
     # The video lane is multimodal: one chunk arrives as base64 frames plus a
@@ -80,6 +145,11 @@ PROFILES = {
         "syncopia-memory-qwen38", "qwen3.8:ad-iq2-xs", 65_536, 8_192, 1_800,
         max_concurrency=1, request_timeout_seconds=900,
         max_schema_bytes=65_536,
+    ),
+    # Explicit full-day text opt-in; old 64K extraction/freeform jobs stay unchanged.
+    "syncopia-memory-qwen38-128k-v1": Profile(
+        "syncopia-memory-qwen38-128k-v1", "qwen3.8:ad-iq2-xs", 131_072, 8_192, 1_800,
+        max_concurrency=1, request_timeout_seconds=900,
     ),
     # Seven isolated, text-only comparison lanes.  They deliberately share one
     # source so their evaluations cannot borrow any production caller's share.
@@ -122,12 +192,37 @@ PROFILES = {
     ),
 }
 
+# Distinct scheduler lanes; model labels are not caller-controlled Ollama models.
+VOICE_PROFILE_NAMES = frozenset({"voice-wyoming-v1", "voice-gigaam-v1", "voice-whisper-gpu-v1", "voice-native-cpu-v1"})
+for _name in VOICE_PROFILE_NAMES:
+    PROFILES[_name] = Profile(_name, _name, 0, 0, 0, request_timeout_seconds=1800,
+                             executor="voice")
+
+# Separate text-only comparison lane; never borrow an existing producer source.
+NIGHTLY_PROFILE_NAMES = frozenset({
+    "telegram-nightly-qwen38-v1", "telegram-nightly-gemma12-v1",
+    "telegram-nightly-gemma26-v1", "telegram-nightly-nemotron-nano-v1",
+})
+for _name, _model in (
+    ("telegram-nightly-qwen38-v1", "qwen3.8:ad-iq2-xs"),
+    ("telegram-nightly-gemma12-v1", "gemma4:12b"),
+    ("telegram-nightly-gemma26-v1", "gemma4:26b"),
+    ("telegram-nightly-nemotron-nano-v1", "nemotron-3-nano:30b-a3b-q4_K_M"),
+):
+    PROFILES[_name] = Profile(_name, _model, 32_768, 8_192, 300,
+                             request_timeout_seconds=1800)
+
 _OPENCLAW_PROFILE_NAMES = (
     "openclaw", "openclaw-gemma4", "openclaw-qwen3-vl", "openclaw-nemotron3",
     "openclaw-unc-rvn-iq2xxs", "openclaw-ministral3", "openclaw-nemotron-nano",
-    "openclaw-gpt-oss",
+    "openclaw-gpt-oss", "openclaw-gemma4-26b", "openclaw-bolt-e4b",
+    "openclaw-qwen3-vl-2b", "openclaw-smolvlm2-2b", "openclaw-smolvlm2-500m",
 )
 OPENCLAW_PROFILES_BY_MODEL = {
     PROFILES[name].model: name for name in _OPENCLAW_PROFILE_NAMES
 }
 OPENCLAW_PROFILE_NAMES = frozenset(OPENCLAW_PROFILES_BY_MODEL.values())
+
+EVALUATION_PROFILE_NAMES = frozenset({
+    "eval-qwen3-vl-2b", "eval-qwen3-vl-30b", "eval-gemma4-12b", "eval-gemma4-26b",
+})

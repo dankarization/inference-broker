@@ -1,4 +1,5 @@
 from __future__ import annotations
+import hashlib
 import hmac
 import json
 import select
@@ -11,8 +12,8 @@ from urllib.parse import parse_qs, unquote, urlsplit
 from .compat import (CompatibilityError, stream_frames, submit as submit_compatibility,
                      submit_olya_decision, submit_olya_vision, submit_shutterstock_canary,
                      submit_shutterstock_video, submit_syncopia_memory)
-from .profiles import OPENCLAW_PROFILES_BY_MODEL, PROFILES
-from .dashboard import render as render_dashboard
+from .profiles import OPENCLAW_PROFILES_BY_MODEL, PROFILES, VOICE_PROFILE_NAMES
+from .dashboard_assets import DashboardAssets
 from .policy import SourcePolicyError
 from .service import SourceAdmissionBlocked, SourceQueueFull, StorageAuthorizationRequired
 from .storage import ReceiptConflict, StorageContractError
@@ -20,9 +21,16 @@ from .openclaw import (HEARTBEAT_SECONDS, MAX_OUTSTANDING, MAX_REQUEST_BYTES, MA
                        OpenClawRequestError, error_frame, heartbeat, normalize_request, terminal_frame)
 
 
+def openclaw_wait_seconds(profile):
+    # Keep the existing queue budget, with five minutes of admission/switch
+    # headroom for profiles whose execution budget exceeds the old waiter.
+    return max(MAX_WAIT_SECONDS, profile.request_timeout_seconds + 300)
+
+
 def serve(broker, host="127.0.0.1", port=8088, policy=None, storage_token=None, asr_api=None):
     broker.use_source_policy(policy)
     openclaw_slots = threading.BoundedSemaphore(MAX_OUTSTANDING)
+    dashboard_assets = DashboardAssets()
     class Handler(BaseHTTPRequestHandler):
         def _json(self, status, value, headers=None):
             encoded=json.dumps(value).encode(); self.send_response(status); self.send_header("Content-Type","application/json"); self.send_header("Content-Length",str(len(encoded)))
@@ -57,10 +65,12 @@ def serve(broker, host="127.0.0.1", port=8088, policy=None, storage_token=None, 
                 self._json(401, {"error": {"code": "storage_auth_required"}})
                 return False
             return True
-        def _dashboard_validator(self, include_producer_storage):
+        def _dashboard_validator(self, include_producer_storage, asset_version=None):
             etag = broker.dashboard_etag(
                 policy, include_producer_storage=include_producer_storage,
             )
+            if asset_version is not None:
+                etag = '"' + hashlib.sha256((etag + asset_version).encode()).hexdigest() + '"'
             headers = {"ETag": etag, "Cache-Control": "private, no-cache"}
             if self.headers.get("If-None-Match") == etag:
                 self.send_response(304)
@@ -120,7 +130,7 @@ def serve(broker, host="127.0.0.1", port=8088, policy=None, storage_token=None, 
                 if job["state"] == "completed" and "result" not in job:
                     self._json(410, {"error": "broker result has expired", "job_id": job["id"]})
                     return
-                deadline = time.monotonic() + MAX_WAIT_SECONDS
+                deadline = time.monotonic() + openclaw_wait_seconds(PROFILES[job["profile"]])
                 try:
                     if streaming:
                         self.send_response(200)
@@ -209,23 +219,32 @@ def serve(broker, host="127.0.0.1", port=8088, policy=None, storage_token=None, 
             asr_job = None
             if path.startswith("/v1/jobs/"):
                 asr_job = broker.status(path.split("/")[3])
-            if ((isinstance(body, dict) and (body.get("kind") == "transcribe"
+            if ((isinstance(body, dict) and ((body.get("kind") == "transcribe" and body.get("profile") not in VOICE_PROFILE_NAMES)
                      or body.get("profile") == "stt-whisper" or body.get("source") == "stt-whisper"))
                     or unquote(path).startswith("/v1/sources/stt-whisper/")
-                    or (asr_job and asr_job.get("kind") == "transcribe")):
+                    or (asr_job and asr_job.get("profile") == "stt-whisper")):
                 self._json(403, {"error": "use authenticated ASR API"})
                 return
-            if path == "/v1/jobs":
+            if path == "/v1/queue/pause":
+                if not isinstance(body, dict) or set(body) != {"paused"} or not isinstance(body["paused"], bool):
+                    self._json(400, {"error": "body must contain only boolean paused"})
+                    return
+                self._json(200, broker.set_queue_paused(body["paused"]))
+            elif path == "/v1/jobs":
                 if (
                     isinstance(body, dict) and body.get("producer_storage") is not None
                     and not self._storage_authorized()
                 ):
                     return
                 try:
-                    self._json(202, broker.submit(body["profile"], body["kind"], body.get("payload", {}),
-                                                  body.get("source"), body.get("source_item_id"),
-                                                  body.get("external_id"),
-                                                  body.get("producer_storage")))
+                    if not isinstance(body, dict): raise ValueError("request body must be JSON object")
+                    projection = parse_qs(urlsplit(self.path).query, keep_blank_values=True).get("projection")
+                    if projection is not None and (projection != ["nextcloud-final-v1"] or body.get("source") != "nextcloud"):
+                        raise ValueError("unsupported projection")
+                    result = broker.submit(body["profile"], body["kind"], body.get("payload", {}),
+                                           body.get("source"), body.get("source_item_id"),
+                                           body.get("external_id"), body.get("producer_storage"))
+                    self._json(202, broker.nextcloud_projection(result) if projection else result)
                 except SourceAdmissionBlocked as error: self._admission_blocked(error)
                 except SourceQueueFull as error: self._json(429, {"error": str(error)})
                 except (KeyError, TypeError, ValueError, StorageContractError) as e: self._json(400, {"error": str(e)})
@@ -248,6 +267,19 @@ def serve(broker, host="127.0.0.1", port=8088, policy=None, storage_token=None, 
                 except ReceiptConflict as error:
                     self._json(409, {"error": {"code": error.code, "message": str(error)}})
                 except StorageContractError as error:
+                    self._json(400, {"error": str(error)})
+            elif path == "/v1/maintenance/admission":
+                if not self._storage_authorized():
+                    return
+                try:
+                    if policy is None or not isinstance(body, dict) or set(body) != {"enabled", "expected_sha256"}:
+                        raise SourcePolicyError("maintenance requires enabled, expected_sha256 and a source policy")
+                    # The same lock serializes every durable claim/requeue, so
+                    # a successful response is an admission barrier.
+                    with broker.lock:
+                        enabled = policy.set_maintenance(body["enabled"], body["expected_sha256"])
+                    self._json(200, {"maintenance": enabled})
+                except SourcePolicyError as error:
                     self._json(400, {"error": str(error)})
             elif path == "/v1/maintenance/compact":
                 if not self._storage_authorized():
@@ -276,6 +308,7 @@ def serve(broker, host="127.0.0.1", port=8088, policy=None, storage_token=None, 
                     return
                 try:
                     result=broker.retry(job_id); self._json(200 if result else 404, result or {"error":"not found"})
+                except SourceAdmissionBlocked as error: self._admission_blocked(error)
                 except ValueError as e: self._json(409, {"error":str(e)})
                 except SourceQueueFull as e: self._json(429, {"error":str(e)})
             elif path.startswith("/v1/sources/") and path.endswith("/weight"):
@@ -362,6 +395,8 @@ def serve(broker, host="127.0.0.1", port=8088, policy=None, storage_token=None, 
                     ))
                 except StorageAuthorizationRequired:
                     self._storage_authorized()
+                except SourceAdmissionBlocked as error:
+                    self._admission_blocked(error)
                 except (SourcePolicyError, ValueError) as error:
                     self._json(400, {"error": str(error)})
                 except SourceQueueFull as error:
@@ -488,20 +523,49 @@ def serve(broker, host="127.0.0.1", port=8088, policy=None, storage_token=None, 
             parsed = urlsplit(self.path)
             path = parsed.path
             query = parse_qs(parsed.query)
-            if path == "/dashboard":
+            if path.startswith("/dashboard/assets/"):
+                try:
+                    asset = dashboard_assets.read(path.removeprefix("/dashboard/assets/"))
+                except KeyError:
+                    self._json(404, {"error": "not found"})
+                    return
+                except OSError:
+                    self._json(503, {"error": "dashboard asset unavailable"}, {"Cache-Control": "no-store"})
+                    return
+                etag = asset.etag
+                unchanged = self.headers.get("If-None-Match") == etag
+                self.send_response(304 if unchanged else 200)
+                self.send_header("Content-Type", asset.content_type)
+                self.send_header("Cache-Control", "no-cache")
+                self.send_header("ETag", etag)
+                if not unchanged:
+                    self.send_header("Content-Length", str(len(asset.content)))
+                self.end_headers()
+                if not unchanged:
+                    self.wfile.write(asset.content)
+            elif path == "/dashboard":
+                try:
+                    live_page, unavailable_page, version = dashboard_assets.pages()
+                except OSError:
+                    self._json(503, {"error": "dashboard assets unavailable"}, {"Cache-Control": "no-store"})
+                    return
                 include_producer_storage = self._storage_authenticated()
-                etag, headers = self._dashboard_validator(include_producer_storage)
+                etag, headers = self._dashboard_validator(include_producer_storage, version)
                 if etag is None:
                     return
-                dashboard = broker.dashboard(
-                    policy,
-                    include_producer_storage=include_producer_storage,
-                )
-                encoded = render_dashboard(dashboard)
-                status = 503 if dashboard["observation"]["state"] == "unavailable" else 200
-                self.send_response(status); self.send_header("Content-Type", "text/html; charset=utf-8"); self.send_header("Content-Length", str(len(encoded)))
+                # Preserve the 503 contract; rows and counters now come only
+                # from the client's /v1/dashboard request, not Python rendering.
+                dashboard = broker.dashboard(policy, include_producer_storage=include_producer_storage)
+                unavailable = dashboard["observation"]["state"] == "unavailable"
+                page = unavailable_page if unavailable else live_page
+                if unavailable:
+                    headers["Cache-Control"] = "no-store"
+                self.send_response(503 if unavailable else 200)
+                self.send_header("Content-Type", page.content_type)
+                self.send_header("Content-Length", str(len(page.content)))
                 for name, value in headers.items(): self.send_header(name, value)
-                self.end_headers(); self.wfile.write(encoded)
+                self.end_headers()
+                self.wfile.write(page.content)
             elif path == "/v1/dashboard":
                 include_producer_storage = self._storage_authenticated()
                 etag, headers = self._dashboard_validator(include_producer_storage)
@@ -515,6 +579,15 @@ def serve(broker, host="127.0.0.1", port=8088, policy=None, storage_token=None, 
                     503 if dashboard["observation"]["state"] == "unavailable" else 200,
                     dashboard, headers,
                 )
+            elif path == "/v1/nightly-eval/contract":
+                from .nightly_eval import contract
+                self._json(200, contract())
+            elif path == "/v1/voice/capabilities":
+                from . import voice_cpu
+                try:
+                    self._json(200, voice_cpu.capabilities())
+                except ValueError:
+                    self._json(503, {"error": "CPU voice capability unavailable"})
             elif path == "/healthz": self._json(200, broker.health())
             elif path == "/v1/metrics": self._json(200, broker.metrics())
             elif path == "/v1/storage/health": self._json(200, broker.storage_health())
@@ -546,6 +619,10 @@ def serve(broker, host="127.0.0.1", port=8088, policy=None, storage_token=None, 
                     body = broker.terminal_history(
                         limit=limit, cursor=cursor,
                         include_producer_storage=self._storage_authenticated(),
+                        source_weights={
+                            name: entry.get("weight")
+                            for name, entry in ((policy.snapshot().get("sources") if policy is not None else {}) or {}).items()
+                        },
                     )
                     if body.get("next_cursor"):
                         body["next_cursor"] = f"{body['next_cursor'][0]}:{body['next_cursor'][1]}"
@@ -598,7 +675,15 @@ def serve(broker, host="127.0.0.1", port=8088, policy=None, storage_token=None, 
                 job_id = path.split("/")[3]
                 if broker.producer_storage_job(job_id) and not self._storage_authorized():
                     return
-                result=broker.status(job_id); self._json(200 if result else 404, result or {"error":"not found"})
+                try:
+                    result = broker.status(job_id)
+                    projection = parse_qs(urlsplit(self.path).query, keep_blank_values=True).get("projection")
+                    if projection is not None:
+                        if projection != ["nextcloud-final-v1"]: raise ValueError("unsupported projection")
+                        result = broker.nextcloud_projection(result)
+                    self._json(200 if result else 404, result or {"error":"not found"})
+                except ValueError as error:
+                    self._json(400, {"error": str(error)})
             else: self._json(404, {"error":"not found"})
         def log_message(self, *_): pass
     return ThreadingHTTPServer((host, port), Handler)

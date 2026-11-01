@@ -1,0 +1,193 @@
+{
+  "capacity": {
+    "global_limits": {
+      "active_input_bytes_hard_cap": null,
+      "active_job_count_hard_cap": null,
+      "admission_disk_reserve": {
+        "available": "max(0, free_bytes - reserve)",
+        "failure_http": 400,
+        "formula": "max(configured min_free_space_bytes, ceil(total_fs_bytes*0.05))",
+        "fraction_total_fs": 0.05,
+        "minimum_bytes_default": 2147483648,
+        "scope": "all new admissions"
+      },
+      "effective_live_state": "not inferred; main reads actual source policy/storage health/free space separately",
+      "http_payload_bound_scope": "normalizer after HTTP JSON parsing; envelope/preparse is NOT a global hard cap",
+      "http_v1_jobs_preparse_content_length_hard_cap": null,
+      "soft_maintenance_targets": {
+        "database_bytes": 2147483648,
+        "journal_size_limit_bytes": 67108864,
+        "note": "not hard admission/FS quotas; WAL can exceed under busy reader",
+        "wal_autocheckpoint_pages": 4096,
+        "wal_budget_bytes": 134217728
+      },
+      "terminal_inline_retention": {
+        "enabled_by_default": false,
+        "enforcement": "ONLY when retention_enabled for the admitting source; terminal bytes, not active queue count",
+        "failure_http": 400,
+        "global_budget_bytes": 805306368,
+        "source_budget_default_bytes": 134217728
+      }
+    },
+    "nextcloud": {
+      "active_eval_jobs": 256,
+      "active_eval_payload_bytes": 268435456,
+      "legacy_route_outstanding_jobs": 2,
+      "scope": "separate Nextcloud guard, NOT pilot capacity"
+    },
+    "pilot": {
+      "active_jobs": 512,
+      "active_normalized_payload_bytes": 536870912,
+      "active_states": [
+        "queued",
+        "running",
+        "cancel_requested"
+      ],
+      "full_queue_http": 429,
+      "job_body_storage": "SQLite broker_temporary inline; no producer refs/external spool bypass",
+      "keyed_replay": "same source/external_id/profile/kind/input_hash/source_item_id returns existing before admission gates",
+      "normalized_bytes_formula": "storage.content_evidence(normalized_payload)[1], includes base64 expansion",
+      "source_policy": "must exist, enabled=true, admission_allowed=true; main alone changes policy",
+      "unknown_post": "recover correlation+status exact identity; absence does NOT authorize blind replay"
+    }
+  },
+  "deployment_status": "SOURCE_ONLY_NOT_LIVE",
+  "doc100": {
+    "all_at_once_requires": "existing_pilot_active+400<=512 AND active_payload_bytes+planned_normalized_bytes<=512MiB AND source policy open AND disk/retention guards pass",
+    "cloud_lane": "independent; never wait local completion or success as a cloud admission barrier",
+    "documents": 100,
+    "jobs": 400,
+    "models": 4,
+    "on_pressure": "persist producer plan/intents, bounded admission/collection sweeps; no model-turn per file/no queue bypass"
+  },
+  "evidence": {
+    "digest_scope": "intended installed snapshot, NOT cryptographic per-dispatch attestation",
+    "inference_executed": false,
+    "model_capability_check": "metadata-only local /api/show and /api/tags 2026-10-25T18:04:17Z; installed vision confirmed for Gemma12/Gemma26",
+    "qualification_created": false
+  },
+  "nextcloud_verifier": {
+    "keep_alive": 300,
+    "kind": "generate",
+    "model": "gemma4:26b",
+    "model_digest": "sha256:001e5dafc3c77684c2307ebc6ab8e336e10c9b18eca52acf547d72fc83c3ca8c",
+    "options": {
+      "num_ctx": 16384,
+      "num_predict": 4096,
+      "temperature": 0
+    },
+    "profile": "nextcloud-verify-gemma26",
+    "quantization": "Q4_K_M",
+    "schema": "nextcloud-verify-gemma26-v1",
+    "source": "nextcloud",
+    "stream": false,
+    "think": false
+  },
+  "pilot_profiles": [
+    {
+      "assistant_history": false,
+      "intended_model_digest": "sha256:4eb23ef187e2c5462566d6a1d3bbbc2f1346d0b4327cbb66d58fffbcc9b2b05c",
+      "keep_alive": 300,
+      "kind": "chat",
+      "max_decoded_image_bytes_total": 25165824,
+      "max_format_schema_bytes": 65536,
+      "max_image_payload_json_bytes": 33554432,
+      "max_images": 4,
+      "max_system_user_messages": 16,
+      "max_text_payload_json_bytes": 2097152,
+      "model": "gemma4:12b",
+      "options": {
+        "num_ctx": 8192,
+        "num_predict": 2048,
+        "temperature": 0
+      },
+      "producer_storage_references": false,
+      "profile": "eval-gemma4-12b",
+      "quantization": "Q4_K_M",
+      "source": "pilot-mainpc",
+      "stream": false,
+      "think": false,
+      "timeout_seconds": 900,
+      "tools": false
+    },
+    {
+      "assistant_history": false,
+      "intended_model_digest": "sha256:001e5dafc3c77684c2307ebc6ab8e336e10c9b18eca52acf547d72fc83c3ca8c",
+      "keep_alive": 300,
+      "kind": "chat",
+      "max_decoded_image_bytes_total": 25165824,
+      "max_format_schema_bytes": 65536,
+      "max_image_payload_json_bytes": 33554432,
+      "max_images": 4,
+      "max_system_user_messages": 16,
+      "max_text_payload_json_bytes": 2097152,
+      "model": "gemma4:26b",
+      "options": {
+        "num_ctx": 8192,
+        "num_predict": 2048,
+        "temperature": 0
+      },
+      "producer_storage_references": false,
+      "profile": "eval-gemma4-26b",
+      "quantization": "Q4_K_M",
+      "source": "pilot-mainpc",
+      "stream": false,
+      "think": false,
+      "timeout_seconds": 900,
+      "tools": false
+    },
+    {
+      "assistant_history": false,
+      "intended_model_digest": "sha256:afc393e3572c07db0bc84aa460d928a16c75f3fbb9ca9e0dccc4fbd2dafb573e",
+      "keep_alive": 300,
+      "kind": "chat",
+      "max_decoded_image_bytes_total": 25165824,
+      "max_format_schema_bytes": 65536,
+      "max_image_payload_json_bytes": 33554432,
+      "max_images": 4,
+      "max_system_user_messages": 16,
+      "max_text_payload_json_bytes": 2097152,
+      "model": "qwen3-vl:2b-instruct-q4_K_M",
+      "options": {
+        "num_ctx": 8192,
+        "num_predict": 2048,
+        "temperature": 0
+      },
+      "producer_storage_references": false,
+      "profile": "eval-qwen3-vl-2b",
+      "quantization": "Q4_K_M",
+      "source": "pilot-mainpc",
+      "stream": false,
+      "think": false,
+      "timeout_seconds": 900,
+      "tools": false
+    },
+    {
+      "assistant_history": false,
+      "intended_model_digest": "sha256:eda0be1008774ea4e575187712b9a3b1201f3e66e7ecff899cc295db1cf00248",
+      "keep_alive": 300,
+      "kind": "chat",
+      "max_decoded_image_bytes_total": 25165824,
+      "max_format_schema_bytes": 65536,
+      "max_image_payload_json_bytes": 33554432,
+      "max_images": 4,
+      "max_system_user_messages": 16,
+      "max_text_payload_json_bytes": 2097152,
+      "model": "qwen3-vl:30b",
+      "options": {
+        "num_ctx": 16384,
+        "num_predict": 8192,
+        "temperature": 0
+      },
+      "producer_storage_references": false,
+      "profile": "eval-qwen3-vl-30b",
+      "quantization": "Q4_K_M",
+      "source": "pilot-mainpc",
+      "stream": false,
+      "think": false,
+      "timeout_seconds": 900,
+      "tools": false
+    }
+  ],
+  "schema": "pilot-doc100-source-contract-v1"
+}

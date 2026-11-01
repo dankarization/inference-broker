@@ -9,9 +9,9 @@ from unittest.mock import patch
 from urllib.error import HTTPError
 from urllib.request import Request, ProxyHandler, build_opener
 
-from broker.http import serve
+from broker.http import openclaw_wait_seconds, serve
 from broker.openclaw import MODEL, normalize_request
-from broker.profiles import OPENCLAW_PROFILES_BY_MODEL, PROFILES
+from broker.profiles import OPENCLAW_PROFILES_BY_MODEL, PROFILES, VOICE_PROFILE_NAMES
 from broker.service import Broker, SourceQueueFull
 
 
@@ -149,7 +149,9 @@ class OpenClawRouteTests(unittest.TestCase):
 
     def test_all_configured_models_route_to_server_owned_profiles(self):
         cases = {
+            "nemotron-3.5-bolt:e4b": (65_536, 8_192, True),
             "gemma4:12b": (262_144, 16_384, True),
+            "gemma4:26b": (262_144, 8_192, True),
             "qwen3-vl:30b": (212_992, 16_384, True),
             "nemotron3:33b": (131_072, 8_192, True),
             "qwen3.8:ad-iq2-xs": (131_072, 16_384, False),
@@ -157,6 +159,9 @@ class OpenClawRouteTests(unittest.TestCase):
             "frob/ministral-3:14b-thinking-q4_K_M": (262_144, 16_384, True),
             "nemotron-3-nano:30b-a3b-q4_K_M": (262_144, 16_384, False),
             "gpt-oss:20b": (131_072, 16_384, False),
+            "qwen3-vl:2b-instruct-q4_K_M": (8_192, 2_048, True),
+            "hf.co/ggml-org/SmolVLM2-2.2B-Instruct-GGUF:Q4_K_M": (8_192, 2_048, True),
+            "hf.co/ggml-org/SmolVLM2-500M-Video-Instruct-GGUF:Q8_0": (8_192, 2_048, True),
         }
         self.assertEqual(set(OPENCLAW_PROFILES_BY_MODEL), set(cases))
         for model, (context, output, vision) in cases.items():
@@ -169,6 +174,8 @@ class OpenClawRouteTests(unittest.TestCase):
                 if vision:
                     body["messages"] = [{"role": "user", "content": "describe",
                                          "images": ["aGVsbG8="]}]
+                if model == "nemotron-3.5-bolt:e4b":
+                    body["think"] = True
                 result = {}
                 def client():
                     with self.opener.open(self.request(body), timeout=5) as response:
@@ -202,6 +209,141 @@ class OpenClawRouteTests(unittest.TestCase):
                     self.assertEqual(caught.exception.code, 400)
         with self.assertRaises(HTTPError) as caught:
             self.opener.open(self.request({**self.sample(), "model": "caller-chosen:bad"}))
+        self.assertEqual(caught.exception.code, 400)
+
+    def test_bolt_boolean_modes_context_ladder_and_dispatch(self):
+        for think in (None, False, True):
+            for context in (1024, 8192, 16384, 32768, 49152, 65536):
+                with self.subTest(think=think, context=context):
+                    body = {"model": "nemotron-3.5-bolt:e4b", "messages": [
+                        {"role": "user", "content": "unchanged probe", "images": ["aGVsbG8="] * 4}],
+                        "options": {"num_ctx": context, "num_predict": 512}}
+                    if think is not None:
+                        body["think"] = think
+                    job = self.broker.submit("openclaw-bolt-e4b", "chat",
+                                             normalize_request(body), source="openclaw")
+                    self.assertTrue(self.broker.dispatch_once(frozenset({"openclaw"})))
+                    sent = self.ollama.requests[-1][1]
+                    self.assertEqual(sent["model"], body["model"])
+                    self.assertEqual(sent["options"], body["options"])
+                    self.assertEqual(sent["messages"], body["messages"])
+                    self.assertIs(sent["truncate"], False)
+                    self.assertIs(sent["shift"], False)
+                    self.assertEqual(sent["_broker_timeout_seconds"], 1800)
+                    if think is None:
+                        self.assertNotIn("think", sent)
+                    else:
+                        self.assertIs(sent["think"], think)
+                    self.assertEqual(self.broker.status(job["id"])["state"], "completed")
+
+    def test_bolt_rejects_unsupported_controls_and_out_of_range_probes(self):
+        body = {"model": "nemotron-3.5-bolt:e4b", "messages": [
+            {"role": "user", "content": "probe"}]}
+        for patch in (
+            *({"think": v} for v in ("low", "medium", "high", "max", 0, 1, None, [], {})),
+            *({"options": {"num_ctx": v}} for v in (None, 0, -1, True, 65537, 262144)),
+            *({"options": {"num_predict": v}} for v in (None, 0, -1, True, 8193)),
+            {"options": {"thinking_budget": 128}}, {"reasoning_budget": 128},
+            {"chat_template_kwargs": {"enable_thinking": True}},
+            {"truncate": True}, {"shift": True},
+            {"messages": [{"role": "user", "content": "x", "images": ["aGVsbG8="] * 5}]},
+        ):
+            with self.subTest(patch=patch), self.assertRaises(ValueError):
+                self.broker.submit("openclaw-bolt-e4b", "chat", {**body, **patch}, source="openclaw")
+        job = self.broker.submit("openclaw-bolt-e4b", "chat", normalize_request(body), source="openclaw")
+        self.assertTrue(self.broker.dispatch_once(frozenset({"openclaw"})))
+        self.assertEqual(self.ollama.requests[-1][1]["options"],
+                         {"num_ctx": 65536, "num_predict": 8192})
+
+    def test_small_vlm_smoke_profiles_enforce_dispatch_and_image_bounds(self):
+        # The executor is fake: these assertions verify broker admission and
+        # dispatch, not the artifacts' vision or agent/tool capabilities.
+        for model, profile_name in (
+            ("qwen3-vl:2b-instruct-q4_K_M", "openclaw-qwen3-vl-2b"),
+            ("hf.co/ggml-org/SmolVLM2-2.2B-Instruct-GGUF:Q4_K_M", "openclaw-smolvlm2-2b"),
+            ("hf.co/ggml-org/SmolVLM2-500M-Video-Instruct-GGUF:Q8_0", "openclaw-smolvlm2-500m"),
+        ):
+            with self.subTest(model=model):
+                self.assertEqual(OPENCLAW_PROFILES_BY_MODEL[model], profile_name)
+                self.assertEqual(PROFILES[profile_name].max_images, 4)
+                for options, expected in (
+                    ({}, {"num_ctx": 8192, "num_predict": 2048}),
+                    ({"num_ctx": 999999, "num_predict": 999999},
+                     {"num_ctx": 8192, "num_predict": 2048}),
+                    ({"num_ctx": 2048, "num_predict": 128},
+                     {"num_ctx": 2048, "num_predict": 128}),
+                ):
+                    body = {"model": model, "messages": [
+                        {"role": "user", "content": "describe", "images": ["aGVsbG8="] * 4}],
+                        "options": options}
+                    job = self.broker.submit(profile_name, "chat", normalize_request(body),
+                                             source="openclaw")
+                    self.assertTrue(self.broker.dispatch_once(frozenset({"openclaw"})))
+                    request = self.ollama.requests[-1][1]
+                    self.assertEqual(request["model"], model)
+                    self.assertEqual(request["options"], expected)
+                    self.assertEqual(request["_broker_timeout_seconds"], 600)
+                    self.assertEqual(request["messages"], body["messages"])
+                    self.assertEqual(self.broker.status(job["id"])["state"], "completed")
+                for messages, error in (
+                    ([{"role": "user", "content": "x", "images": ["aGVsbG8="] * 5}],
+                     "too many images"),
+                    ([{"role": "user", "content": "x", "images": ["aGVsbG8="] * 3},
+                      {"role": "user", "content": "x", "images": ["aGVsbG8="] * 2}],
+                     "too many images"),
+                    ([{"role": "assistant", "content": "x", "images": ["aGVsbG8="]}],
+                     "images require"),
+                    ([{"role": "user", "content": "x", "images": ["not base64!"]}],
+                     "valid base64"),
+                ):
+                    with self.assertRaisesRegex(ValueError, error):
+                        self.broker.submit(profile_name, "chat", {"messages": messages},
+                                           source="openclaw")
+                with self.assertRaisesRegex(ValueError, "configured OpenClaw model"):
+                    normalize_request({"model": model + "-unknown", "messages": body["messages"]})
+                with self.assertRaisesRegex(ValueError, "requires source openclaw"):
+                    self.broker.submit(profile_name, "generate", normalize_request(body),
+                                       source="openclaw")
+
+    def test_gemma4_26b_smoke_options_thinking_and_server_caps(self):
+        for think, requested, expected in (
+            (False, {"num_ctx": 8192, "num_predict": 512},
+             {"num_ctx": 8192, "num_predict": 512}),
+            (True, {"num_ctx": 999999, "num_predict": 999999},
+             {"num_ctx": 262144, "num_predict": 8192}),
+            (True, {}, {"num_ctx": 262144, "num_predict": 8192}),
+            *((False, {"num_ctx": size, "num_predict": 512},
+               {"num_ctx": size, "num_predict": 512})
+              for size in (32768, 65536, 131072, 196608, 262144)),
+        ):
+            with self.subTest(think=think, options=requested):
+                body = {**self.sample(), "model": "gemma4:26b", "think": think,
+                        "options": requested}
+                body["messages"][2]["thinking"] = "Use the read tool"
+                result = {}
+                def client():
+                    with self.opener.open(self.request(body), timeout=5) as response:
+                        result["body"] = json.loads(response.read())
+                        result["id"] = response.headers["X-Broker-Job-Id"]
+                caller = threading.Thread(target=client)
+                caller.start(); self.wait_queued()
+                self.assertTrue(self.broker.dispatch_once(frozenset({"openclaw"})))
+                caller.join(timeout=2)
+                self.assertFalse(caller.is_alive())
+                self.assertEqual(result["body"]["model"], "gemma4:26b")
+                job = self.broker.status(result["id"])
+                self.assertEqual((job["profile"], job["source"], job["state"]),
+                                 ("openclaw-gemma4-26b", "openclaw", "completed"))
+                request = self.ollama.requests[-1][1]
+                self.assertEqual(request["options"], expected)
+                self.assertIs(request["think"], think)
+                self.assertEqual(request["messages"], body["messages"])
+                self.assertEqual(request["tools"], body["tools"])
+                self.assertEqual(request["keep_alive"], "300s")
+                self.assertEqual(request["_broker_timeout_seconds"], 3600)
+        with self.assertRaises(HTTPError) as caught:
+            self.opener.open(self.request({**body, "messages": [
+                {"role": "user", "content": "describe", "images": ["aGVsbG8="] * 17}]}))
         self.assertEqual(caught.exception.code, 400)
 
     def test_idempotency_queue_bound_and_failed_executor(self):
@@ -248,7 +390,7 @@ class OpenClawRouteTests(unittest.TestCase):
         self.assertEqual(output["frames"][-1]["status"], 502)
         self.assertEqual(output["frames"][-1]["error"], "broker job failed")
 
-        with patch("broker.http.MAX_WAIT_SECONDS", .05), patch("broker.http.HEARTBEAT_SECONDS", .02):
+        with patch("broker.http.openclaw_wait_seconds", return_value=.05), patch("broker.http.HEARTBEAT_SECONDS", .02):
             with self.assertRaises(HTTPError) as caught:
                 self.opener.open(self.request(self.sample(), {"Idempotency-Key": "retry-turn"}),
                                  timeout=2)
@@ -378,10 +520,36 @@ class OpenClawRouteTests(unittest.TestCase):
             self.assertEqual(self.broker.db.execute(
                 "SELECT state FROM jobs WHERE source='openclaw' ORDER BY created DESC LIMIT 1"
             ).fetchone()[0], "cancelled")
-        with patch("broker.http.MAX_WAIT_SECONDS", .05), patch("broker.http.HEARTBEAT_SECONDS", .02):
+        with patch("broker.http.openclaw_wait_seconds", return_value=.05), patch("broker.http.HEARTBEAT_SECONDS", .02):
             with self.assertRaises(HTTPError) as caught:
                 self.opener.open(self.request(self.sample()), timeout=2)
             self.assertEqual(caught.exception.code, 504)
+
+
+class NativeWaitBudgetTests(unittest.TestCase):
+    def test_long_prefill_budget_is_narrow_and_waiter_outlives_execution(self):
+        for name, profile in PROFILES.items():
+            if name == "openclaw-gemma4-26b":
+                self.assertEqual(profile.request_timeout_seconds, 3600)
+                self.assertEqual(openclaw_wait_seconds(profile), 3900)
+            elif name == "openclaw-bolt-e4b":
+                self.assertEqual(profile.request_timeout_seconds, 1800)
+                self.assertEqual(openclaw_wait_seconds(profile), 2100)
+            elif name.startswith("uncensored-eval-"):
+                # Mainline comparison lanes retain their separate two-hour budget.
+                self.assertEqual(profile.request_timeout_seconds, 7200)
+                self.assertEqual(openclaw_wait_seconds(profile), 7500)
+            elif name in VOICE_PROFILE_NAMES or name in {
+                "nextcloud-eval-qwen-64k-v1",
+                "telegram-nightly-qwen38-v1", "telegram-nightly-gemma12-v1",
+                "telegram-nightly-gemma26-v1", "telegram-nightly-nemotron-nano-v1",
+            }:
+                # Async-only profiles, including the unchanged deployed Qwen64
+                # baseline, are not new OpenClaw model routes.
+                self.assertEqual(profile.request_timeout_seconds, 1800)
+                self.assertEqual(openclaw_wait_seconds(profile), 2100)
+            else:
+                self.assertEqual(openclaw_wait_seconds(profile), 1800)
 
 
 if __name__ == "__main__":

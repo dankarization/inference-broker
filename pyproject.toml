@@ -1,7 +1,17 @@
 [project]
-name = "ollama-inference-broker"
+name = "inference-broker"
 version = "0.1.0"
 requires-python = ">=3.11"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["broker"]
+
+[tool.setuptools.package-data]
+broker = ["static/*.html", "static/*.css", "static/*.js", "table_sort.js"]

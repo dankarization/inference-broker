@@ -209,12 +209,12 @@ class BrokerTests(unittest.TestCase):
                 "prompt": "photo", "images": ["aGVsbG8="], "format": {},
             }, source="shutterstock")
 
-    def test_dispatch_allowlist_leaves_non_pilot_work_queued(self):
+    def test_dispatch_allowlist_leaves_other_work_queued(self):
         b=self.make(["nemotron3:33b"])
         blocked=b.submit("interactive", "generate", {"prompt":"do not run"})["id"]
-        pilot=b.submit("interactive", "generate", {"prompt":"pilot"}, source="pilot-mainpc")["id"]
-        self.assertTrue(b.dispatch_once(frozenset({"pilot-mainpc"})))
-        self.assertEqual(b.status(pilot)["state"], "completed")
+        allowed=b.submit("interactive", "generate", {"prompt":"allowed"}, source="allowed-source")["id"]
+        self.assertTrue(b.dispatch_once(frozenset({"allowed-source"})))
+        self.assertEqual(b.status(allowed)["state"], "completed")
         self.assertEqual(b.status(blocked)["state"], "queued")
 
     def test_canary_rate_limit_and_persisted_result(self):
@@ -517,14 +517,14 @@ class SourcePolicyTests(unittest.TestCase):
         sources = SourcePolicy(policy_path).snapshot()["sources"]
         self.assertEqual(
             {name: entry["weight"] for name, entry in sources.items()},
-            {"shutterstock-video": 3.0, "olya-vision": 8.0,
+            {"local-voice": 2.0, "shutterstock-video": 3.0, "olya-vision": 8.0,
              "olya-decision": 6.0, "syncopia-telegram-memory": 4.0},
         )
         for name, entry in sources.items():
             with self.subTest(source=name):
                 self.assertTrue(entry["enabled"])
                 self.assertTrue(entry["admission_allowed"])
-                self.assertTrue(entry["producer_storage_enabled"])
+                self.assertEqual(entry["producer_storage_enabled"], name != "local-voice")
                 self.assertFalse(entry["ack_required"])
                 self.assertFalse(entry["compaction_enabled"])
                 self.assertTrue(entry["legacy_result_fallback"])

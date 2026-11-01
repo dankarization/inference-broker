@@ -8,6 +8,7 @@ import binascii
 from typing import Any
 
 from .profiles import PROFILES
+from .qwen_budget import PROFILE as QWEN64_PROFILE
 
 
 class CompatibilityError(ValueError):
@@ -403,3 +404,76 @@ def _valid_messages(messages: Any) -> bool:
 
 def _frame(value: dict[str, Any]) -> bytes:
     return (json.dumps(value, separators=(",", ":")) + "\n").encode()
+
+
+GEMMA26_CONTRACT = dict(
+    schema="nextcloud-verify-gemma26-v1", model="gemma4:26b",
+    model_digest="sha256:001e5dafc3c77684c2307ebc6ab8e336e10c9b18eca52acf547d72fc83c3ca8c",
+    quantization="Q4_K_M", think=False,
+    options=dict(num_ctx=16384, num_predict=4096, temperature=0),
+    keep_alive=300, stream=False,
+)
+QWEN_EVAL_PROFILES = frozenset({"nextcloud-eval-qwen", QWEN64_PROFILE})
+NEXTCLOUD_PROFILES = frozenset({"nextcloud-qwen3-vl", "nextcloud-verify-gemma26"}) | QWEN_EVAL_PROFILES
+
+
+def validate_nextcloud_payload(request, profile_name="nextcloud-qwen3-vl"):
+    """Bounded dedicated lane; accepts its own normalized replay shape."""
+    if profile_name not in NEXTCLOUD_PROFILES:
+        raise CompatibilityError("not a Nextcloud profile")
+    profile = PROFILES[profile_name]
+    if not isinstance(request, dict) or set(request) - {
+        "prompt", "images", "model", "stream", "options", "keep_alive", "think",
+    }:
+        raise CompatibilityError("unsupported Nextcloud payload fields")
+    if request.get("model", profile.model) != profile.model:
+        raise CompatibilityError("Nextcloud model must match its dedicated profile")
+    prompt, images = request.get("prompt"), request.get("images")
+    if not isinstance(prompt, str) or not 1 <= len(prompt.encode()) <= 16_384:
+        raise CompatibilityError("Nextcloud prompt must be 1..16384 bytes")
+    if not isinstance(images, list) or not 1 <= len(images) <= profile.max_images:
+        raise CompatibilityError("Nextcloud requires 1..4 images")
+    for value in images:
+        if not isinstance(value, str) or not 1 <= len(value) <= 2_800_000:
+            raise CompatibilityError("Nextcloud image exceeds byte limit")
+        try:
+            decoded = base64.b64decode(value, validate=True)
+        except (ValueError, binascii.Error) as exc:
+            raise CompatibilityError("Nextcloud image must be base64") from exc
+        if not decoded or len(decoded) > 2_097_152:
+            raise CompatibilityError("Nextcloud image exceeds decoded byte limit")
+    if profile_name == "nextcloud-verify-gemma26":
+        if request.get("think") is not False:
+            raise CompatibilityError("Gemma26 verification requires think=false")
+        opts = request.get("options")
+        if (not isinstance(opts, dict) or type(opts.get("num_ctx")) is not int
+            or type(opts.get("num_predict")) is not int
+            or type(opts.get("temperature")) not in (int, float)
+            or opts != GEMMA26_CONTRACT["options"]
+            or request.get("stream", False) is not False
+            or type(request.get("keep_alive", 300)) is not int
+            or request.get("keep_alive", 300) != 300):
+            raise CompatibilityError("Gemma26 verification settings are server-owned")
+        return {"prompt": prompt, "images": images, "stream": False,
+                "options": dict(GEMMA26_CONTRACT["options"]), "think": False}
+    # Keep the exact v1 normalized payload for old submissions and replays.
+    # V2 is explicit thinking with a larger, still server-owned output budget.
+    if profile_name in QWEN_EVAL_PROFILES and request.get("think") is not True:
+        raise CompatibilityError("Nextcloud evaluation requires think=true")
+    if "think" in request and request["think"] is not True:
+        raise CompatibilityError("Nextcloud think must be true when supplied")
+    options = {"num_ctx": profile.max_context,
+               "num_predict": profile.max_output if "think" in request else 2_048,
+               "temperature": 0}
+    if profile_name in QWEN_EVAL_PROFILES:
+        supplied = request.get("options", options)
+        if (not isinstance(supplied, dict) or type(supplied.get("num_ctx")) is not int
+                or type(supplied.get("num_predict")) is not int
+                or type(supplied.get("temperature")) not in (int, float)):
+            raise CompatibilityError("Nextcloud evaluation options require exact numeric types")
+    if request.get("options", options) != options or request.get("stream", False) is not False:
+        raise CompatibilityError("Nextcloud options are server-owned")
+    if request.get("keep_alive", profile.keep_alive_seconds) != profile.keep_alive_seconds:
+        raise CompatibilityError("Nextcloud keep_alive is server-owned")
+    return {"prompt": prompt, "images": images, "stream": False, "options": options,
+            **({"think": True} if "think" in request else {})}

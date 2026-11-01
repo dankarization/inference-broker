@@ -1,0 +1,25 @@
+{
+  "budget_method": "compact messages UTF-8 bytes + output + wrapper reserve",
+  "deployment_required": true,
+  "input_transform": "none; preserve exact system/user role and content",
+  "keep_alive_seconds": 1800,
+  "kind": "chat",
+  "legacy_profile_unchanged": "syncopia-memory-qwen38",
+  "max_concurrency": 1,
+  "max_serialized_message_utf8_bytes": 118784,
+  "model": "qwen3.8:ad-iq2-xs",
+  "native_effective_settings": null,
+  "options": {
+    "num_ctx": 131072,
+    "num_predict": 8192,
+    "temperature": 0
+  },
+  "producer_storage_required": true,
+  "profile": "syncopia-memory-qwen38-128k-v1",
+  "request_timeout_seconds": 900,
+  "schema": "syncopia-memory-daily-text-128k-v1",
+  "source": "syncopia-telegram-memory",
+  "think": "low",
+  "tokenizer_count": null,
+  "wrapper_reserve": 4096
+}

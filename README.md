@@ -1,4 +1,59 @@
-# Ollama Inference Broker / Брокер инференса Ollama
+# Inference broker queue
+
+Брокер принимает задания локального инференса в durable SQLite-очередь и
+последовательно передаёт их настроенным backend: Ollama, Wyoming, GigaAM и
+Whisper GPU. Источники используют общую очередь, source policy и один execution
+slot; профиль задания определяет backend и лимиты. Dashboard показывает
+состояние очереди и управляет dispatch/admission.
+
+## Как проходит задание
+
+```mermaid
+%%{init: {"flowchart": {"htmlLabels": false}}}%%
+flowchart LR
+    jobs["Источники заданий"] -->|HTTP| broker
+    subgraph HOST["Постоянный хост"]
+        broker["broker · SQLite WAL"]
+        ui["Dashboard"] -->|Pause / Resume| broker
+    end
+    subgraph MAINPC["MAIN-PC · GPU"]
+        ollama["Ollama"]
+        voice["GigaAM / Whisper GPU"]
+    end
+    broker -->|один slot| ollama
+    broker -->|тот же slot| voice
+    broker -->|тот же slot| wyoming["Wyoming"]
+    broker -.->|WOL| MAINPC
+```
+
+Очередь и leases хранятся на постоянном хосте, а не на MAIN-PC. Source policy
+задаёт admission, dispatch и weight; scheduler выбирает eligible source по
+обратной доле weight, затем FIFO внутри source и совместимые model batches.
+Без source policy действует глобальный FIFO. Подключённые voice jobs проходят
+тот же scheduler: [контракт voice backends](docs/VOICE-JOBS.md). Прямые вызовы
+backend в обход broker не входят в его очередь.
+
+**Pause queue** запрещает новые запуски для всех источников, но сохраняет приём
+заданий. Текущее задание завершается, затем broker выгружает GPU-модели;
+неудачная выгрузка повторяется без возобновления dispatch. Пауза сохраняется
+в SQLite после рестарта. **Resume queue** снова разрешает dispatch.
+Это отдельный контроль от per-source dispatch pause и admission block.
+
+## Dashboard
+
+Панель доступна на `/dashboard`: общие счётчики, Sources с весами и контролями,
+Active jobs, Forecast и History. Данные обновляются в фоне каждые 30 секунд без
+перезагрузки страницы. Подробности: [Dashboard](docs/DASHBOARD.md).
+
+Текущая панель, ширина viewport 1440 px:
+
+![Inference broker queue: Pause queue, Sources, Active jobs, Forecast и History при 1440 px](docs/images/dashboard-1440.png)
+
+Та же панель при 1920 px; таблицы используют доступную ширину с небольшими
+боковыми отступами:
+
+![Inference broker queue: dashboard при 1920 px](docs/images/dashboard-1920.png)
+
 
 [English](#english) · [Русский](#russian)
 
@@ -29,7 +84,7 @@ flowchart LR
 
 The broker and SQLite queue live on an always-on host; the Ollama executor may sleep. Wake-on-LAN, model readiness, unload/load, and inference happen only when dispatch is enabled and an eligible job is selected. `GET /healthz` does not contact the executor.
 
-With a runtime source policy, the scheduler takes the oldest eligible job from each source, groups ready source/model lanes into contiguous model-aware batches, and allocates a recurring 60-minute execution-time horizon in **direct proportion** to their positive weights. Jobs are non-preemptive, so a final job may exceed its lane's budget. A source that becomes ready mid-cycle receives a share of the remaining horizon. Without a policy, eligible jobs use global FIFO.
+With a runtime source policy, the scheduler takes the oldest eligible job from each source, groups ready source/model lanes into contiguous model-aware batches, and allocates a recurring 60-minute execution-time horizon in **inverse proportion** to their positive weights. Jobs are non-preemptive, so a final job may exceed its lane's budget. A source that becomes ready mid-cycle receives a share of the remaining horizon. Without a policy, eligible jobs use global FIFO.
 
 ### Local start (admission only)
 

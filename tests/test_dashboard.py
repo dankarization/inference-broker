@@ -1,14 +1,19 @@
 import json
+import shutil
 import sqlite3
+import subprocess
 import tempfile
 import threading
 import unittest
 from datetime import datetime, timezone
+from pathlib import Path
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 from unittest.mock import patch
 
-from broker.dashboard import render, snapshot
+from broker.dashboard import format_duration, history_display, snapshot
+from broker.dashboard_assets import DashboardAssets
+from broker.profiles import PROFILES
 from broker.http import serve
 from broker.service import Broker, SourcePolicy
 
@@ -25,6 +30,49 @@ class FakeWol:
 
 
 class DashboardTests(unittest.TestCase):
+    def test_history_fields_are_payload_free_and_exclude_queue_wait(self):
+        db = tempfile.NamedTemporaryFile()
+        self.addCleanup(db.close)
+        broker = Broker(db.name, FakeOllama(), FakeWol())
+        self.addCleanup(broker.db.close)
+        finished = datetime(2026, 10, 28, 13, 52, 17, tzinfo=timezone.utc).timestamp()
+        with broker.db:
+            for job_id, state, started in (
+                ('done', 'completed', finished - 12.25),
+                ('cancelled', 'cancelled', finished - 20),
+                ('unstarted', 'completed', None),
+                ('failed', 'failed', finished - 30),
+            ):
+                broker.db.execute(
+                    'INSERT INTO jobs(id,profile,kind,source,payload,state,created,started,finished) '
+                    'VALUES(?,?,?,?,?,?,?,?,?)',
+                    (job_id, 'interactive', 'generate', 'source', '{"secret":"private"}',
+                     state, finished - 3600, started, finished),
+                )
+        first = broker.terminal_history(limit=2)
+        second = broker.terminal_history(limit=2, cursor=tuple(first['next_cursor']))
+        rows = first['items'] + second['items']
+        self.assertEqual(len(rows), 4)
+        for row in rows:
+            self.assertEqual(row['model'], PROFILES['interactive'].model)
+            self.assertEqual(row['finished_display'], '28/10/2026, 17:52:17')
+            self.assertEqual(row['model_turn_seconds'], 12.25 if row['id'] == 'done' else None)
+        self.assertNotIn('private', json.dumps(rows))
+        self.assertEqual(history_display({'finished': 0})['finished_display'], '01/01/1970, 04:00:00')
+        self.assertEqual(history_display({'finished': None})['finished_display'], '—')
+
+    def test_frontend_rendering_and_controls_with_real_scripts(self):
+        if shutil.which('node') is None:
+            self.skipTest('node required for real frontend execution')
+        root = Path(__file__).resolve().parents[1]
+        checked = subprocess.run(['node', '--check', str(root / 'broker/static/dashboard.js')],
+                                 capture_output=True, text=True)
+        self.assertEqual(checked.returncode, 0, checked.stderr)
+        result = subprocess.run(['node', str(root / 'tests/dashboard_dom.cjs')],
+                                capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('dashboard frontend contract PASS', result.stdout)
+
     def test_policy_select_state_machine_recovers_and_serializes(self):
         # Executable model of the rendered desired/saved/saving state machine.
         saved, desired, saving, sent = "A", "A", False, []
@@ -87,68 +135,100 @@ class DashboardTests(unittest.TestCase):
         self.assertEqual(ids, [f"terminal-{index:02d}" for index in range(39, -1, -1)])
         self.assertNotIn("payload", json.dumps(first))
 
-    def test_dashboard_html_contains_enabled_and_history_loading_contract(self):
-        html = render({"timestamp": 1, "sources": [], "active_jobs": [],
-                       "overall": {"states": {"completed": 0}, "completed_last_hour": 0, "completed_last_24_hours": 0},
-                       "history": [], "forecast": {"contingent": True, "next_selections": []}}).decode()
-        self.assertIn('class="enabled-form"', html) if False else self.assertIn("id=history-body", html)
-        self.assertIn("IntersectionObserver", html)
-        self.assertIn("/v1/history?limit=30", html)
-        self.assertLess(html.index("<h2>Forecast</h2>"), html.index("<h2>History</h2>"))
-        self.assertNotIn("tr.innerHTML", html)
-        self.assertIn("td.textContent", html)
-        self.assertIn("timeZone:'Asia/Tbilisi'", html)
-        self.assertIn("querySelectorAll('.bulk-action')", html)
-        self.assertIn("window.confirm", html)
-        self.assertIn("addEventListener('change'", html)
-        self.assertIn("while(desired!==saved)", html)
-        self.assertIn("desired===value", html)
-        self.assertIn("<meta http-equiv=refresh content=30>", html)
-        self.assertIn("refreshes every 30 seconds", html)
-        self.assertNotIn("content=15", html)
-        unavailable = render({
-            "observation": {"state": "unavailable", "observed_at": 1},
-        }).decode()
-        self.assertIn("<meta http-equiv=refresh content=30>", unavailable)
-        self.assertIn("refreshes every 30 seconds", unavailable)
-        self.assertNotIn("content=15", unavailable)
+    def test_dashboard_html_contains_static_loading_contract(self):
+        live, unavailable, _ = DashboardAssets().pages()
+        html = live.content.decode()
+        self.assertIn('id="history-body"', html)
+        self.assertLess(html.index('<h2>Forecast</h2>'), html.index('<h2>History</h2>'))
+        self.assertIn('/dashboard/assets/dashboard.js?v=', html)
+        self.assertIn('/dashboard/assets/dashboard.css?v=', html)
+        self.assertNotIn('__VERSION_', html)
+        # A meta refresh reloads the whole page: it would drop the chosen sort,
+        # the scroll position and the form state on every tick. Data is patched
+        # in the background instead.
+        for page in (html, unavailable.content.decode()):
+            self.assertNotIn('http-equiv="refresh"', page)
+            self.assertNotIn('http-equiv=refresh', page)
+            self.assertNotIn('http-equiv', page.lower())
+            self.assertIn('every 30 seconds in the background', page)
+        self.assertIn('refreshes every 30 seconds', html)
+        # Wide tables scroll in their own box instead of stretching the page.
+        self.assertEqual(html.count('<div class="table-scroll">'), 4)
+        for name in ('sources-table', 'active-table', 'forecast-table', 'history-table'):
+            self.assertIn(f'<div class="table-scroll"><table id="{name}">', html)
+        self.assertIn('mm:ss', html)
+        self.assertIn('Dashboard data unavailable', unavailable.content.decode())
+        self.assertNotIn('Completed:', unavailable.content.decode())
 
-    def test_sources_are_sorted_by_numeric_weight_then_source(self):
-        def source(name, weight):
-            return {
-                "source": name,
-                "scheduler": {
-                    "enabled": True, "admission_allowed": True,
-                    "weight": weight, "next_allowed": None,
-                },
-                "states": {
-                    name: 0 for name in (
-                        "queued", "running", "lease", "retry", "delayed",
-                        "failed", "cancelled", "completed",
-                    )
-                },
-                "completed_last_hour": 0,
-                "completed_last_24_hours": 0,
-            }
+    def test_no_meta_refresh_in_shipped_dashboard_html(self):
+        """The auto-reload contract: no meta refresh in either shipped shell."""
+        dashboard = Path(__file__).resolve().parents[1] / 'broker/static/dashboard.html'
+        raw = dashboard.read_text(encoding='utf-8')
+        self.assertNotIn('http-equiv="refresh"', raw)
+        self.assertNotIn('http-equiv=refresh', raw)
+        self.assertNotIn('http-equiv', raw.lower())
+        live, unavailable, _ = DashboardAssets().pages()
+        for page in (live.content.decode(), unavailable.content.decode()):
+            self.assertNotIn('http-equiv', page.lower())
 
-        rendered = render({
-            "timestamp": 1,
-            "sources": [
-                source("weight-10", 10), source("weight-1-b", 1),
-                source("weight-2", 2), source("weight-1-a", 1),
-            ],
-            "active_jobs": [],
-            "overall": {
-                "states": {"completed": 0},
-                "completed_last_hour": 0,
-                "completed_last_24_hours": 0,
-            },
-        }).decode()
-        positions = [
-            rendered.index(f"<td>{name}</td>")
-            for name in ("weight-1-a", "weight-1-b", "weight-2", "weight-10")
-        ]
-        self.assertEqual(positions, sorted(positions))
+    def test_dashboard_css_keeps_tables_compact_and_responsive(self):
+        """Narrow screens must not be stretched by numeric columns."""
+        css = (Path(__file__).resolve().parents[1] / 'broker/static/dashboard.css').read_text(encoding='utf-8')
+        self.assertIn('.table-scroll', css)
+        self.assertIn('overflow-x: auto', css)
+        # Cells stay on one line (short rows) and the table sizes to its
+        # content instead of stretching columns into empty space.
+        self.assertIn('white-space: nowrap', css)
+        self.assertIn('width: auto', css)
+        self.assertNotIn('th, td { width: 1%', css)
+        # Narrow-screen rules exist and never touch the wide default layout.
+        self.assertIn('@media (max-width: 900px)', css)
+        self.assertIn('@media (max-width: 640px)', css)
+        self.assertIn('@media (max-width: 480px)', css)
+        self.assertLess(css.index('.table-scroll'), css.index('@media'))
+        # Column hiding is scoped to the narrow queries only (the [hidden]
+        # attribute utility is the one pre-existing display rule).
+        default_rules = css[:css.index('@media')].replace('[hidden] { display: none !important; }', '')
+        self.assertNotIn('display: none', default_rules)
+        for query in css[css.index('@media'):].split('@media')[1:]:
+            self.assertIn('display: none', query)
+        # The 30-second background refresh lives in the script, not the document.
+        script = (Path(__file__).resolve().parents[1] / 'broker/static/dashboard.js').read_text(encoding='utf-8')
+        self.assertIn('REFRESH_INTERVAL_MS = 30000', script)
+        self.assertIn("'visibilitychange'", script)
+        self.assertIn('setInterval', script)
+        self.assertIn('clearInterval', script)
+        # A reload survives only as the unavailable-shell recovery branch.
+        # Comments are stripped so the count reflects executable code only.
+        code = '\n'.join(line for line in script.splitlines() if not line.strip().startswith('//'))
+        self.assertEqual(code.count('location.reload'), 1)
+        self.assertIn('pauseRefreshTimer(); window.location.reload();', code)
+        self.assertIn('captureView', script)
+        self.assertIn('restoreView', script)
+        self.assertIn('refreshRows', script)
+
+    def test_duration_format_is_mm_ss_and_matches_the_javascript_helper(self):
+        """One duration format for both halves of the dashboard contract.
+
+        The same fixture file drives ``duration()`` in tests/dashboard_dom.cjs,
+        so the Python and JavaScript helpers cannot drift apart.
+        """
+        cases = json.loads((Path(__file__).resolve().parent / 'duration_format_cases.json')
+                           .read_text(encoding='utf-8'))['cases']
+        self.assertGreaterEqual(len(cases), 10)
+        for seconds, expected in cases:
+            with self.subTest(seconds=seconds):
+                self.assertEqual(format_duration(seconds), expected)
+        # The former "42.000s" shape is gone: every duration is a clock value.
+        self.assertEqual(format_duration(42), '00:42')
+        self.assertEqual(format_duration(150.2), '02:30')
+        self.assertEqual(format_duration(3725.9), '1:02:05')
+        self.assertNotIn('s', format_duration(0.4))
+        row = history_display({'state': 'completed', 'started': 100.0, 'finished': 142.0})
+        self.assertEqual(row['model_turn_seconds'], 42.0)
+        self.assertEqual(row['model_turn_display'], '00:42')
+        self.assertEqual(history_display({'finished': 0})['finished_display'], '01/01/1970, 04:00:00')
+
     def test_payload_history_uses_the_bounded_observer_index_path(self):
         db = tempfile.NamedTemporaryFile()
         self.addCleanup(db.close)
@@ -162,7 +242,7 @@ class DashboardTests(unittest.TestCase):
                 [
                     (
                         f"history-{index}", "interactive", "generate", "archive",
-                        payload, "completed", float(index), 99_999.0, float(index),
+                        payload, "completed", float(index), float(index), float(index),
                     )
                     for index in range(2_000)
                 ],
@@ -189,15 +269,23 @@ class DashboardTests(unittest.TestCase):
         broker.db.set_progress_handler(stop_full_table_scan, 1)
         broker.db.set_trace_callback(queries.append)
         try:
-            data = snapshot(broker.db, now=100_000, policy_snapshot={"sources": {
-                "history": {"enabled": True, "weight": 1.0},
-            }})
+            data = snapshot(
+                broker.db, now=100_000,
+                policy_snapshot={"sources": {"history": {"enabled": True, "weight": 1.0}}},
+                # Keep this probe focused on the covering completion windows:
+                # exclude the 2_000 archive rows so the state counts describe the
+                # same single source the policy knows about.
+                include_producer_storage=False,
+            )
         finally:
             broker.db.set_progress_handler(None, 0)
             broker.db.set_trace_callback(None)
 
-        self.assertEqual(data["overall"]["states"]["completed"], 1)
-        self.assertEqual(data["overall"]["completed_last_hour"], 1)
+        history_source = next(
+            item for item in data["sources"] if item["source"] == "history"
+        )
+        self.assertEqual(history_source["states"]["completed"], 1)
+        self.assertEqual(history_source["completed_last_hour"], 1)
         self.assertLess(progress_calls[0], 70_000)
         self.assertTrue(any("FROM audit_events" in query for query in queries))
         self.assertFalse(any("finished>=" in query for query in queries))
@@ -349,28 +437,6 @@ class DashboardTests(unittest.TestCase):
             self.assertNotEqual(changed_headers["ETag"], etag)
             self.assertEqual(regenerate.call_count, 3)
 
-    def test_html_renders_active_timestamps_in_tbilisi_and_nulls_as_dash(self):
-        timestamp = datetime(2026, 8, 29, 8, 30, tzinfo=timezone.utc).timestamp()
-        html = render({
-            "timestamp": timestamp,
-            "sources": [],
-            "active_jobs": [{
-                "id": "active-job", "source": "interactive", "state": "running",
-                "started": timestamp, "lease_until": None, "attempt_count": 1, "retry_count": 0,
-            }],
-            "overall": {
-                "states": {"completed": 0},
-                "completed_last_hour": 0,
-                "completed_last_24_hours": 0,
-            },
-        }).decode()
-        self.assertIn("2026-08-29 12:30:00 UTC+04:00 (Asia/Tbilisi)", html)
-        self.assertNotIn(f">{timestamp}<", html)
-        self.assertIn(
-            'title="2026-08-29T08:30:00Z (epoch 1787992200.0)"', html,
-        )
-        self.assertIn("<td>—</td>", html)
-
     def test_dashboard_is_payload_free_and_uses_finished_completion_windows(self):
         clock = lambda: 100_000
         db = tempfile.NamedTemporaryFile()
@@ -386,6 +452,8 @@ class DashboardTests(unittest.TestCase):
         completed_recent = broker.submit("batch-video", "generate", {"prompt": "do-not-expose"}, source="dashboard-source")["id"]
         completed_old = broker.submit("batch-video", "generate", {"prompt": "also-private"}, source="dashboard-source")["id"]
         running = broker.submit("batch-video", "generate", {}, source="dashboard-source")["id"]
+        # An old persisted job remains visible even if its source is not registered.
+        broker.submit("batch-video", "generate", {}, source="omitted-source")
         with broker.db:
             broker.db.execute("UPDATE jobs SET state='completed',finished=? WHERE id=?", (99_000, completed_recent))
             broker.db.execute("UPDATE jobs SET state='completed',finished=? WHERE id=?", (10_000, completed_old))
@@ -425,6 +493,9 @@ class DashboardTests(unittest.TestCase):
 
         body, _ = get("/v1/dashboard")
         data = json.loads(body)
+        self.assertEqual(set(data), {"timestamp", "maintenance", "queue_paused", "sources", "active_jobs",
+                                     "overall", "forecast", "history", "observation"})
+        self.assertEqual(data, broker.dashboard(policy, include_producer_storage=False))
         source = next(item for item in data["sources"] if item["source"] == "dashboard-source")
         self.assertEqual(source["scheduler"], {
             "enabled": True, "dispatch_paused": False,
@@ -435,32 +506,20 @@ class DashboardTests(unittest.TestCase):
         self.assertEqual(source["completed_last_hour"], 1)
         self.assertEqual(source["completed_last_24_hours"], 1)
         self.assertNotIn("payload", json.dumps(data))
-        broker.submit("batch-video", "generate", {}, source="omitted-source")
         data = broker.dashboard(policy)
         omitted = next(item for item in data["sources"] if item["source"] == "omitted-source")
         self.assertEqual(omitted["scheduler"], {
             "enabled": False, "dispatch_paused": True,
-            "admission_allowed": True, "weight": None, "next_allowed": None,
+            "admission_allowed": False, "weight": None, "next_allowed": None,
         })
         html, content_type = get("/dashboard")
         self.assertIn("text/html", content_type)
         self.assertIn(b"Completed 1h", html)
         self.assertIn(b"Weight", html)
-        self.assertIn(b'<select name="weight" aria-label="Weight for dashboard-source">', html)
-        self.assertIn(b'<option value="3" selected>3</option>', html)
-        self.assertNotIn(b">3.0<", html)
-        self.assertIn(b"weight-feedback", html)
+        # HTML is a data-free shell; the DOM harness exercises real controls.
+        self.assertNotIn(b'dashboard-source', html)
+        self.assertNotIn(b'active-job', html)
         self.assertNotIn(b"Dead", html)
-        self.assertIn(b'<tr><td colspan=15>None</td></tr>', render({
-            "timestamp": 0,
-            "sources": [],
-            "active_jobs": [],
-            "overall": {
-                "states": {"completed": 0},
-                "completed_last_hour": 0,
-                "completed_last_24_hours": 0,
-            },
-        }))
         self.assertNotIn(b"do-not-expose", html)
         status, result = post("/v1/sources/dashboard-source/weight", {"weight": 7})
         self.assertEqual((status, result), (200, {"source": "dashboard-source", "weight": 7}))

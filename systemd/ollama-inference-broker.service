@@ -1,5 +1,5 @@
 [Unit]
-Description=Local Ollama inference broker (configure before dispatch)
+Description=Local Inference broker queue (configure before dispatch)
 After=default.target
 
 [Service]

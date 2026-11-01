@@ -68,6 +68,13 @@ class OllamaHTTP:
     def ps(self, timeout_seconds: float | None = None) -> dict:
         return self._request("/api/ps", timeout_seconds=timeout_seconds)
 
+    def tags(self, timeout_seconds: float = 5) -> dict:
+        return self._request("/api/tags", timeout_seconds=timeout_seconds)
+
+    def show(self, model: str, timeout_seconds: float = 5) -> dict:
+        # Read-only metadata operation via POST; no load/run.
+        return self._request("/api/show", {"model": model}, timeout_seconds)
+
     def is_ready(self, model: str) -> bool:
         return any(item.get("name") == model for item in self.ps().get("models", []))
 

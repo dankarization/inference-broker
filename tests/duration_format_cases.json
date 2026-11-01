@@ -1,0 +1,22 @@
+{
+  "comment": "Shared contract for broker/dashboard.py:format_duration and duration() in broker/static/dashboard.js. tests/test_dashboard.py and tests/dashboard_dom.cjs both read this file, so the Python and JavaScript implementations cannot drift apart.",
+  "format": "mm:ss below one hour, h:mm:ss from one hour, null/None is an em dash",
+  "cases": [
+    [null, "—"],
+    [0, "00:00"],
+    [0.4, "00:00"],
+    [0.99, "00:00"],
+    [42, "00:42"],
+    [42.9, "00:42"],
+    [59.999, "00:59"],
+    [60, "01:00"],
+    [61, "01:01"],
+    [90, "01:30"],
+    [150.2, "02:30"],
+    [3599, "59:59"],
+    [3600, "1:00:00"],
+    [3661, "1:01:01"],
+    [3725, "1:02:05"],
+    [7325.9, "2:02:05"]
+  ]
+}

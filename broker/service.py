@@ -5,6 +5,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import sqlite3
 import threading
 import time
@@ -14,15 +15,23 @@ from pathlib import Path
 from typing import Any
 
 from .analytics import analytics_snapshot, attempt_history, audit_history
-from .dashboard import snapshot as dashboard_snapshot
-from .compat import (CompatibilityError, UNCENSORED_EVAL_PROFILES,
+from .dashboard import history_display, snapshot as dashboard_snapshot
+from .qwen_budget import (PROFILE as QWEN64_PROFILE, CONTRACT as QWEN64_CONTRACT,
+                          snapshot as qwen64_snapshot, evidence as qwen64_evidence,
+                          project as project_qwen64_evidence)
+from .compat import (CompatibilityError, UNCENSORED_EVAL_PROFILES, NEXTCLOUD_PROFILES, GEMMA26_CONTRACT,
+                     validate_nextcloud_payload,
                      validate_olya_decision_payload,
                      validate_olya_vision_payload,
                      validate_shutterstock_canary_payload,
                      validate_shutterstock_video_payload,
-                     validate_syncopia_memory_payload,
-                     validate_uncensored_eval_payload)
-from .profiles import OPENCLAW_PROFILE_NAMES, PROFILES
+                     validate_syncopia_memory_payload, validate_uncensored_eval_payload)
+from .profiles import EVALUATION_PROFILE_NAMES, OPENCLAW_PROFILE_NAMES, PROFILES
+from . import nightly_eval, syncopia_daily
+from .profiles import NIGHTLY_PROFILE_NAMES, VOICE_PROFILE_NAMES
+from . import voice
+from .evaluation import normalize_request as normalize_evaluation_request
+from .evaluation import validate_result as validate_evaluation_result
 from .asr import PROFILE as ASR_PROFILE, validate_payload as validate_asr_payload
 from .openclaw import (MAX_OUTSTANDING, normalize_request as normalize_openclaw_request,
                        validate_result as validate_openclaw_result)
@@ -105,6 +114,7 @@ class SourcePolicy:
         self._lock = threading.RLock()
         self._signature: tuple[int, int, int] | None = None
         self._sources: dict[str, dict[str, Any]] = {}
+        self._maintenance = False
 
     def _load_locked(self) -> None:
         try:
@@ -128,6 +138,7 @@ class SourcePolicy:
             self._signature = signature
             return
         self._sources = normalized
+        self._maintenance = raw.get("maintenance", False)
         self._signature = signature
 
     def snapshot(self) -> dict[str, Any]:
@@ -136,6 +147,7 @@ class SourcePolicy:
             self._load_locked()
             return {
                 "path": str(self.path),
+                "maintenance": self._maintenance,
                 "sources": {name: dict(entry) for name, entry in self._sources.items()},
             }
 
@@ -153,11 +165,11 @@ class SourcePolicy:
             return entry["weight"] if entry else None
 
     def admission_allowed(self, source: str) -> bool:
-        """Default old policy entries and unknown sources to admission allowed."""
+        """Deny unregistered sources and all new work in maintenance mode."""
         with self._lock:
             self._load_locked()
             entry = self._sources.get(source)
-            return True if entry is None else entry["admission_allowed"]
+            return bool(entry is not None and not self._maintenance and entry["admission_allowed"])
 
     def storage_config(self, source: str) -> dict[str, Any]:
         """Return fail-closed producer-storage flags for one source."""
@@ -185,16 +197,22 @@ class SourcePolicy:
                 )
             }
 
-    def _mutate_source(self, source: str, field: str, value: Any) -> Any:
+    def _mutate_source(self, source: str | None, field: str, value: Any, expected_sha256: str | None = None) -> Any:
         """Serialize and durably atomically replace one source policy field."""
         with self._lock:
             try:
                 with source_policy_write_lock(self.path):
-                    raw = json.loads(self.path.read_text(encoding="utf-8"))
+                    raw_bytes = self.path.read_bytes()
+                    if expected_sha256 is not None and hashlib.sha256(raw_bytes).hexdigest() != expected_sha256:
+                        raise SourcePolicyError("policy checksum changed")
+                    raw = json.loads(raw_bytes)
                     normalized = normalize_source_policy(raw)
-                    if source not in normalized:
-                        raise SourcePolicyError(f"source {source!r} is not configured")
-                    raw["sources"][source][field] = value
+                    if source is None:
+                        raw[field] = value
+                    else:
+                        if source not in normalized:
+                            raise SourcePolicyError(f"source {source!r} is not configured")
+                        raw["sources"][source][field] = value
                     temporary: str | None = None
                     try:
                         mode = self.path.stat().st_mode & 0o7777
@@ -243,6 +261,13 @@ class SourcePolicy:
             raise SourcePolicyError("allowed must be a boolean")
         return self._mutate_source(source, "admission_allowed", allowed)
 
+    def set_maintenance(self, enabled: Any, expected_sha256: str) -> bool:
+        if not isinstance(enabled, bool):
+            raise SourcePolicyError("maintenance must be a boolean")
+        if not isinstance(expected_sha256, str) or re.fullmatch(r"[a-f0-9]{64}", expected_sha256) is None:
+            raise SourcePolicyError("expected_sha256 must be a sha256 hex digest")
+        return self._mutate_source(None, "maintenance", enabled, expected_sha256)
+
 
 class Broker:
     """One-resource scheduler with FIFO source heads and time-weighted batches."""
@@ -285,7 +310,8 @@ class Broker:
         # 60-minute allocation from the durable ready queue.
         self._time_cycle: dict[str, Any] | None = None
         self._duration_estimates: dict[tuple[str, str], float] = {}
-        self._active_time_batch: dict[str, Any] | None = None
+        # Account attempts independently; completion order need not match claim order.
+        self._active_time_batches: dict[str, dict[str, Any]] = {}
         # Immutable copy written under the lock for the lock-free forecast.
         self._scheduler_snapshot: dict[str, Any] | None = None
         self.source_policy = source_policy
@@ -293,6 +319,8 @@ class Broker:
         self.journal_size_limit_bytes = int(journal_size_limit_bytes)
         self._init_db()
         with self.db:
+            self.db.execute("CREATE TABLE IF NOT EXISTS queue_control (id INTEGER PRIMARY KEY CHECK(id=1), paused INTEGER NOT NULL)")
+            self.db.execute("INSERT OR IGNORE INTO queue_control VALUES(1,0)")
             self.db.execute("CREATE TABLE IF NOT EXISTS gpu_executor_fences "
                             "(resource TEXT PRIMARY KEY, request_id TEXT NOT NULL, job_id TEXT NOT NULL)")
             self.db.execute("CREATE TABLE IF NOT EXISTS asr_receipts "
@@ -478,6 +506,12 @@ class Broker:
             # The broker lock serializes new idempotent admissions; do not impose
             # a retroactive uniqueness constraint on durable legacy history.
 
+            self.db.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS jobs_nextcloud_external "
+                "ON jobs(source,external_id) WHERE source='nextcloud' "
+                "AND external_id IS NOT NULL"
+            )
+
     def _retire_priority_column(self) -> None:
         """Remove a legacy priority column only when new inserts need it gone.
 
@@ -569,6 +603,7 @@ class Broker:
             ))
             for row in expired:
                 attempt_no = row["attempt_count"] or None
+                self._complete_time_batch(row["id"], now)
                 if attempt_no is not None:
                     self.db.execute(
                         "UPDATE job_attempts SET finished=?,outcome='lease_expired' "
@@ -614,13 +649,48 @@ class Broker:
             raise ValueError("unknown profile")
         if kind not in {"chat", "generate", "transcribe"}:
             raise ValueError("kind must be chat, generate or transcribe")
-        if kind == "transcribe" or profile == ASR_PROFILE or source == ASR_PROFILE:
+        if (kind == "transcribe" and profile not in VOICE_PROFILE_NAMES) or profile == ASR_PROFILE or source == ASR_PROFILE:
             if (kind != "transcribe" or profile != ASR_PROFILE
                     or (source or profile) != ASR_PROFILE or producer_storage is not None
                     or self.whisper_executor is None or not external_id):
                 raise ValueError("ASR requires configured executor, dedicated profile and idempotency key")
             payload = validate_asr_payload(payload)
         source = source or profile
+        if source == "local-voice" or profile in VOICE_PROFILE_NAMES:
+            if source != "local-voice" or profile not in VOICE_PROFILE_NAMES or kind != "transcribe":
+                raise ValueError("voice requires local-voice source, voice profile and transcribe kind")
+            if profile == voice.voice_cpu.PROFILE and (not external_id or not source_item_id):
+                raise ValueError("CPU voice requires durable correlation IDs")
+            payload = voice.validate(payload, profile)
+        if profile == syncopia_daily.PROFILE:
+            if source != syncopia_daily.SOURCE or kind != "chat":
+                raise ValueError("daily capacity requires its protected source/profile and chat")
+            if not external_id or not source_item_id or producer_storage is None:
+                raise ValueError("daily capacity requires correlation IDs and producer_storage")
+            payload = syncopia_daily.normalize_request(payload)
+        if source == nightly_eval.SOURCE or profile in NIGHTLY_PROFILE_NAMES:
+            if (source != nightly_eval.SOURCE or profile not in NIGHTLY_PROFILE_NAMES
+                    or kind != "chat" or producer_storage is not None):
+                raise ValueError("nightly requires dedicated source/profile and inline chat")
+            if not external_id or not source_item_id:
+                raise ValueError("nightly requires durable external_id and source_item_id")
+            payload = nightly_eval.normalize_request(payload, profile)
+        if source == "pilot-mainpc" and profile not in EVALUATION_PROFILE_NAMES:
+            raise ValueError("pilot-mainpc requires a dedicated evaluation profile")
+        if profile in EVALUATION_PROFILE_NAMES:
+            if source != "pilot-mainpc" or kind != "chat" or producer_storage is not None:
+                raise ValueError("Evaluation requires source pilot-mainpc and inline chat")
+            payload = normalize_evaluation_request(payload, profile)
+        if source == "nextcloud" or profile in NEXTCLOUD_PROFILES:
+            if source != "nextcloud" or profile not in NEXTCLOUD_PROFILES or kind != "generate":
+                raise ValueError("Nextcloud requires its dedicated source/profile and generate")
+            if not external_id or not source_item_id:
+                raise ValueError("Nextcloud requires external_id and source_item_id")
+            if profile == "nextcloud-verify-gemma26":
+                if (not isinstance(external_id, str) or re.fullmatch(r"[A-Za-z0-9_.:/-]{1,160}", external_id) is None
+                    or not isinstance(source_item_id, str) or re.fullmatch(r"[0-9]{1,128}", source_item_id) is None):
+                    raise ValueError("Gemma26 requires bounded exact correlation/file identities")
+            payload = validate_nextcloud_payload(payload, profile)
         if source == "openclaw" and profile not in OPENCLAW_PROFILE_NAMES:
             raise ValueError("source openclaw requires the OpenClaw profile")
         if profile in OPENCLAW_PROFILE_NAMES and (source != "openclaw" or kind != "chat"):
@@ -703,7 +773,7 @@ class Broker:
                         (source, external_id),
                     ).fetchone()
                     tombstone_is_idempotent = tombstone is not None and (
-                        source in {"olya-vision", "olya-decision", "syncopia-telegram-memory", "openclaw", ASR_PROFILE}
+                        source in {"olya-vision", "olya-decision", "syncopia-telegram-memory", "openclaw", "nextcloud", "pilot-mainpc", "local-voice", nightly_eval.SOURCE, ASR_PROFILE}
                         or producer_storage is not None
                         or tombstone["producer_attempt_id"] is not None
                     )
@@ -732,7 +802,7 @@ class Broker:
                         or existing["result_storage_mode"] != "broker_temporary"
                     )
                     if (
-                        source in {"olya-vision", "olya-decision", "syncopia-telegram-memory", "openclaw", ASR_PROFILE}
+                        source in {"olya-vision", "olya-decision", "syncopia-telegram-memory", "openclaw", "nextcloud", "pilot-mainpc", "local-voice", nightly_eval.SOURCE, ASR_PROFILE}
                         or producer_storage is not None
                         or existing_has_producer_storage
                     ):
@@ -759,12 +829,56 @@ class Broker:
                                 raise ValueError(
                                     "producer storage idempotency conflict for existing correlation"
                                 )
-                        if source in {"openclaw", ASR_PROFILE} and (
+                        if source in {"openclaw", "nextcloud", "pilot-mainpc", "local-voice", nightly_eval.SOURCE, ASR_PROFILE} and (
                             existing["profile"] != profile or existing["kind"] != kind
                             or existing["input_hash"] != content_evidence(payload)[0]
                         ):
                             raise ValueError("idempotency key was used for another request")
+                        if source in {"nextcloud", "pilot-mainpc", "local-voice", nightly_eval.SOURCE} and existing["source_item_id"] != source_item_id:
+                            raise ValueError("source correlation item conflict")
                         return self.status(existing["id"])
+            if source == nightly_eval.SOURCE:
+                entry = (self.source_policy.snapshot()["sources"].get(source)
+                         if self.source_policy is not None else None)
+                if not entry or not entry["enabled"] or not entry["admission_allowed"]:
+                    raise SourceAdmissionBlocked(source)
+                total = self.db.execute(
+                    "SELECT count(*) FROM (SELECT id FROM jobs WHERE source=? UNION "
+                    "SELECT job_id FROM job_retention_tombstones WHERE source=?)", (source, source),
+                ).fetchone()[0]
+                active = self.db.execute(
+                    "SELECT count(*) FROM jobs WHERE source=? AND state IN "
+                    "('queued','running','cancel_requested')", (source,),
+                ).fetchone()[0]
+                if total >= nightly_eval.MAX_CALLS or active:
+                    raise SourceQueueFull("nightly: at most 32 lifetime cells and one outstanding job")
+            if source == "pilot-mainpc":
+                from .evaluation import PILOT_MAX_ACTIVE_JOBS, PILOT_MAX_ACTIVE_INPUT_BYTES
+                entry = (self.source_policy.snapshot()["sources"].get(source)
+                         if self.source_policy is not None else None)
+                if not entry or not entry["enabled"] or not entry["admission_allowed"]:
+                    raise SourceAdmissionBlocked(source)
+                outstanding = self.db.execute(
+                    "SELECT count(*),coalesce(sum(input_bytes),0) FROM jobs WHERE source='pilot-mainpc' "
+                    "AND state IN ('queued','running','cancel_requested')"
+                ).fetchone()
+                if outstanding[0] >= PILOT_MAX_ACTIVE_JOBS or outstanding[1] + content_evidence(payload)[1] > PILOT_MAX_ACTIVE_INPUT_BYTES:
+                    raise SourceQueueFull("pilot-mainpc budget: 512 active jobs / 512 MiB")
+            if source == "nextcloud":
+                if self.source_policy is None or source not in self.source_policy.snapshot()["sources"]:
+                    raise SourceAdmissionBlocked(source)
+                if profile == "nextcloud-qwen3-vl" and self.db.execute(
+                    "SELECT count(*) FROM jobs WHERE source='nextcloud' "
+                    "AND state IN ('queued','running','cancel_requested')"
+                ).fetchone()[0] >= 2:
+                    raise SourceQueueFull("nextcloud has 2 outstanding jobs")
+                if profile in {"nextcloud-eval-qwen", "nextcloud-verify-gemma26", QWEN64_PROFILE}:
+                    outstanding = self.db.execute(
+                        "SELECT count(*),coalesce(sum(input_bytes),0) FROM jobs WHERE source='nextcloud' "
+                        "AND state IN ('queued','running','cancel_requested')"
+                    ).fetchone()
+                    if outstanding[0] >= 256 or outstanding[1] + content_evidence(payload)[1] > 256 * 1024**2:
+                        raise SourceQueueFull("nextcloud evaluation budget: 256 jobs / 256 MiB")
             storage_fields = self.storage.prepare_admission(source, payload, producer_storage)
             if self.source_policy is not None and not self.source_policy.admission_allowed(source):
                 self._audit(
@@ -866,8 +980,12 @@ class Broker:
     ) -> dict[str, Any]:
         """Requeue only failed jobs while retaining attempts and audit history."""
         source = self._bulk_source(source)
+        if source == nightly_eval.SOURCE:
+            raise ValueError("nightly evaluation never retries/requeues")
         now = self.clock()
         with self.lock, self.db:
+            if self.source_policy is not None and not self.source_policy.admission_allowed(source):
+                raise SourceAdmissionBlocked(source)
             rows = list(self.db.execute(
                 "SELECT id,attempt_count,compaction_state," + PRODUCER_STORAGE_JOB_PREDICATE +
                 " AS producer_storage FROM jobs WHERE source=? AND state='failed' "
@@ -931,6 +1049,50 @@ class Broker:
             row = self.db.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
             return self._job(row) if row else self.storage.tombstone_status(job_id)
 
+    @staticmethod
+    def nextcloud_projection(job: dict | None) -> dict | None:
+        """Opt-in final-only wire contract: no payload, thinking or raw errors."""
+        if job is None:
+            return None
+        if job.get("source") != "nextcloud" or job.get("profile") not in NEXTCLOUD_PROFILES:
+            raise ValueError("projection requires a dedicated Nextcloud job")
+        result = {name: job.get(name) for name in (
+            "id", "source", "profile", "kind", "external_id", "source_item_id", "state",
+            "created", "queued_at", "started", "finished", "input_hash", "input_bytes",
+        )}
+        result["projection"] = "nextcloud-final-v1"
+        if job.get("profile") == "nextcloud-eval-qwen":
+            result["request_contract"] = dict(
+                schema="nextcloud-eval-qwen-v1", model="qwen3-vl:30b", think=True,
+                options=dict(num_ctx=16384, num_predict=8192, temperature=0),
+                keep_alive=300, stream=False,
+            )
+        if job.get("profile") == QWEN64_PROFILE:
+            result["request_contract"] = {**QWEN64_CONTRACT, "options": dict(QWEN64_CONTRACT["options"])}
+        if job.get("profile") == "nextcloud-verify-gemma26":
+            result["request_contract"] = {**GEMMA26_CONTRACT,
+                "options": dict(GEMMA26_CONTRACT["options"])}
+        raw = job.get("result")
+        if isinstance(raw, dict):
+            if job.get("profile") == QWEN64_PROFILE:
+                result["execution_evidence"] = project_qwen64_evidence(raw.get("_broker_execution_evidence"))
+            # Scalars only: malformed nested values must never tunnel reasoning
+            # or raw errors through an otherwise allowlisted result field.
+            projected = {}
+            for name in ("model", "response"):
+                value = raw.get(name)
+                projected[name] = value if isinstance(value, str) else None
+            projected["done"] = raw.get("done") is True
+            reason = raw.get("done_reason")
+            projected["done_reason"] = reason if reason in ("stop", "length") else "unknown"
+            for name in ("eval_count", "total_duration", "load_duration", "prompt_eval_count",
+                         "prompt_eval_duration", "eval_duration"):
+                value = raw.get(name)
+                projected[name] = value if type(value) is int and 0 <= value <= 10**15 else None
+            projected["error"] = bool(raw.get("error"))
+            result["result"] = projected
+        return result
+
     def compact_status(self, job_id: str) -> dict | None:
         return self.storage.compact_status(job_id) or self.storage.tombstone_status(job_id)
 
@@ -973,14 +1135,20 @@ class Broker:
         data.pop("priority", None)  # inert historic column is never public
         for field in LEGACY_HIDDEN_STORAGE_FIELDS:
             data.pop(field, None)
+        if data["source"] in {"pilot-mainpc", nightly_eval.SOURCE} or data["profile"] in {QWEN64_PROFILE, voice.voice_cpu.PROFILE}:
+            # Exact durable client correlation survives terminal payload cleanup.
+            data["input_hash"] = row["input_hash"]
+            data["input_bytes"] = row["input_bytes"]
         data["payload"] = json.loads(data["payload"])
+        if data["profile"] == voice.voice_cpu.PROFILE and data["payload"] == {}:
+            data.pop("payload")  # terminal cleanup: correlate using the original input_hash
         if data.get("result_json") is not None:
             data["result"] = json.loads(data.pop("result_json"))
         else:
             data.pop("result_json", None)
         if data["state"] == "queued":
             data["queue_position"] = self._position(row)
-        return data
+        return nightly_eval.projection(data) if data["source"] == nightly_eval.SOURCE else data
 
     def _position(self, row):
         before = self.db.execute("SELECT count(*) FROM jobs WHERE state='queued' AND "
@@ -1032,10 +1200,14 @@ class Broker:
                 ).fetchone() is not None:
                     raise ValueError("job retry retention has expired")
                 return None
+            if row["source"] == nightly_eval.SOURCE:
+                raise ValueError("nightly evaluation never retries/requeues")
             if row["state"] not in {"failed", "cancelled"}:
                 raise ValueError("only failed or cancelled jobs may be retried")
             if row["compaction_state"] != "full":
                 raise ValueError("job retry retention has expired")
+            if self.source_policy is not None and not self.source_policy.admission_allowed(row["source"]):
+                raise SourceAdmissionBlocked(row["source"])
             if row["source"] == "openclaw":
                 self._ensure_openclaw_capacity_locked()
             if row['source'] == ASR_PROFILE:
@@ -1239,15 +1411,16 @@ class Broker:
         snapshot = self._scheduler_snapshot or {}
         cycle = deepcopy(snapshot.get("time_cycle"))
         estimates = dict(snapshot.get("duration_estimates") or {})
-        active = snapshot.get("active_time_batch")
+        active_batches = snapshot.get("active_time_batches") or {}
         # The active lease will release before any projected selection.  Its
         # true duration is unknown until completion, so forecast uses the same
         # lane estimate it uses for all subsequent non-preemptive boundaries.
-        if policy is not None and running is not None and active is not None and cycle:
-            self._record_time_usage(
-                cycle, tuple(active["lane"]),
-                self._forecast_duration(tuple(active["lane"]), estimates),
-            )
+        if policy is not None and running is not None and cycle:
+            for active in active_batches.values():
+                self._record_time_usage(
+                    cycle, tuple(active["lane"]),
+                    self._forecast_duration(tuple(active["lane"]), estimates),
+                )
         remaining = [dict(row) for row in candidates]
         selections: list[dict[str, Any]] = []
         for _ in range(bounded):
@@ -1301,6 +1474,10 @@ class Broker:
     ) -> dict:
         """Payload-free live queue data for the local operational dashboard."""
         policy_snapshot = policy.snapshot() if policy is not None else None
+        source_weights = {
+            name: entry.get("weight")
+            for name, entry in ((policy_snapshot or {}).get("sources") or {}).items()
+        }
         now = self.clock()
         snapshot, error = self._observer_read(
             lambda db: {
@@ -1308,6 +1485,7 @@ class Broker:
                     db, now=now, policy_snapshot=policy_snapshot,
                     include_producer_storage=include_producer_storage,
                 ),
+                "queue_paused": bool(db.execute("SELECT paused FROM queue_control WHERE id=1").fetchone()[0]),
                 "forecast": self._forecast(
                     db, policy, now, 10,
                     include_producer_storage=include_producer_storage,
@@ -1315,6 +1493,7 @@ class Broker:
                 "history": self._terminal_history(
                     db, limit=10,
                     include_producer_storage=include_producer_storage,
+                    source_weights=source_weights,
                 ),
             }
         )
@@ -1355,6 +1534,7 @@ class Broker:
     def _terminal_history(
         self, db, *, limit: int, cursor: tuple[float, str] | None = None,
         include_producer_storage: bool = True,
+        source_weights: dict[str, Any] | None = None,
     ):
         values: list[Any] = []
         clause = ""
@@ -1376,15 +1556,23 @@ class Broker:
             " ORDER BY finished DESC,id DESC LIMIT ?",
             (*values, max(1, min(limit, 30))),
         )
-        return [dict(row) for row in rows]
+        weights = source_weights or {}
+        history = []
+        for row in rows:
+            item = history_display(dict(row))
+            item["weight"] = weights.get(item["source"])
+            history.append(item)
+        return history
 
     def terminal_history(
         self, *, limit: int = 30, cursor: tuple[float, str] | None = None,
         include_producer_storage: bool = True,
+        source_weights: dict[str, Any] | None = None,
     ):
         data, error = self._observer_read(lambda db: self._terminal_history(
             db, limit=limit, cursor=cursor,
             include_producer_storage=include_producer_storage,
+            source_weights=source_weights,
         ))
         if data is None:
             return {"unavailable": True, "reason": (error or {}).get("reason")}
@@ -1511,7 +1699,7 @@ class Broker:
         model_oldest: dict[str, tuple[float, str]] = {}
         for key, lane in lanes.items():
             source, model = key
-            model_totals[model] = model_totals.get(model, 0.0) + lane["weight"]
+            model_totals[model] = model_totals.get(model, 0.0) + 1.0 / lane["weight"]
             candidate_key = (lane["queued_at"], source)
             if model not in model_oldest or candidate_key < model_oldest[model]:
                 model_oldest[model] = candidate_key
@@ -1523,7 +1711,7 @@ class Broker:
         for model in models:
             order.extend(sorted(
                 (key for key in lanes if key[1] == model),
-                key=lambda key: (-lanes[key]["weight"], lanes[key]["queued_at"], key[0]),
+                key=lambda key: (lanes[key]["weight"], lanes[key]["queued_at"], key[0]),
             ))
         return order
 
@@ -1553,7 +1741,7 @@ class Broker:
             key: float(policy.weight(row["source"]) or 1.0)
             for key, row in available.items()
         }
-        weight_total = sum(weights.values())
+        weight_total = sum(1.0 / weight for weight in weights.values())
         old_lanes = previous.get("lanes", {})
         lanes: dict[tuple[str, str], dict[str, Any]] = {}
         for key, row in available.items():
@@ -1564,8 +1752,20 @@ class Broker:
                 "weight": weights[key],
                 "queued_at": row["queued_at"] if row["queued_at"] is not None else row["created"],
                 "used": used,
-                "budget": used + (remaining * weights[key] / weight_total if weight_total else 0.0),
+                "budget": used + (remaining / weights[key] / weight_total if weight_total else 0.0),
             }
+        # An in-flight lane can disappear from the ready queue before its
+        # attempt finishes. Retain its accounting record until completion.
+        for active in self._active_time_batches.values():
+            key = tuple(active["lane"])
+            if key not in lanes and key in old_lanes:
+                lanes[key] = dict(old_lanes[key], accounting_only=True)
+            elif key not in lanes and not previous:
+                # A fresh horizon must still charge attempts begun in the
+                # preceding horizon when they eventually complete.
+                old = (getattr(self, "_time_cycle", None) or {}).get("lanes", {}).get(key)
+                if old is not None:
+                    lanes[key] = dict(old, used=0.0, budget=0.0, accounting_only=True)
         current = previous.get("current") if preserve_current else None
         if current not in lanes:
             current = None
@@ -1596,22 +1796,43 @@ class Broker:
         if not available:
             return None, cycle, {}
         signature = self._policy_signature(policy)
-        if cycle is None or cycle.get("total_used", 0.0) >= SCHEDULING_HORIZON_SECONDS:
+        existing_lanes = (cycle or {}).get("lanes", {})
+        new_lanes = {key for key in available
+                     if key not in existing_lanes or existing_lanes[key].get("accounting_only")}
+        current = (cycle or {}).get("current")
+        # Admission is a non-preemptive boundary, not a redistribution of the
+        # leftover hour inside an unchanged model batch. A more important new
+        # lane joins immediately if compatible; otherwise finish exactly one
+        # queued turn of the current model before beginning its own batch.
+        lower_arrival = (
+            cycle is not None and current in cycle["lanes"]
+            and any(policy.weight(key[0]) < cycle["lanes"][current]["weight"]
+                    for key in new_lanes)
+        )
+        if lower_arrival:
+            newcomers = [key for key in new_lanes
+                         if policy.weight(key[0]) < cycle["lanes"][current]["weight"]]
+            first = min(newcomers, key=lambda key: (
+                policy.weight(key[0]), available[key]["created"], key))
+            # An overlong active turn must not suppress same-model insertion.
+            previous = cycle if cycle["total_used"] < SCHEDULING_HORIZON_SECONDS else None
+            cycle = self._new_time_cycle(available, policy, now, previous)
+            cycle["current"] = first
+            if first[1] != current[1] and current in available:
+                cycle["boundary_lane"] = current
+        elif cycle is None or cycle.get("total_used", 0.0) >= SCHEDULING_HORIZON_SECONDS:
             cycle = self._new_time_cycle(available, policy, now)
         elif cycle.get("signature") != signature:
-            # A hot policy change takes effect at the next non-preemptive job
-            # boundary.  The active request has already completed here.
             cycle = self._new_time_cycle(available, policy, now, cycle)
-        elif any(key not in cycle.get("lanes", {}) for key in available):
-            # A source/model lane became ready after an empty/failing period.
-            # Preserve the current contiguous batch, but divide the remaining
-            # horizon so the returning lane receives bounded service.
+        elif new_lanes:
             cycle = self._new_time_cycle(
                 available, policy, now, cycle, preserve_current=True,
             )
 
-        selected_key = cycle.get("current")
-        if (
+        boundary = cycle.pop("boundary_lane", None)
+        # The admission boundary leaves the new lane current for the next pick.
+        selected_key = boundary if boundary in available else cycle.get("current")
+        if boundary not in available and (
             selected_key not in available
             or selected_key not in cycle["lanes"]
             or not self._budget_remaining(cycle["lanes"][selected_key])
@@ -1632,13 +1853,14 @@ class Broker:
                 key for key in cycle["order"] if key in available
             )
 
-        cycle["current"] = selected_key
+        if boundary not in available:
+            cycle["current"] = selected_key
         selected = available[selected_key]
         lane = cycle["lanes"][selected_key]
         eligible_sources = sorted({row["source"] for row in available.values()})
         decision = {
             "mode": "time_batch",
-            "reason": "60-minute weighted time batch with model affinity",
+            "reason": "60-minute reciprocal-weight model batch; lower weight gets more time",
             "eligible_sources": eligible_sources,
             "active_weights": {
                 source: weight for source, weight in self._policy_signature(policy)
@@ -1674,14 +1896,14 @@ class Broker:
         self._scheduler_snapshot = {
             "time_cycle": deepcopy(self._time_cycle),
             "duration_estimates": dict(self._duration_estimates),
-            "active_time_batch": deepcopy(self._active_time_batch),
+            "active_time_batches": deepcopy(self._active_time_batches),
             "last": dict(self._last_scheduler_decision)
             if getattr(self, "_last_scheduler_decision", None) else None,
         }
 
-    def _complete_time_batch(self, finished: float) -> None:
+    def _complete_time_batch(self, job_id: str, finished: float) -> None:
         """Charge one completed non-preemptive attempt to its selected lane."""
-        active = self._active_time_batch
+        active = self._active_time_batches.pop(job_id, None)
         if active is None:
             return
         lane = tuple(active["lane"])
@@ -1691,7 +1913,6 @@ class Broker:
         self._duration_estimates[lane] = (
             elapsed if previous is None else ((previous + elapsed) / 2.0)
         )
-        self._active_time_batch = None
         self._publish_scheduler_snapshot()
 
     def _next(self, allowed_sources: frozenset[str] | None = None, policy: SourcePolicy | None = None):
@@ -1723,6 +1944,35 @@ class Broker:
         self._last_scheduler_decision = dict(decision)
         self._publish_scheduler_snapshot()
         return selected
+
+    def queue_paused(self) -> bool:
+        with self.lock:
+            return bool(self.db.execute("SELECT paused FROM queue_control WHERE id=1").fetchone()[0])
+
+    def set_queue_paused(self, paused: bool) -> dict:
+        if not isinstance(paused, bool):
+            raise ValueError("paused must be a boolean")
+        with self.lock, self.db:
+            self.db.execute("UPDATE queue_control SET paused=? WHERE id=1", (int(paused),))
+        return {"paused": paused}
+
+    def _unload_if_paused(self) -> None:
+        # Serialize resume/claims with unloading; never touch an active attempt.
+        with self.lock:
+            if not self.queue_paused() or self.db.execute(
+                "SELECT 1 FROM jobs WHERE state IN ('running','cancel_requested') LIMIT 1"
+            ).fetchone():
+                return
+            try:
+                if self.executor_fence() and not self.reconcile_executor_fence():
+                    if not self.whisper_executor or not self.whisper_executor.release_idle(self):
+                        return
+                for model in self.ollama.ps().get("models", []):
+                    self.ollama.unload(model["name"])
+                self._loaded_models_cache = []
+            except Exception:
+                # Backend outages must not kill the dispatcher; retry next tick.
+                LOGGER.warning("Paused queue GPU unload failed; will retry", exc_info=True)
 
     def set_executor_fence(self, request_id, job_id):
         with self.lock, self.db:
@@ -1762,8 +2012,13 @@ class Broker:
             return self.executor_fence() is None
         return False
 
-    def dispatch_once(self, allowed_sources: frozenset[str] | None = None, policy: SourcePolicy | None = None) -> bool:
+    def dispatch_once(self, allowed_sources: frozenset[str] | None = None, policy: SourcePolicy | None = None, drain_check: bool = False) -> bool:
         with self.lock:
+            if drain_check:
+                return bool(self.db.execute("SELECT 1 FROM jobs WHERE state IN ('running','cancel_requested') LIMIT 1").fetchone())
+            if self.queue_paused():
+                self._unload_if_paused()
+                return False
             if self.db.execute("SELECT 1 FROM jobs WHERE state IN ('running','cancel_requested') LIMIT 1").fetchone():
                 return False
             ready_sources = frozenset(row[0] for row in self.db.execute(
@@ -1839,6 +2094,8 @@ class Broker:
                              policy.enabled_sources() if policy is not None else queued_sources)
                 allowed_sources = permitted - {ASR_PROFILE}
         with self.lock, self.db:
+            if self.queue_paused():
+                return False
             if self.executor_fence() != fence:
                 return False
             if self.db.execute("SELECT 1 FROM jobs WHERE state IN ('running','cancel_requested')").fetchone():
@@ -1857,7 +2114,7 @@ class Broker:
             # recovered while its bounded executor call is still active.
             lease_seconds = max(
                 float(self.lease_seconds),
-                float(PROFILES[row["profile"]].request_timeout_seconds) + 15.0,
+                float(PROFILES[row["profile"]].request_timeout_seconds) + (315.0 if row["profile"] == QWEN64_PROFILE else 15.0),
             )
             lease_until = now + lease_seconds
             decision = dict(self._last_scheduler_decision or {})
@@ -1886,7 +2143,7 @@ class Broker:
                 occurred=now, metadata={"lease_until": lease_until},
             )
             if policy is not None:
-                self._active_time_batch = {
+                self._active_time_batches[row["id"]] = {
                     "lane": self._lane_key(row),
                     "started": now,
                 }
@@ -1912,9 +2169,9 @@ class Broker:
         except Exception as exc:
             with self.lock, self.db:
                 finished = self.clock()
-                error_summary = ("ASR execution failed (" + type(exc).__name__ + ")"
-                                 if execution_row["kind"] == "transcribe" else bounded_error_summary(exc))
-                self._complete_time_batch(finished)
+                error_summary = ("nightly execution failed; no raw executor detail retained"
+                                 if row["source"] == nightly_eval.SOURCE else "ASR execution failed (" + type(exc).__name__ + ")" if execution_row["kind"] == "transcribe" else bounded_error_summary(exc))
+                self._complete_time_batch(row["id"], finished)
                 self.db.execute("UPDATE jobs SET state='failed',finished=?,lease_until=NULL,error=? WHERE id=?", (finished, error_summary, row["id"]))
                 self.storage.record_terminal_retention(
                     row["id"], row["source"], "failed", finished,
@@ -1931,17 +2188,46 @@ class Broker:
                 )
                 self._refresh_health_cache_locked()
                 self.completed.notify_all()
+        try:
+            self._unload_if_paused()
+        except Exception:
+            # A later dispatcher tick retries backend unload without changing
+            # the completed job outcome or permitting queued execution.
+            pass
         return True
 
     def _execute(self, row):
-        if row["kind"] == "transcribe":
+        if row["profile"] == ASR_PROFILE:
             if self.whisper_executor is None:
                 raise RuntimeError("ASR executor disabled")
             result = self.whisper_executor.run(self, row)
             self._finish_execution(row, result, "Whisper transcription completed; GPU fence tracked independently")
             return
         profile = PROFILES[row["profile"]]
+        if row["profile"] == syncopia_daily.PROFILE:
+            payload = json.loads(row["payload"])
+            if (row["source"] != syncopia_daily.SOURCE or row["kind"] != "chat"
+                    or syncopia_daily.normalize_request(payload) != payload):
+                raise ValueError("daily capacity persisted contract drift")
+        if profile.executor == "voice":
+            if row["profile"] == voice.voice_cpu.PROFILE:
+                import base64
+                payload = voice.validate(json.loads(row["payload"]), row["profile"])
+                result = voice.voice_cpu.execute(base64.b64decode(payload["audio_base64"]), row["id"], profile.request_timeout_seconds)
+                self._finish_execution(row, result, "CPU voice adapter call completed")
+                return
+            self.wol.wake()
+            result = voice.execute(row["profile"], json.loads(row["payload"]), profile.request_timeout_seconds)
+            self._finish_execution(row, result, "voice executor call completed")
+            return
         self.wol.wake()
+        nightly_evidence = None
+        if row["profile"] in NIGHTLY_PROFILE_NAMES:
+            payload = json.loads(row["payload"])
+            nightly_eval.normalize_request(payload, row["profile"])
+            nightly_evidence = nightly_eval.native_contract(self.ollama, row["profile"], payload["think"])
+            if nightly_evidence["native_thinking"] != payload["native_thinking"]:
+                raise ValueError("native thinking metadata changed since freeze")
         models = self.ollama.ps().get("models", [])
         self._loaded_models_cache = [dict(model) for model in models if isinstance(model, dict)]
         loaded = [m.get("name") for m in models]
@@ -1976,20 +2262,34 @@ class Broker:
             )
         if not ready:
             raise RuntimeError("target model did not become ready")
+        qwen64_before = qwen64_snapshot(self.ollama) if row["profile"] == QWEN64_PROFILE else None
         payload = json.loads(row["payload"])
         options = dict(payload.get("options", {}))
         default_context = profile.default_context or profile.max_context
         options["num_ctx"] = min(int(options.get("num_ctx", default_context)), profile.max_context)
         options["num_predict"] = min(int(options.get("num_predict", profile.max_output)), profile.max_output)
         request = {k: v for k, v in payload.items() if k not in {"model", "keep_alive"}}
+        if nightly_evidence is not None:
+            request.pop("native_thinking", None)
         request.update({"model": profile.model, "stream": False, "options": options,
                         "keep_alive": f"{profile.keep_alive_seconds}s"})
         request["_broker_timeout_seconds"] = profile.request_timeout_seconds
         result = self.ollama.run(row["kind"], request)
         if not isinstance(result, dict):
             raise RuntimeError("Ollama returned a non-object response")
+        if row["profile"] == QWEN64_PROFILE:
+            after = qwen64_snapshot(self.ollama, effective=True)
+            result = dict(result, _broker_execution_evidence=qwen64_evidence(qwen64_before, after, sampled_at=self.clock()))
+            self._loaded_models_cache = [after]
         if row["profile"] in OPENCLAW_PROFILE_NAMES:
             validate_openclaw_result(result, profile.model)
+        if row["profile"] in EVALUATION_PROFILE_NAMES:
+            validate_evaluation_result(result, profile.model)
+        if nightly_evidence is not None:
+            context = nightly_eval.resident_context(self.ollama, profile.model)
+            result = nightly_eval.project_result(result, profile.model)
+            result["execution_evidence"] = nightly_eval.project_evidence(
+                dict(nightly_evidence, runtime_context_length=context))
         self._finish_execution(row, result, reason)
 
     def _finish_execution(self, row, result, reason):
@@ -2023,7 +2323,7 @@ class Broker:
                 attempt_no=attempt_no, from_state=state, to_state=final,
                 reason=reason, occurred=finished,
             )
-            self._complete_time_batch(finished)
+            self._complete_time_batch(row["id"], finished)
             self._refresh_health_cache_locked()
             self.completed.notify_all()
 
@@ -2103,8 +2403,15 @@ class Dispatcher(threading.Thread):
         self.drain_event = threading.Event()
 
     def drain(self) -> None:
-        """Stop new claims while the in-flight remote execution finishes."""
+        """Stop new claims while the in-flight remote execution finishes.
+
+        A drain is deliberately one-shot: the next dispatch loop that finds the
+        in-flight attempt finished resumes claims automatically.  SIGUSR1 (and
+        therefore ``systemctl reload``) must never leave the dispatcher stopped
+        until a process restart.
+        """
         self.drain_event.set()
+
     def run(self):
         while not self.stop_event.is_set():
             # With a runtime policy, the effective allowlist and weights come
@@ -2118,6 +2425,17 @@ class Dispatcher(threading.Thread):
             self.broker.recover()
             self.broker.storage.maybe_checkpoint()
             self.broker.storage.maybe_maintain()
-            if not self.drain_event.is_set():
+            if self.drain_event.is_set():
+                # One-shot drain: the first loop that finds no in-flight attempt
+                # resumes claims instead of waiting for a process restart.  A
+                # running job keeps the drain flag until it finishes, so the
+                # active attempt is never interleaved with a new claim.
+                if not self.broker.dispatch_once(allowed, policy, drain_check=True):
+                    self.drain_event.clear()
+                    self.broker._audit(
+                        "dispatcher.resumed",
+                        reason="drain finished; no in-flight attempt",
+                    )
+            else:
                 self.broker.dispatch_once(allowed, policy)
             self.stop_event.wait(self.interval)

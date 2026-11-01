@@ -1,0 +1,104 @@
+{
+  "contract": {
+    "schema": "telegram-nightly-eval-v1",
+    "source": "telegram-nightly-eval-20261028-v1",
+    "max_calls": 32,
+    "max_outstanding": 1,
+    "profiles": [
+      {
+        "profile": "telegram-nightly-gemma12-v1",
+        "model": "gemma4:12b",
+        "model_digest": "4eb23ef187e2c5462566d6a1d3bbbc2f1346d0b4327cbb66d58fffbcc9b2b05c",
+        "options": {
+          "num_ctx": 32768,
+          "num_predict": 8192,
+          "temperature": 0
+        },
+        "kind": "chat",
+        "max_images": 0,
+        "format": "freeform",
+        "timeout_seconds": 1800
+      },
+      {
+        "profile": "telegram-nightly-gemma26-v1",
+        "model": "gemma4:26b",
+        "model_digest": "001e5dafc3c77684c2307ebc6ab8e336e10c9b18eca52acf547d72fc83c3ca8c",
+        "options": {
+          "num_ctx": 32768,
+          "num_predict": 8192,
+          "temperature": 0
+        },
+        "kind": "chat",
+        "max_images": 0,
+        "format": "freeform",
+        "timeout_seconds": 1800
+      },
+      {
+        "profile": "telegram-nightly-nemotron-nano-v1",
+        "model": "nemotron-3-nano:30b-a3b-q4_K_M",
+        "model_digest": "b725f11174073334edd0c2ff396b8d4e66d7dab22a5a63717ccad5a08a270cf1",
+        "options": {
+          "num_ctx": 32768,
+          "num_predict": 8192,
+          "temperature": 0
+        },
+        "kind": "chat",
+        "max_images": 0,
+        "format": "freeform",
+        "timeout_seconds": 1800
+      },
+      {
+        "profile": "telegram-nightly-qwen38-v1",
+        "model": "qwen3.8:ad-iq2-xs",
+        "model_digest": "b6f02c5a32addd8a6b03ae205617bec9472903d9755e116084376fd429d100b9",
+        "options": {
+          "num_ctx": 32768,
+          "num_predict": 8192,
+          "temperature": 0
+        },
+        "kind": "chat",
+        "max_images": 0,
+        "format": "freeform",
+        "timeout_seconds": 1800
+      }
+    ]
+  },
+  "source_proposal": {
+    "telegram-nightly-eval-20261028-v1": {
+      "enabled": false,
+      "admission_allowed": false,
+      "weight": 1
+    }
+  },
+  "policy_action": "main merges one entry only after acceptance; no replacement of existing sources",
+  "native_metadata": "native-v2 preserves known/unknown per exact model; unknown blocks only its rows; capability never substitutes values/default",
+  "input_proposal": {
+    "manifest_sha256": "5f8046556912ad1e7c09239717c315eb4cde39f889e1640dfb72fca6f7cad0e8",
+    "model_facing_only": [
+      "case-01-porta/messages.json",
+      "case-02-kp/messages.json",
+      "case-03-pm/messages.json",
+      "case-04-s92/messages.json"
+    ],
+    "text_only": true,
+    "dereference_urls": false,
+    "read_references_rubric_proofs": false,
+    "generation_budget": "8192 total native generation tokens including thinking; final token count unknown unless backend reports it"
+  },
+  "runner_proposal": {
+    "native_schema": "telegram-nightly-native-v2",
+    "frozen_schema": "telegram-nightly-frozen-v2",
+    "partial_matrix_schema": "telegram-nightly-matrix-v2",
+    "unknown_status": "blocked_native_metadata",
+    "unknown_supported": null,
+    "unknown_payload_hash": null,
+    "unknown_external_id": null,
+    "legacy_known_frozen_v1_readable": true,
+    "main_observed_plan": {
+      "planned": 32,
+      "supported": 24,
+      "blocked_native_metadata": 8
+    },
+    "journal_rebinding": false
+  }
+}
