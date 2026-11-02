@@ -3,7 +3,7 @@
 Брокер принимает задания локального инференса в durable SQLite-очередь и
 последовательно передаёт их настроенным backend: Ollama, Wyoming, GigaAM и
 Whisper GPU. Источники используют общую очередь, source policy и один execution
-slot; профиль задания определяет backend и лимиты. Dashboard показывает
+slot; профиль задания определяет backend и defaults лимитов; runtime overrides зависят от lane. Dashboard показывает
 состояние очереди и управляет dispatch/admission.
 
 ## Как проходит задание
@@ -60,7 +60,7 @@ Active jobs, Forecast и History. Данные обновляются в фон�
 <a id="english"></a>
 ## English
 
-A local admission and scheduling service for one Ollama GPU executor. It keeps jobs in a durable SQLite WAL queue, runs at most one inference job at a time, and keeps model selection and limits on the server side. It does not replace Ollama or route cloud workloads.
+A local admission and scheduling service for one Ollama GPU executor. It keeps jobs in a durable SQLite WAL queue, runs at most one inference job at a time, with server profile defaults and optional per-job runtime overrides. It does not replace Ollama or route cloud workloads.
 
 An optional [Whisper executor](docs/WHISPER_EXECUTOR.md) shares this GPU queue
 through a separately authenticated ASR API. It is disabled by default and requires
@@ -126,6 +126,8 @@ The report timer is optional. Before enabling it, copy `config/report.env.exampl
 
 ### Key contracts
 
+Complete caller reference, override scope and errors: [HTTP API (Russian)](docs/API.md).
+
 - The opt-in OpenClaw native chat route waits on the same durable queue and returns an Ollama-compatible response; it does not change legacy admission-only endpoints. See [OpenClaw route](docs/OPENCLAW_ROUTE.md) for its wire contract and rollout boundary.
 
 - `POST /v1/jobs` durably admits a server-owned profile and returns HTTP 202. `GET /v1/jobs/{id}` and `POST /v1/jobs/{id}/cancel` expose the job lifecycle.
@@ -134,6 +136,11 @@ The report timer is optional. Before enabling it, copy `config/report.env.exampl
 - `BROKER_DISPATCH_ENABLED=true` starts the dispatcher. Without `BROKER_SOURCES_POLICY`, an explicit `BROKER_DISPATCH_SOURCES` allowlist is required. With a policy, enabled sources form the dispatch allowlist.
 - A policy source's `enabled=false` pauses new dispatch leases; `admission_allowed=false` rejects new jobs with HTTP 403 before insertion. The source controls API supports dispatch pause/resume, admission allow/block, weight changes, and confirmed bulk cancellation of queued or retry of failed jobs. Existing running work is not preempted.
 - Producer-owned storage is opt-in per source and admission. Its status, receipt, and mutation APIs require an owner-only bearer token; legacy jobs keep their previous contract. Compaction requires explicit guards and a matching durable ACK. See [producer storage](docs/PRODUCER_STORAGE.md) and [analytics](docs/ANALYTICS.md).
+
+### Queue job runtime overrides
+
+`POST /v1/jobs` accepts optional `model`, `options` and new-source `weight`.
+Lane validation and override precedence are documented in [HTTP API](docs/API.md).
 
 An illustrative **non-production** policy:
 
@@ -162,7 +169,7 @@ Tests use fakes for the executor and Wake-on-LAN; they do not start live inferen
 <a id="russian"></a>
 ## Русский
 
-Локальный сервис приёма и планирования заданий для одного GPU-исполнителя Ollama. Задания сохраняются в SQLite WAL, одновременно исполняется не более одного задания, а выбор модели и ограничения задаются сервером. Брокер не заменяет Ollama и не маршрутизирует облачные нагрузки.
+Локальный сервис приёма и планирования заданий для одного GPU-исполнителя Ollama. Задания сохраняются в SQLite WAL, одновременно исполняется не более одного задания, а серверные defaults модели и лимитов могут переопределяться заданием в поддерживаемых lanes. Брокер не заменяет Ollama и не маршрутизирует облачные нагрузки.
 
 [Схема архитектуры](#architecture) показывает путь от HTTP API через устойчивую очередь и диспетчер к пробуждаемому GPU-исполнителю. Брокер и очередь работают на постоянно включённом хосте. WOL, проверка готовности и инференс происходят только после включения dispatch и выбора допустимого задания. `GET /healthz` не обращается к исполнителю.
 
@@ -195,6 +202,8 @@ curl --fail http://127.0.0.1:8088/healthz
 
 ### Основные контракты
 
+Формы запросов, область overrides, endpoints и ошибки: [HTTP API](docs/API.md).
+
 - Дополнительный OpenClaw native chat route ждёт результат в той же устойчивой очереди и возвращает Ollama-совместимый ответ; старые admission-only endpoints не меняются. См. [маршрут OpenClaw](docs/OPENCLAW_ROUTE.md) и границы его rollout.
 
 - `POST /v1/jobs` сохраняет задание с серверным профилем и возвращает HTTP 202. `GET /v1/jobs/{id}` и `POST /v1/jobs/{id}/cancel` показывают и изменяют состояние задания.
@@ -225,23 +234,3 @@ python3 -m unittest discover -s tests -v
 ```
 
 Тесты используют заглушки Ollama и Wake-on-LAN и не запускают реальный инференс. Границы rollout описаны в [ROADMAP.md](ROADMAP.md).
-
-### Queue job runtime overrides
-
-`POST /v1/jobs` accepts optional top-level `model`, `options` (including
-`num_ctx` and `num_predict`), and `weight`. Job runtime values take precedence
-over profile defaults; absent values keep the legacy profile behavior. Sources
-are scheduling identities, not model owners. New sources are registered atomically
-in the configured source-policy file, enabled and admission-allowed, with weight
-5 unless the introducing job supplies a finite positive weight. Existing source
-entries and maintenance/admission controls are retained.
-
-Token budgets are never silently clamped: requests above the target model's
-configured physical context ceiling fail with HTTP 400 containing the requested
-value, limit, and model id. Known models use the largest server-configured context
-ceiling for that model (not the submitting profile's smaller default). Unknown
-models require native `/api/show` context metadata; unavailable metadata fails
-closed. These limits do not enable multi-job GPU execution. Pilot and nightly
-jobs retain dedicated source/correlation and media/thinking safety contracts,
-but testers can select model and token budgets. Synchronous compatibility routes
-continue to apply their own input contracts.
