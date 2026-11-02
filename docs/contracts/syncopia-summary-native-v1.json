@@ -1,0 +1,65 @@
+{
+  "schema": "syncopia-summary-native-v1",
+  "source": "syncopia-telegram-memory",
+  "kind": "chat",
+  "think": false,
+  "profiles": {
+    "syncopia-summary-gemma12-v1": {
+      "profile": {
+        "name": "syncopia-summary-gemma12-v1",
+        "model": "gemma4:12b",
+        "max_context": 131072,
+        "max_output": 65536,
+        "keep_alive_seconds": 300,
+        "max_concurrency": 1,
+        "min_interval_seconds": 0,
+        "request_timeout_seconds": 1800,
+        "max_images": 0,
+        "max_schema_bytes": 0,
+        "executor": "ollama",
+        "occupancy_class": "unknown",
+        "occupancy_cohort": null,
+        "occupancy_max_jobs": 1,
+        "occupancy_peak_vram_bytes": null,
+        "occupancy_evidence": null,
+        "default_context": null
+      },
+      "model": "gemma4:12b",
+      "model_digest": "4eb23ef187e2c5462566d6a1d3bbbc2f1346d0b4327cbb66d58fffbcc9b2b05c",
+      "native_context": 262144
+    },
+    "syncopia-summary-bolt-e4b-v1": {
+      "profile": {
+        "name": "syncopia-summary-bolt-e4b-v1",
+        "model": "nemotron-3.5-bolt:e4b",
+        "max_context": 65536,
+        "max_output": 32768,
+        "keep_alive_seconds": 300,
+        "max_concurrency": 1,
+        "min_interval_seconds": 0,
+        "request_timeout_seconds": 1800,
+        "max_images": 0,
+        "max_schema_bytes": 0,
+        "executor": "ollama",
+        "occupancy_class": "unknown",
+        "occupancy_cohort": null,
+        "occupancy_max_jobs": 1,
+        "occupancy_peak_vram_bytes": null,
+        "occupancy_evidence": null,
+        "default_context": null
+      },
+      "model": "nemotron-3.5-bolt:e4b",
+      "model_digest": "69f2be39b309ade35ef04ee02507915f4cd839f6631e14425146cb6c9df3bd39",
+      "native_context": 65536
+    }
+  },
+  "input_rule": {
+    "max_message_bytes": 196608,
+    "proxy": "canonical-message-JSON UTF8 bytes; NOT tokenizer",
+    "wrapper_reserve": 4096,
+    "condition": "input_proxy + num_predict + wrapper_reserve <= num_ctx"
+  },
+  "source_only": true,
+  "quality_GO": false,
+  "recurring_GO": false
+}

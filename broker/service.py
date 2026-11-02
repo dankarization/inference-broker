@@ -29,7 +29,7 @@ from .compat import (CompatibilityError, UNCENSORED_EVAL_PROFILES, NEXTCLOUD_PRO
                      validate_shutterstock_video_payload,
                      validate_syncopia_memory_payload, validate_uncensored_eval_payload)
 from .profiles import EVALUATION_PROFILE_NAMES, OPENCLAW_PROFILE_NAMES, PROFILES
-from . import nightly_eval, syncopia_daily
+from . import nightly_eval, syncopia_daily, syncopia_summary
 from .profiles import NIGHTLY_PROFILE_NAMES, VOICE_PROFILE_NAMES
 from . import voice
 from .evaluation import normalize_request as normalize_evaluation_request
@@ -702,6 +702,9 @@ class Broker:
             raise ValueError("payload must be an object")
         payload = deepcopy(payload)
         legacy_payload = deepcopy(payload)
+        if profile in syncopia_summary.MODELS:
+            # Fail closed on model/mode/budget before generic metadata fallback.
+            syncopia_summary.normalize_request(legacy_payload, profile, model, options)
         requested_model = model if model is not None else payload.get("model")
         if model is not None:
             payload["model"] = model
@@ -795,6 +798,10 @@ class Broker:
                 })
             except CompatibilityError as exc:
                 raise ValueError(str(exc)) from exc
+        if profile in syncopia_summary.MODELS:
+            payload = syncopia_summary.admit(
+                self.ollama, profile, source, kind, legacy_payload, model, options,
+                external_id, source_item_id, producer_storage)
         if profile == "syncopia-memory-qwen38":
             if source != "syncopia-telegram-memory":
                 raise ValueError("Syncopia memory profile must use its dedicated source")
@@ -862,6 +869,14 @@ class Broker:
                             "job retention expired; recover the durable producer artifact"
                         )
                 if existing is not None:
+                    # Native summaries share the memory source, not its legacy
+                    # permissive correlation semantics. Protect both directions
+                    # of a collision with an old/default-model job.
+                    if profile in syncopia_summary.MODELS or existing["profile"] in syncopia_summary.MODELS:
+                        if (existing["profile"] != profile or existing["kind"] != kind
+                                or existing["source_item_id"] != source_item_id
+                                or existing["input_hash"] != content_evidence(payload)[0]):
+                            raise ValueError("summary v1 idempotency identity conflict")
                     existing_has_producer_storage = (
                         existing["producer_attempt_id"] is not None
                         or existing["input_storage_mode"] != "broker_temporary"
@@ -1179,6 +1194,9 @@ class Broker:
             data.pop(field, None)
         if data["source"] in {"pilot-mainpc", nightly_eval.SOURCE} or data["profile"] in {QWEN64_PROFILE, voice.voice_cpu.PROFILE}:
             # Exact durable client correlation survives terminal payload cleanup.
+            data["input_hash"] = row["input_hash"]
+            data["input_bytes"] = row["input_bytes"]
+        if data["profile"] in syncopia_summary.MODELS:
             data["input_hash"] = row["input_hash"]
             data["input_bytes"] = row["input_bytes"]
         data["payload"] = json.loads(data["payload"])
@@ -2246,6 +2264,14 @@ class Broker:
             if (row["source"] != syncopia_daily.SOURCE or row["kind"] != "chat"
                     or syncopia_daily.normalize_request(payload) != payload):
                 raise ValueError("daily capacity persisted contract drift")
+        summary_evidence = None
+        if row["profile"] in syncopia_summary.MODELS:
+            payload = json.loads(row["payload"])
+            if row["source"] != syncopia_summary.SOURCE or row["kind"] != "chat":
+                raise ValueError("summary v1 persisted source/kind drift")
+            if content_evidence(payload) != (row["input_hash"], row["input_bytes"]):
+                raise ValueError("summary v1 persisted input identity drift")
+            summary_evidence = syncopia_summary.persisted_contract(self.ollama, row["profile"], payload)
         if profile.executor == "voice":
             if row["profile"] == voice.voice_cpu.PROFILE:
                 import base64
@@ -2308,6 +2334,8 @@ class Broker:
         request = {k: v for k, v in payload.items() if k not in {"model", "keep_alive"}}
         if nightly_evidence is not None:
             request.pop("native_thinking", None)
+        if summary_evidence is not None:
+            request.pop("summary_contract", None)
         request.update({"model": profile.model, "stream": False, "options": options,
                         "keep_alive": f"{profile.keep_alive_seconds}s"})
         request["_broker_timeout_seconds"] = profile.request_timeout_seconds
@@ -2327,6 +2355,9 @@ class Broker:
             result = nightly_eval.project_result(result, profile.model)
             result["execution_evidence"] = nightly_eval.project_evidence(
                 dict(nightly_evidence, runtime_context_length=context))
+        if summary_evidence is not None:
+            result = dict(result, execution_evidence=syncopia_summary.execution_evidence(
+                self.ollama, row["profile"], payload, result))
         self._finish_execution(row, result, reason)
 
     def _finish_execution(self, row, result, reason):

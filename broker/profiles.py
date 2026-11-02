@@ -151,6 +151,15 @@ PROFILES = {
         "syncopia-memory-qwen38-128k-v1", "qwen3.8:ad-iq2-xs", 131_072, 8_192, 1_800,
         max_concurrency=1, request_timeout_seconds=900,
     ),
+    # Opt-in native-Boolean summaries; legacy memory/daily profiles unchanged.
+    "syncopia-summary-gemma12-v1": Profile(
+        "syncopia-summary-gemma12-v1", "gemma4:12b", 131_072, 65_536, 300,
+        request_timeout_seconds=1800,
+    ),
+    "syncopia-summary-bolt-e4b-v1": Profile(
+        "syncopia-summary-bolt-e4b-v1", "nemotron-3.5-bolt:e4b", 65_536, 32_768, 300,
+        request_timeout_seconds=1800,
+    ),
     # Seven isolated, text-only comparison lanes.  They deliberately share one
     # source so their evaluations cannot borrow any production caller's share.
     # 64k is the normal comparison default; 128k is an explicit stress ceiling.
