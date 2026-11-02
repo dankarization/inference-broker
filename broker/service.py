@@ -799,8 +799,8 @@ class Broker:
             except CompatibilityError as exc:
                 raise ValueError(str(exc)) from exc
         if profile in syncopia_summary.MODELS:
-            payload = syncopia_summary.admit(
-                self.ollama, profile, source, kind, legacy_payload, model, options,
+            payload = syncopia_summary.prepare(
+                profile, source, kind, legacy_payload, model, options,
                 external_id, source_item_id, producer_storage)
         if profile == "syncopia-memory-qwen38":
             if source != "syncopia-telegram-memory":
@@ -875,7 +875,7 @@ class Broker:
                     if profile in syncopia_summary.MODELS or existing["profile"] in syncopia_summary.MODELS:
                         if (existing["profile"] != profile or existing["kind"] != kind
                                 or existing["source_item_id"] != source_item_id
-                                or existing["input_hash"] != content_evidence(payload)[0]):
+                                or content_evidence(payload) != (existing["input_hash"], existing["input_bytes"])):
                             raise ValueError("summary v1 idempotency identity conflict")
                     existing_has_producer_storage = (
                         existing["producer_attempt_id"] is not None
@@ -918,6 +918,10 @@ class Broker:
                         if source in {"nextcloud", "pilot-mainpc", "local-voice", nightly_eval.SOURCE} and existing["source_item_id"] != source_item_id:
                             raise ValueError("source correlation item conflict")
                         return self.status(existing["id"])
+            if profile in syncopia_summary.MODELS:
+                # Existing exact receipts returned above. Only new admissions
+                # depend on live metadata; dispatch still revalidates it too.
+                syncopia_summary.persisted_contract(self.ollama, profile, payload)
             if source == nightly_eval.SOURCE:
                 entry = (self.source_policy.snapshot()["sources"].get(source)
                          if self.source_policy is not None else None)

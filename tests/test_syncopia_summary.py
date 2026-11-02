@@ -7,6 +7,7 @@ from pathlib import Path
 import subprocess
 import tempfile
 import unittest
+from unittest.mock import patch
 from broker import syncopia_summary as s
 from broker.compat import validate_syncopia_memory_payload
 from broker.profiles import PROFILES
@@ -188,6 +189,91 @@ class SummaryTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError,'model must match'):
             self.broker.submit(**body)
         self.assertEqual(self.native.calls,[]);self.assertEqual(self.count(),0)
+
+    def test_exact_queued_completed_failed_receipts_ignore_offline_and_drift_metadata(self):
+        for profile in s.MODELS:
+            for state in ('queued','completed','failed'):
+                for fault in ('offline','digest','capability'):
+                    with self.subTest(profile=profile,state=state,fault=fault):
+                        self.native.digest_override=None;self.native.values=[False,True]
+                        body=self.body(profile)
+                        body['external_id']='receipt-'+str(self.count())
+                        job=self.broker.submit(**body)
+                        if state=='completed':
+                            row=self.broker.db.execute('select * from jobs where id=?',(job['id'],)).fetchone()
+                            self.broker._execute(row)
+                        elif state=='failed':
+                            with self.broker.db:
+                                self.broker.db.execute("update jobs set state='failed',payload='{}',error='synthetic failed' where id=?",(job['id'],))
+                        if state!='queued':self.assertEqual(self.broker.status(job['id'])['payload'],{})
+                        self.native.digest_override='0'*64 if fault=='digest' else None
+                        self.native.values=['low'] if fault=='capability' else [False,True]
+                        count=self.count();calls=list(self.native.calls);runs=copy.deepcopy(self.native.requests)
+                        wakes=self.wake.calls
+                        tag_method=self.native.tags
+                        with patch.object(self.native,'tags',side_effect=OSError('synthetic offline') if fault=='offline' else tag_method) as tags, patch.object(self.native,'show',side_effect=AssertionError('receipt must not query show')) as show:
+                            retried=self.broker.submit(**copy.deepcopy(body))
+                            tags.assert_not_called();show.assert_not_called()
+                        self.assertEqual((retried['id'],retried['state']),(job['id'],state))
+                        self.assertEqual((retried['input_hash'],retried['input_bytes']),(job['input_hash'],job['input_bytes']))
+                        self.assertEqual(self.count(),count)
+                        self.assertEqual(self.native.calls,calls);self.assertEqual(self.native.requests,runs)
+                        self.assertEqual(self.wake.calls,wakes)
+        self.native.digest_override=None;self.native.values=[False,True]
+
+    def test_offline_collision_and_pinned_proof_mismatch_reject_without_preflight(self):
+        body=self.body();job=self.broker.submit(**body)
+        for change in ('text','item','profile','options','legacy'):
+            changed=copy.deepcopy(body)
+            if change=='text':changed['payload']['messages'][1]['content']='different'
+            elif change=='item':changed['source_item_id']='different-item'
+            elif change=='options':changed['options']['num_predict']+=1
+            elif change=='profile':
+                changed['profile']='syncopia-summary-bolt-e4b-v1';changed['model']=s.MODELS[changed['profile']][0]
+            else:
+                changed.update(profile='syncopia-memory-qwen38',model='qwen3.8:ad-iq2-xs');changed['payload']['think']='low'
+            with self.subTest(change=change),patch.object(self.native,'tags',side_effect=AssertionError('must not preflight')) as tags:
+                with self.assertRaisesRegex(ValueError,'identity conflict'):self.broker.submit(**changed)
+                tags.assert_not_called()
+        proof=s.pinned_contract(body['profile']);proof['schema']='different-proof'
+        with patch.object(s,'pinned_contract',return_value=proof),patch.object(self.native,'tags',side_effect=AssertionError('must not preflight')):
+            with self.assertRaisesRegex(ValueError,'identity conflict'):self.broker.submit(**body)
+        self.assertEqual(self.count(),1);self.assertEqual(self.broker.status(job['id'])['id'],job['id'])
+
+    def test_expired_receipt_remains_closed_without_metadata_or_reinsertion(self):
+        from broker.storage import content_evidence
+        body=self.body()
+        normalized=s.prepare(body['profile'],body['source'],body['kind'],body['payload'],
+                             body['model'],body['options'],body['external_id'],body['source_item_id'],None)
+        with self.broker.db:
+            self.broker.db.execute("insert into job_retention_tombstones (job_id,source,external_id,profile,kind,final_state,input_hash,created,purged_at) values (?,?,?,?,?,?,?,?,?)",
+                ('expired-synthetic',s.SOURCE,body['external_id'],body['profile'],'chat','completed',content_evidence(normalized)[0],1,2))
+        with patch.object(self.native,'tags',side_effect=AssertionError('must not preflight')) as tags:
+            with self.assertRaisesRegex(ValueError,'recover the durable producer artifact'):self.broker.submit(**body)
+            body['payload']['messages'][1]['content']='changed expired input'
+            with self.assertRaisesRegex(ValueError,'expired correlation'):self.broker.submit(**body)
+            tags.assert_not_called()
+        self.assertEqual(self.count(),0);self.assertFalse(self.native.requests)
+
+    def test_stored_receipt_byte_identity_corruption_cannot_return_uuid(self):
+        body=self.body();job=self.broker.submit(**body)
+        with self.broker.db:self.broker.db.execute('update jobs set input_bytes=input_bytes+1 where id=?',(job['id'],))
+        with patch.object(self.native,'tags',side_effect=AssertionError('must not preflight')):
+            with self.assertRaisesRegex(ValueError,'identity conflict'):self.broker.submit(**body)
+        self.assertEqual(self.count(),1)
+
+    def test_new_keys_still_require_live_metadata_and_do_not_insert_when_offline_or_drifted(self):
+        for profile in s.MODELS:
+            body=self.body(profile)
+            with patch.object(self.native,'tags',side_effect=OSError('synthetic offline')) as tags:
+                with self.assertRaisesRegex(ValueError,'metadata unavailable'):self.broker.submit(**body)
+                tags.assert_called_once()
+            self.native.digest_override='0'*64
+            with self.assertRaisesRegex(ValueError,'digest mismatch'):self.broker.submit(**body)
+            self.native.digest_override=None;self.native.values=['low']
+            with self.assertRaisesRegex(ValueError,'boolean capability'):self.broker.submit(**body)
+            self.native.values=[False,True]
+        self.assertEqual(self.count(),0);self.assertFalse(self.native.requests);self.assertEqual(self.wake.calls,0)
 
     def test_idempotency_exact_retry_and_payload_model_item_collisions(self):
         body=self.body();job=self.broker.submit(**body)

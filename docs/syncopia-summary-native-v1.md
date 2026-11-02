@@ -19,7 +19,12 @@ No streaming, tools, media, schema format, keep_alive override or extra options.
 Exactly two messages, System then User, each with only role/content. Exact
 UTF-8 content is copied, never sliced, normalized or summarized by this adapter.
 External/source-item IDs are required bounded durable identities.
-Exact retries return the existing job; changing profile, kind, source item or
+Exact queued/completed/failed retries reconstruct deterministic normalized input
+and pinned admission proof, then compare the complete durable identity under the
+DB lock, without fresh metadata. They return the original receipt even if native
+metadata is now offline/drifted; this never authorizes execution. New keys still
+require live preflight before INSERT; dispatch preflight is unchanged.
+Changing profile, kind, source item or
 normalized input under the same source/external ID rejects. Collisions with old
 memory jobs reject in either direction; legacy-to-legacy behavior is unchanged.
 

@@ -78,6 +78,13 @@ def budget(payload):
                 tokenizer="NOT_USED", runtime_fit="UNMEASURED")
 
 
+def pinned_contract(profile_name):
+    """Deterministic expected admission proof, not a fresh runtime observation."""
+    model, pinned, native_limit = MODELS[profile_name]
+    return dict(schema=VERSION, model=model, model_digest=pinned, native_context=native_limit,
+                native_thinking_values=[False, True], requested_think=False)
+
+
 def native_contract(executor, profile_name):
     """Read-only metadata only; never load/infer/download or change options."""
     model, pinned, native_limit = MODELS[profile_name]
@@ -101,19 +108,27 @@ def native_contract(executor, profile_name):
         not isinstance(info, dict) or type(info.get("gemma4.context_length")) is not int or
         info["gemma4.context_length"] != native_limit):
         raise ValueError("summary v1 native boolean capability/context unavailable")
-    return dict(schema=VERSION, model=model, model_digest=pinned, native_context=native_limit,
-                native_thinking_values=[False, True], requested_think=False)
+    return pinned_contract(profile_name)
 
 
-def admit(executor, profile, source, kind, payload, model, options,
-          external_id, source_item_id, producer_storage):
+def prepare(profile, source, kind, payload, model, options,
+            external_id, source_item_id, producer_storage):
+    """Reconstruct exact pinned identity for receipt lookup without native I/O."""
     if source != SOURCE or kind != "chat" or producer_storage is not None:
         raise ValueError("summary v1 requires existing memory source and inline chat")
     if any(not isinstance(v, str) or re.fullmatch(r"[A-Za-z0-9_.:/-]{1,160}", v) is None
            for v in (external_id, source_item_id)):
         raise ValueError("summary v1 requires bounded durable correlation IDs")
     result = normalize_request(payload, profile, model, options)
-    result["summary_contract"] = dict(native_contract(executor, profile), admission_budget=budget(result))
+    result["summary_contract"] = dict(pinned_contract(profile), admission_budget=budget(result))
+    return result
+
+
+def admit(executor, profile, source, kind, payload, model, options,
+          external_id, source_item_id, producer_storage):
+    result = prepare(profile, source, kind, payload, model, options,
+                     external_id, source_item_id, producer_storage)
+    persisted_contract(executor, profile, result)
     return result
 
 
