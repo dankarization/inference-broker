@@ -11,7 +11,8 @@ from urllib.request import Request, ProxyHandler, build_opener
 
 from broker.http import openclaw_wait_seconds, serve
 from broker.openclaw import MODEL, normalize_request
-from broker.profiles import OPENCLAW_PROFILES_BY_MODEL, PROFILES, VOICE_PROFILE_NAMES
+from broker.profiles import (OPENCLAW_LEGACY_PROFILE_NAMES, OPENCLAW_PROFILE_NAMES,
+                             OPENCLAW_PROFILES_BY_MODEL, PROFILES, VOICE_PROFILE_NAMES)
 from broker.service import Broker
 
 
@@ -33,7 +34,7 @@ class FakeOllama:
         return {"models": [{"name": MODEL}]}
 
     def is_ready(self, model):
-        return model in OPENCLAW_PROFILES_BY_MODEL
+        return any(profile.model == model for profile in PROFILES.values())
 
     def unload(self, model):
         pass
@@ -157,10 +158,10 @@ class OpenClawRouteTests(unittest.TestCase):
             "qwen3.8:unc-rvn-iq2xxs": (131_072, 16_384, False),
             "frob/ministral-3:14b-thinking-q4_K_M": (262_144, 16_384, True),
             "nemotron-3-nano:30b-a3b-q4_K_M": (262_144, 16_384, False),
-            "gpt-oss:20b": (131_072, 16_384, False),
             "qwen3-vl:2b-instruct-q4_K_M": (8_192, 2_048, True),
-            "hf.co/ggml-org/SmolVLM2-2.2B-Instruct-GGUF:Q4_K_M": (8_192, 2_048, True),
-            "hf.co/ggml-org/SmolVLM2-500M-Video-Instruct-GGUF:Q8_0": (8_192, 2_048, True),
+            # Live 2026-11-09 MAIN-PC artifacts and their /api/show ceilings.
+            "deepseek-ocr:latest": (8_192, 2_048, True),
+            "glm-ocr:latest": (131_072, 8_192, True),
         }
         self.assertEqual(set(OPENCLAW_PROFILES_BY_MODEL), set(cases))
         for model, (context, output, vision) in cases.items():
@@ -258,30 +259,45 @@ class OpenClawRouteTests(unittest.TestCase):
     def test_small_vlm_smoke_profiles_enforce_dispatch_and_image_bounds(self):
         # The executor is fake: these assertions verify broker admission and
         # dispatch, not the artifacts' vision or agent/tool capabilities.
+        # qwen3-vl:2b remains an OpenClaw wire model; the two SmolVLM2 artefacts
+        # were deleted from MAIN-PC, so their lanes are retained for queued jobs
+        # only and are no longer reachable as wire models (see the route-removal
+        # regression below).
         for model, profile_name in (
             ("qwen3-vl:2b-instruct-q4_K_M", "openclaw-qwen3-vl-2b"),
             ("hf.co/ggml-org/SmolVLM2-2.2B-Instruct-GGUF:Q4_K_M", "openclaw-smolvlm2-2b"),
             ("hf.co/ggml-org/SmolVLM2-500M-Video-Instruct-GGUF:Q8_0", "openclaw-smolvlm2-500m"),
         ):
             with self.subTest(model=model):
-                self.assertEqual(OPENCLAW_PROFILES_BY_MODEL[model], profile_name)
                 self.assertEqual(PROFILES[profile_name].max_images, 4)
+                if model in OPENCLAW_PROFILES_BY_MODEL:
+                    self.assertEqual(OPENCLAW_PROFILES_BY_MODEL[model], profile_name)
+                    body = {"model": model, "messages": [
+                        {"role": "user", "content": "describe", "images": ["aGVsbG8="] * 4}]}
+                else:
+                    # Retained lane for a deleted artifact: it is loadable, but
+                    # its wire model no longer selects a route profile.
+                    self.assertIn(profile_name, OPENCLAW_LEGACY_PROFILE_NAMES)
+                    self.assertNotIn(profile_name, OPENCLAW_PROFILE_NAMES)
+                    with self.assertRaisesRegex(ValueError, "configured OpenClaw model"):
+                        normalize_request({"model": model, "messages": [
+                            {"role": "user", "content": "describe"}]})
+                    body = {"messages": [
+                        {"role": "user", "content": "describe", "images": ["aGVsbG8="] * 4}]}
                 for options, expected in (
                     ({}, {"num_ctx": 8192, "num_predict": 2048}),
                     ({"num_ctx": 2048, "num_predict": 128},
                      {"num_ctx": 2048, "num_predict": 128}),
                 ):
-                    body = {"model": model, "messages": [
-                        {"role": "user", "content": "describe", "images": ["aGVsbG8="] * 4}],
-                        "options": options}
-                    job = self.broker.submit(profile_name, "chat", normalize_request(body),
+                    attempt = {**body, "options": options}
+                    job = self.broker.submit(profile_name, "chat", attempt,
                                              source="openclaw")
                     self.assertTrue(self.broker.dispatch_once(frozenset({"openclaw"})))
                     request = self.ollama.requests[-1][1]
                     self.assertEqual(request["model"], model)
                     self.assertEqual(request["options"], expected)
                     self.assertEqual(request["_broker_timeout_seconds"], 600)
-                    self.assertEqual(request["messages"], body["messages"])
+                    self.assertEqual(request["messages"], attempt["messages"])
                     self.assertEqual(self.broker.status(job["id"])["state"], "completed")
                 for messages, error in (
                     ([{"role": "user", "content": "x", "images": ["aGVsbG8="] * 5}],
@@ -295,13 +311,42 @@ class OpenClawRouteTests(unittest.TestCase):
                      "valid base64"),
                 ):
                     with self.assertRaisesRegex(ValueError, error):
-                        self.broker.submit(profile_name, "chat", {"messages": messages},
+                        self.broker.submit(profile_name, "chat", {"model": model, "messages": messages},
                                            source="openclaw")
                 with self.assertRaisesRegex(ValueError, "configured OpenClaw model"):
                     normalize_request({"model": model + "-unknown", "messages": body["messages"]})
                 with self.assertRaisesRegex(ValueError, "requires source openclaw"):
-                    self.broker.submit(profile_name, "generate", normalize_request(body),
+                    self.broker.submit(profile_name, "generate", body,
                                        source="openclaw")
+
+    def test_route_drops_deleted_artifacts_and_keeps_retained_profiles_loadable(self):
+        # Deleted-from-MAIN-PC artefacts must no longer select a wire model, and
+        # the retained profiles must still be submittable for already-queued jobs.
+        for model, profile_name in (
+            ("gpt-oss:20b", "openclaw-gpt-oss"),
+            ("hf.co/ggml-org/SmolVLM2-2.2B-Instruct-GGUF:Q4_K_M", "openclaw-smolvlm2-2b"),
+            ("hf.co/ggml-org/SmolVLM2-500M-Video-Instruct-GGUF:Q8_0", "openclaw-smolvlm2-500m"),
+        ):
+            with self.subTest(model=model):
+                self.assertNotIn(model, OPENCLAW_PROFILES_BY_MODEL)
+                self.assertNotIn(profile_name, OPENCLAW_PROFILE_NAMES)
+                self.assertIn(profile_name, OPENCLAW_LEGACY_PROFILE_NAMES)
+                self.assertIn(profile_name, PROFILES)
+                with self.assertRaisesRegex(ValueError, "configured OpenClaw model"):
+                    normalize_request({"model": model, "messages": [
+                        {"role": "user", "content": "hello"}]})
+                with self.assertRaises(HTTPError) as caught:
+                    self.opener.open(self.request({
+                        "model": model, "stream": False,
+                        "messages": [{"role": "user", "content": "hello"}]}))
+                self.assertEqual(caught.exception.code, 400)
+                # The durable path still admits the retained profile.
+                job = self.broker.submit(profile_name, "chat", {
+                    "model": model,
+                    "messages": [{"role": "user", "content": "queued"}]},
+                    source="openclaw")
+                self.assertEqual(self.broker.status(job["id"])["profile"], profile_name)
+                self.broker.cancel(job["id"])
 
     def test_gemma4_26b_smoke_options_thinking_and_server_caps(self):
         for think, requested, expected in (

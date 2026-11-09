@@ -10,6 +10,7 @@ import wave
 import urllib.error
 from clients import broker_voice_client
 from broker import voice
+from broker.profiles import PROFILES, VOICE_PROFILE_NAMES
 from unittest.mock import patch
 from broker.service import Broker, SourcePolicy
 from tests.test_batch_scheduler import MutableClock, FakeOllama, FakeWol
@@ -141,7 +142,9 @@ class VoiceTests(unittest.TestCase):
             json.dump({'sources': {'local-voice': {'weight': 7}, 'openclaw': {'weight': 1}}}, f)
         policy = SourcePolicy(path)  # Test-only policy; production voice remains weight 2.
         voice_jobs = [self.voice() for _ in range(8)]
-        light_jobs = [self.broker.submit('openclaw-smolvlm2-500m', 'chat',
+        # qwen3-vl:2b is the smallest OpenClaw route model still installed on
+        # MAIN-PC; the previously used SmolVLM2-500M tag no longer exists.
+        light_jobs = [self.broker.submit('openclaw-qwen3-vl-2b', 'chat',
                       {'messages': [{'role': 'user', 'content': str(i)}]}, source='openclaw')['id']
                       for i in range(8)]
         def transcribe(*args):
@@ -153,12 +156,12 @@ class VoiceTests(unittest.TestCase):
             for index in range(9):
                 self.assertTrue(self.broker.dispatch_once(policy=policy))
                 if index == 0:
-                    light_jobs.append(self.broker.submit('openclaw-smolvlm2-500m', 'chat',
+                    light_jobs.append(self.broker.submit('openclaw-qwen3-vl-2b', 'chat',
                         {'messages': [{'role': 'user', 'content': 'extra'}]}, source='openclaw')['id'])
         self.assertEqual(sum(self.broker.status(job)['state'] == 'completed' for job in light_jobs), 8)
         self.assertEqual(sum(self.broker.status(job)['state'] == 'completed' for job in voice_jobs), 1)
         self.assertTrue(any(isinstance(call, tuple) and call[0] == 'run' and
-                            call[2].get('model', '').startswith('hf.co/ggml-org/SmolVLM2-500M')
+                            call[2].get('model', '').startswith('qwen3-vl:2b')
                             for call in self.calls))
 
     def test_http_worker_wire_contract(self):
@@ -178,7 +181,7 @@ class VoiceTests(unittest.TestCase):
         worker.start()
         try:
             with patch.dict(os.environ, {'BROKER_GIGAAM_URL': 'http://127.0.0.1:%d' % server.server_port,
-                                        'BROKER_GIGAAM_TOKEN': 'test-token'}):
+                                         'BROKER_GIGAAM_TOKEN': 'test-token'}):
                 result = voice.execute('voice-gigaam-v1', self.payload, 5)
             self.assertEqual(result['text'], 'test')
             self.assertEqual(received, {'path': '/v1/transcribe', 'auth': 'Bearer test-token', 'audio': b'audio'})
@@ -186,6 +189,111 @@ class VoiceTests(unittest.TestCase):
             server.shutdown()
             worker.join(5)
             server.server_close()
+
+    def _wire_server(self, response):
+        received = {}
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_POST(self):
+                received.update(path=self.path, auth=self.headers.get('Authorization'),
+                                audio=self.rfile.read(int(self.headers['Content-Length'])))
+                body = json.dumps(response).encode()
+                self.send_response(200)
+                self.send_header('Content-Length', str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+            def log_message(self, *args): pass
+        server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(thread.join, 5)
+        self.addCleanup(server.shutdown)
+        return server, received
+
+    def test_whisper_large_v3_uses_its_own_worker_and_no_forced_language(self):
+        # The large-v3 lane must call a separately configured base URL/token and
+        # must not force a broker-side language; the worker picks it, matching
+        # the live CPU service. Its result model id is not pinned to the medium
+        # worker's identity.
+        server, received = self._wire_server({'text': 'large', 'model': 'whisper-large-v3-mainpc-cuda'})
+        medium_env = {'BROKER_WHISPER_GPU_URL': 'http://127.0.0.1:1',
+                      'BROKER_WHISPER_GPU_TOKEN': 'medium-token'}
+        with patch.dict(os.environ, {**medium_env,
+                                     'BROKER_WHISPER_LARGE_URL': 'http://127.0.0.1:%d' % server.server_port,
+                                     'BROKER_WHISPER_LARGE_TOKEN': 'large-token'}):
+            result = voice.execute('voice-whisper-gpu-large-v3-v1', self.payload, 5)
+        self.assertEqual(result, {'text': 'large', 'model': 'whisper-large-v3-mainpc-cuda'})
+        self.assertEqual(received, {'path': '/v1/transcribe', 'auth': 'Bearer large-token', 'audio': b'audio'})
+        # Even a result that echoes the medium model id is accepted: the
+        # separate URL/token, not the model id, is the identity boundary.
+        server2, received2 = self._wire_server({'text': 'large', 'model': 'whisper-medium-int8-mainpc-cuda'})
+        with patch.dict(os.environ, {**medium_env,
+                                     'BROKER_WHISPER_LARGE_URL': 'http://127.0.0.1:%d' % server2.server_port,
+                                     'BROKER_WHISPER_LARGE_TOKEN': 'large-token'}):
+            self.assertEqual(voice.execute('voice-whisper-gpu-large-v3-v1', self.payload, 5)['text'], 'large')
+        self.assertEqual(received2['auth'], 'Bearer large-token')
+
+    def test_medium_and_gigaam_contracts_are_unchanged(self):
+        # Regression: the pre-existing lanes keep their exact URLs, tokens and
+        # fixed query strings. Only the large-v3 lane drops the language query.
+        gigaam, gigaam_seen = self._wire_server({'text': 'g', 'model': 'gigaam-v3-e2e-rnnt'})
+        medium, medium_seen = self._wire_server({'text': 'm', 'model': 'whisper-medium-int8-mainpc-cuda'})
+        with patch.dict(os.environ, {
+            'BROKER_GIGAAM_URL': 'http://127.0.0.1:%d' % gigaam.server_port,
+            'BROKER_GIGAAM_TOKEN': 'gigaam-token',
+            'BROKER_WHISPER_GPU_URL': 'http://127.0.0.1:%d' % medium.server_port,
+            'BROKER_WHISPER_GPU_TOKEN': 'medium-token',
+        }):
+            self.assertEqual(voice.execute('voice-gigaam-v1', self.payload, 5)['text'], 'g')
+            self.assertEqual(voice.execute('voice-whisper-gpu-v1', self.payload, 5)['text'], 'm')
+        self.assertEqual(gigaam_seen['path'], '/v1/transcribe')
+        self.assertEqual(gigaam_seen['auth'], 'Bearer gigaam-token')
+        self.assertEqual(medium_seen['path'], '/v1/transcribe?profile=background&language=ru')
+        self.assertEqual(medium_seen['auth'], 'Bearer medium-token')
+        self.assertEqual(voice._HTTP_WORKERS['voice-gigaam-v1'], ('GIGAAM', '', 'gigaam-v3-e2e-rnnt'))
+        self.assertEqual(voice._HTTP_WORKERS['voice-whisper-gpu-v1'],
+                         ('WHISPER_GPU', '?profile=background&language=ru', None))
+
+    def test_voice_lanes_fail_closed_without_their_own_credentials(self):
+        # A missing credential for one lane must never fall back to a sibling
+        # worker; each profile is rejected independently.
+        with patch.dict(os.environ, {'BROKER_GIGAAM_URL': 'http://127.0.0.1:1',
+                                     'BROKER_GIGAAM_TOKEN': 'x'}, clear=True):
+            with self.assertRaisesRegex(RuntimeError, 'WHISPER_GPU worker'):
+                voice.execute('voice-whisper-gpu-v1', self.payload, 5)
+            with self.assertRaisesRegex(RuntimeError, 'WHISPER_LARGE worker'):
+                voice.execute('voice-whisper-gpu-large-v3-v1', self.payload, 5)
+        with patch.dict(os.environ, {'BROKER_WHISPER_GPU_URL': 'http://127.0.0.1:1',
+                                     'BROKER_WHISPER_GPU_TOKEN': 'x'}, clear=True):
+            with self.assertRaisesRegex(RuntimeError, 'GIGAAM worker'):
+                voice.execute('voice-gigaam-v1', self.payload, 5)
+            with self.assertRaisesRegex(RuntimeError, 'WHISPER_LARGE worker'):
+                voice.execute('voice-whisper-gpu-large-v3-v1', self.payload, 5)
+        with patch.dict(os.environ, {}, clear=True):
+            # Wyoming is a socket transport and CPU voice uses the separate
+            # adapter contract: neither may appear as an HTTP worker lane.
+            self.assertNotIn('voice-wyoming-v1', voice._HTTP_WORKERS)
+            self.assertNotIn(voice.voice_cpu.PROFILE, voice._HTTP_WORKERS)
+            with self.assertRaisesRegex(RuntimeError, 'unknown voice profile'):
+                voice.execute('voice-does-not-exist-v1', self.payload, 5)
+
+    def test_large_v3_profile_is_a_voice_lane_and_survives_dispatch(self):
+        self.assertIn('voice-whisper-gpu-large-v3-v1', VOICE_PROFILE_NAMES)
+        self.assertEqual(voice._HTTP_WORKERS['voice-whisper-gpu-large-v3-v1'],
+                         ('WHISPER_LARGE', '', None))
+        profile = PROFILES['voice-whisper-gpu-large-v3-v1']
+        self.assertEqual((profile.executor, profile.request_timeout_seconds), ('voice', 1800))
+        self.assertEqual(profile.model, 'voice-whisper-gpu-large-v3-v1')
+        job = self.broker.submit('voice-whisper-gpu-large-v3-v1', 'transcribe', self.payload,
+                                 source='local-voice')['id']
+        with patch('broker.voice.execute', return_value={'text': 'ok'}) as execute:
+            self.broker.dispatch_once(policy=self.policy)
+        self.assertEqual(execute.call_args.args[0], 'voice-whisper-gpu-large-v3-v1')
+        self.assertEqual(self.broker.status(job)['state'], 'completed')
+        # Voice lanes never borrow an Ollama profile or a foreign source.
+        with self.assertRaises(ValueError):
+            self.broker.submit('voice-whisper-gpu-large-v3-v1', 'transcribe', self.payload,
+                               source='openclaw')
 
     def test_client_request_and_retry_after_lost_response(self):
         path = os.path.join(self.tmp.name, 'audio.ogg')

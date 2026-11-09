@@ -49,7 +49,7 @@ Top-level `model` перекрывает `payload.model`; top-level `options` с
 
 | Профили | До lane-валидации |
 | --- | --- |
-| `OPENCLAW_PROFILE_NAMES` (все 13 openclaw-профилей из profiles.py), `EVALUATION_PROFILE_NAMES` (четыре eval-профиля/pilot), `NIGHTLY_PROFILE_NAMES` (четыре telegram-nightly-профиля), `interactive`, `cron` | Сохраняют объединённые model/options; валидаторы видят overrides |
+| `OPENCLAW_PROFILE_NAMES` (12 route-профилей + 3 сохранённых legacy из profiles.py; admission/dispatch-гварды и валидация результата идут по объединению `OPENCLAW_EXECUTOR_PROFILE_NAMES`), `EVALUATION_PROFILE_NAMES` (четыре eval-профиля/pilot), `NIGHTLY_PROFILE_NAMES` (четыре telegram-nightly-профиля), `interactive`, `cron` | Сохраняют объединённые model/options; валидаторы видят overrides |
 | Остальные, включая nextcloud, syncopia-memory-*, olya-*, shutterstock-* | Возвращаются к `legacy_payload`; из top-level options перед валидатором сохраняются только ключи кроме num_ctx/num_predict |
 
 Но после ВСЕХ адаптеров `submit()` снова записывает `requested_model`
