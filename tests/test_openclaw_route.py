@@ -127,7 +127,7 @@ class OpenClawRouteTests(unittest.TestCase):
 
     def test_model_and_payload_bounds_and_no_legacy_cron_cap(self):
         self.assertEqual((PROFILES["openclaw"].max_context, PROFILES["openclaw"].max_output),
-                         (131072, 16384))
+                         (262144, 16384))
         for change in ({"model": "evil"}, {"messages": []},
                        {"tools": [{"type": "function", "function": {"name": "x"}}]},
                        {"truncate": True}, {"options": {"num_ctx": True}},
@@ -139,7 +139,7 @@ class OpenClawRouteTests(unittest.TestCase):
             self.assertEqual(caught.exception.code, 400)
         capped = self.sample()
         capped["options"] = {"num_ctx": 999999, "num_predict": 999999}
-        with self.assertRaisesRegex(ValueError, "999999.*131072.*qwen3.8"):
+        with self.assertRaisesRegex(ValueError, "999999.*262144.*qwen3.8"):
             self.broker.submit("openclaw", "chat", normalize_request(capped))
         with self.assertRaises(HTTPError) as caught:
             self.opener.open(self.request(capped))
@@ -152,13 +152,13 @@ class OpenClawRouteTests(unittest.TestCase):
             "nemotron-3.5-bolt:e4b": (65_536, 8_192, True),
             "gemma4:12b": (262_144, 16_384, True),
             "gemma4:26b": (262_144, 8_192, True),
-            "qwen3-vl:30b": (212_992, 16_384, True),
+            "qwen3-vl:30b": (262_144, 16_384, True),
             "nemotron3:33b": (131_072, 8_192, True),
-            "qwen3.8:ad-iq2-xs": (131_072, 16_384, False),
-            "qwen3.8:unc-rvn-iq2xxs": (131_072, 16_384, False),
+            "qwen3.8:ad-iq2-xs": (262_144, 16_384, False),
+            "qwen3.8:unc-rvn-iq2xxs": (262_144, 16_384, False),
             "frob/ministral-3:14b-thinking-q4_K_M": (262_144, 16_384, True),
-            "nemotron-3-nano:30b-a3b-q4_K_M": (262_144, 16_384, False),
-            "qwen3-vl:2b-instruct-q4_K_M": (8_192, 2_048, True),
+            "nemotron-3-nano:30b-a3b-q4_K_M": (1_048_576, 16_384, False),
+            "qwen3-vl:2b-instruct-q4_K_M": (262_144, 2_048, True),
             # Live 2026-11-09 MAIN-PC artifacts and their /api/show ceilings.
             "deepseek-ocr:latest": (8_192, 2_048, True),
             "glm-ocr:latest": (131_072, 8_192, True),
@@ -285,7 +285,7 @@ class OpenClawRouteTests(unittest.TestCase):
                     body = {"messages": [
                         {"role": "user", "content": "describe", "images": ["aGVsbG8="] * 4}]}
                 for options, expected in (
-                    ({}, {"num_ctx": 8192, "num_predict": 2048}),
+                    ({}, {"num_ctx": PROFILES[profile_name].max_context, "num_predict": 2048}),
                     ({"num_ctx": 2048, "num_predict": 128},
                      {"num_ctx": 2048, "num_predict": 128}),
                 ):

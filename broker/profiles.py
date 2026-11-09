@@ -68,7 +68,7 @@ PROFILES = {
     "interactive": Profile("interactive", "nemotron3:33b", 16_384, 2_048, 180),
     "cron": Profile("cron", "nemotron3:33b", 8_192, 1_024, 120),
     # Preserve the original profile name for already-queued agent turns.
-    "openclaw": Profile("openclaw", "qwen3.8:ad-iq2-xs", 131_072, 16_384, 300,
+    "openclaw": Profile("openclaw", "qwen3.8:ad-iq2-xs", 262_144, 16_384, 300,
                         request_timeout_seconds=900),
     "openclaw-gemma4": Profile("openclaw-gemma4", "gemma4:12b", 262_144, 16_384, 300,
                                request_timeout_seconds=900, max_images=16),
@@ -76,16 +76,16 @@ PROFILES = {
     # Bound long-prefill attempts to one hour; other model lanes are unchanged.
     "openclaw-gemma4-26b": Profile("openclaw-gemma4-26b", "gemma4:26b", 262_144, 8_192, 300,
                                    request_timeout_seconds=3600, max_images=16),
-    "openclaw-qwen3-vl": Profile("openclaw-qwen3-vl", "qwen3-vl:30b", 212_992, 16_384, 300,
+    "openclaw-qwen3-vl": Profile("openclaw-qwen3-vl", "qwen3-vl:30b", 262_144, 16_384, 300,
                                 request_timeout_seconds=900, max_images=16),
     "openclaw-nemotron3": Profile("openclaw-nemotron3", "nemotron3:33b", 131_072, 8_192, 300,
                                  request_timeout_seconds=900, max_images=16),
     "openclaw-unc-rvn-iq2xxs": Profile("openclaw-unc-rvn-iq2xxs", "qwen3.8:unc-rvn-iq2xxs",
-                                      131_072, 16_384, 300, request_timeout_seconds=900),
+                                      262_144, 16_384, 300, request_timeout_seconds=900),
     "openclaw-ministral3": Profile("openclaw-ministral3", "frob/ministral-3:14b-thinking-q4_K_M",
                                    262_144, 16_384, 300, request_timeout_seconds=900, max_images=16),
     "openclaw-nemotron-nano": Profile("openclaw-nemotron-nano", "nemotron-3-nano:30b-a3b-q4_K_M",
-                                      262_144, 16_384, 300, request_timeout_seconds=900),
+                                      1_048_576, 16_384, 300, request_timeout_seconds=900),
     "openclaw-gpt-oss": Profile("openclaw-gpt-oss", "gpt-oss:20b", 131_072, 16_384, 300,
                                 request_timeout_seconds=900),
     # Exact artifact metadata ceiling; not measured context/vision acceptance.
@@ -96,15 +96,12 @@ PROFILES = {
     # Opt-in bounded smoke lanes only. Admission does not establish executor
     # vision support or agent/tool compatibility for these model artifacts.
     "openclaw-qwen3-vl-2b": Profile(
-        "openclaw-qwen3-vl-2b", "qwen3-vl:2b-instruct-q4_K_M", 8_192, 2_048, 300,
+        "openclaw-qwen3-vl-2b", "qwen3-vl:2b-instruct-q4_K_M", 262_144, 2_048, 300,
         request_timeout_seconds=600, max_images=4,
     ),
-    # OCR lanes for the artifacts installed on MAIN-PC.  Context ceilings are the
-    # live 2026-11-09 `/api/show` values for those exact tags (deepseekocr 8192;
-    # glm4 131072), not library figures.  The installed qwen3-vl:2b tag reports a
-    # 262144 ceiling, but its route deliberately keeps the narrower smoke bound
-    # above and therefore fails closed instead of widening an existing lane.
-    # Image counts stay bounded until each artifact gets its own media test.
+    # OCR and route ceilings are the live 2026-11-09 `/api/show` values for the
+    # installed tags, not the old smoke bounds.  Image counts stay bounded until
+    # each artifact gets its own media test.
     "openclaw-deepseek-ocr": Profile(
         "openclaw-deepseek-ocr", "deepseek-ocr:latest", 8_192, 2_048, 300,
         request_timeout_seconds=600, max_images=4,
