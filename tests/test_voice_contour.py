@@ -18,6 +18,50 @@ def result(model='whisper-medium-int8-mainpc-cuda',device='cuda'):
 
 
 class ContourTests(unittest.TestCase):
+    def test_actual_queued_failure_retains_only_allowlisted_windows_reason(self):
+        import tempfile
+        import urllib.error
+        from broker.service import Broker
+        from tests.test_batch_scheduler import FakeOllama,FakeWol,MutableClock
+        for detail,expected in [('gpu_memory_busy','gpu_memory_busy'),
+                ('whisper_model_not_prepared','whisper_model_not_prepared'),
+                ('synthetic-secret-do-not-retain','backend_rejected')]:
+            with self.subTest(detail=detail),tempfile.TemporaryDirectory() as tmp:
+                calls=[];clock=MutableClock()
+                broker=Broker(os.path.join(tmp,'db'),FakeOllama(calls,clock,400),FakeWol(calls),clock=clock)
+                try:
+                    job=broker.submit(c.PROFILE,'transcribe',payload(
+                        source_duration_seconds=2911.424,windows_model='large',local_only=True),
+                        source='local-voice',external_id='same-input',source_item_id='same-input')
+                    response=io.BytesIO(json.dumps({'error':'candidate_rejected','detail':detail}).encode())
+                    error=urllib.error.HTTPError('http://127.0.0.1:18083/v1/transcribe',422,'rejected',{},response)
+                    with patch.dict(os.environ,{'BROKER_WHISPER_LARGE_URL':'http://127.0.0.1:18083',
+                            'BROKER_WHISPER_LARGE_TOKEN':'synthetic-token'},clear=True), \
+                            patch('urllib.request.urlopen',side_effect=error) as http,patch.object(c,'cloud') as cloud:
+                        broker.dispatch_once()
+                    receipt=broker.status(job['id'])
+                    self.assertEqual(receipt['state'],'failed')
+                    self.assertEqual(receipt['error'],'ASR execution failed (LocalContourExhausted: '+expected+')')
+                    self.assertNotIn('synthetic-secret',receipt['error'])
+                    self.assertNotIn('synthetic-token',receipt['error'])
+                    self.assertEqual(http.call_count,1)
+                    cloud.assert_not_called()
+                    self.assertEqual(len(broker.attempts(job['id'])),1)
+                finally:broker.db.close()
+
+    def test_worker_error_body_is_bounded_and_untrusted_text_is_not_retained(self):
+        import urllib.error
+        for raw in (b'not json',b'x'*4097,json.dumps({'error':['not-a-string']}).encode()):
+            with self.subTest(raw_length=len(raw)):
+                error=urllib.error.HTTPError('http://127.0.0.1:18083',500,'rejected',{},io.BytesIO(raw))
+                with patch.dict(os.environ,{'BROKER_WHISPER_LARGE_URL':'http://127.0.0.1:18083',
+                        'BROKER_WHISPER_LARGE_TOKEN':'synthetic'},clear=True), \
+                        patch('urllib.request.urlopen',side_effect=error):
+                    with self.assertRaises(c.BackendRejected) as rejected:
+                        voice.execute(c.WINDOWS['large'],{'filename':'audio.ogg',
+                            'audio_base64':base64.b64encode(b'audio').decode()},10)
+                self.assertEqual(rejected.exception.safe_code,'backend_rejected')
+
     def test_whole_source_native_segments_can_exceed_five_minutes(self):
         r=result('whisper-large-v3-mainpc-cuda')
         r['segments']=[{'start':0.,'end':2911.424,'text':'hello'}]

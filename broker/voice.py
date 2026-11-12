@@ -8,6 +8,7 @@ import socket
 import re
 import urllib.parse
 import urllib.request
+import urllib.error
 import wave
 from . import voice_cpu, voice_contour
 
@@ -66,6 +67,13 @@ def validate(payload, profile, *, _contour_transport=False):
     return result
 
 
+def safe_error_summary(error):
+    # Never store raw backend response/exception text in a transcript receipt.
+    if isinstance(error, (voice_contour.BackendRejected, voice_contour.LocalContourExhausted)):
+        return 'ASR execution failed (' + type(error).__name__ + ': ' + error.safe_code + ')'
+    return 'ASR execution failed (' + type(error).__name__ + ')'
+
+
 def execute(profile, payload, timeout, *, _contour_transport=False):
     validate(payload, profile, _contour_transport=_contour_transport)
     if profile==voice_contour.PROFILE:
@@ -95,11 +103,30 @@ def execute(profile, payload, timeout, *, _contour_transport=False):
         'Authorization': 'Bearer ' + token, 'Content-Type': 'application/octet-stream',
         'Accept': 'application/json', 'X-Filename': payload['filename'],
     })
-    with urllib.request.urlopen(request, timeout=timeout) as response:
-        raw = response.read(2 * 1024 * 1024 + 1)
-        if len(raw) > 2 * 1024 * 1024:
-            raise voice_contour.BackendRejected('voice worker response exceeds bound')
-        result = json.loads(raw)
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            raw = response.read(2 * 1024 * 1024 + 1)
+            if len(raw) > 2 * 1024 * 1024:
+                raise voice_contour.BackendRejected('voice worker response exceeds bound')
+            result = json.loads(raw)
+    except urllib.error.HTTPError as exc:
+        # Preserve only worker-owned enumerated diagnostics, not raw response
+        # text, credentials, transcript content or arbitrary exception details.
+        code = 'backend_rejected'
+        try:
+            raw = exc.read(4097)
+            data = json.loads(raw) if len(raw) <= 4096 else None
+            if isinstance(data,dict):
+                for field in ('detail','error'):
+                    candidate = data.get(field)
+                    if isinstance(candidate,str) and candidate in voice_contour.SAFE_WORKER_CODES:
+                        code = candidate
+                        break
+        except (OSError,ValueError):
+            pass
+        finally:
+            exc.close()
+        raise voice_contour.BackendRejected(code) from None
     if not isinstance(result, dict) or not isinstance(result.get('text'), str):
         raise voice_contour.BackendRejected('voice worker returned invalid result')
     if required_model is not None and result.get('model') != required_model:

@@ -20,8 +20,25 @@ PROFILE = 'voice-contour-v1'
 WINDOWS = {'medium':'voice-whisper-gpu-v1', 'large':'voice-whisper-gpu-large-v3-v1', 'gigaam':'voice-gigaam-v1'}
 CPU_MAX_SECONDS = 600
 
+SAFE_WORKER_CODES = frozenset({
+    'gpu_admission_unavailable', 'gpu_memory_busy', 'whisper_model_not_prepared',
+    'cuda_int8_float32_unavailable', 'whisper_prompt_too_long', 'empty_transcript',
+    'invalid_transcript', 'prompt_echo', 'worker_busy', 'worker_stopping',
+    'worker_failure', 'body_size_rejected', 'request_id_required',
+    'unsupported_language', 'language_override_unsupported',
+})
+
 class BackendRejected(RuntimeError):
     """Known terminal response/capability rejection, not transport uncertainty."""
+    def __init__(self, reason):
+        super().__init__(reason)
+        self.safe_code = reason if reason in SAFE_WORKER_CODES else 'backend_rejected'
+
+class LocalContourExhausted(RuntimeError):
+    """Only safe backend diagnostics may escape the local-only terminal gate."""
+    def __init__(self, code='backend_rejected'):
+        self.safe_code = code if code in SAFE_WORKER_CODES else 'backend_rejected'
+        super().__init__('local-only contour exhausted; cloud was not called')
 
 class BackendUnconfigured(RuntimeError):
     """No upload attempted; fallback may select the next configured tier."""
@@ -161,13 +178,14 @@ def execute(payload,timeout,windows):
             if payload['language']!='auto' and model!='gigaam' and result.get('settings',{}).get('language')!=payload['language']:
                 raise ValueError('explicit language not honored')
             return finish(result,'windows')
-        except (ValueError,urllib.error.HTTPError,BackendRejected,BackendUnconfigured):
-            trace.append({'tier':'windows','status':'failed','reason':'backend_rejected_or_capability_unavailable'})
+        except (ValueError,urllib.error.HTTPError,BackendRejected,BackendUnconfigured) as exc:
+            trace.append({'tier':'windows','status':'failed','reason':'backend_rejected_or_capability_unavailable',
+                'error_code':getattr(exc,'safe_code','backend_rejected')})
         except urllib.error.URLError as exc:
             if not isinstance(exc.reason,ConnectionRefusedError):raise
             trace.append({'tier':'windows','status':'skipped','reason':'connection_refused_before_upload'})
         # Timeout/transport errors stay uncertain. Same queued job owns that
         # uncertainty: no second Windows call and no automatic cloud spend.
     if payload['local_only']:
-        raise RuntimeError('local-only contour exhausted; cloud was not called')
+        raise LocalContourExhausted(trace[-1].get('error_code','backend_rejected'))
     return finish(cloud(audio,payload,remaining()),'cloud')

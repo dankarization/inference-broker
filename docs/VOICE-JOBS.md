@@ -92,3 +92,14 @@ never overwrite their payloads, silently start a replacement, or discard their
 terminal evidence. A reviewed same-media migration must reconcile each receipt,
 reuse a completed full-source result where possible, and preserve predecessor
 IDs before admitting only the necessary whole-source replacement for failures.
+
+### Safe terminal diagnostics
+
+Known worker rejection responses are bounded to4KiB and only enumerated codes
+(e.g. `gpu_memory_busy`, `whisper_model_not_prepared`) are retained. Local-only
+contour exhaustion preserves that safe code in the durable terminal error instead
+of hiding every backend reason behind a generic RuntimeError. Unknown/malformed
+bodies map to `backend_rejected`; raw worker text, transcripts, tokens and arbitrary
+exception messages are never stored in this diagnostic. A terminal error is not
+permission for automatic retries or duplicate inference. Historical generic
+receipts cannot be retroactively assigned an unobserved code.

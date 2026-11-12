@@ -2207,7 +2207,7 @@ class Broker:
             with self.lock, self.db:
                 finished = self.clock()
                 error_summary = ("nightly execution failed; no raw executor detail retained"
-                                 if row["source"] == nightly_eval.SOURCE else "ASR execution failed (" + type(exc).__name__ + ")" if execution_row["kind"] == "transcribe" else bounded_error_summary(exc))
+                                 if row["source"] == nightly_eval.SOURCE else voice.safe_error_summary(exc) if execution_row["kind"] == "transcribe" else bounded_error_summary(exc))
                 self._complete_time_batch(row["id"], finished)
                 self.db.execute("UPDATE jobs SET state='failed',finished=?,lease_until=NULL,error=? WHERE id=?", (finished, error_summary, row["id"]))
                 self.storage.record_terminal_retention(
