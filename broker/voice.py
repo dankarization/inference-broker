@@ -10,6 +10,8 @@ import urllib.parse
 import urllib.request
 import urllib.error
 import wave
+from contextlib import nullcontext
+from . import voice_gpu
 from . import voice_cpu, voice_contour
 
 MAX_AUDIO_BYTES = 8 * 1024 * 1024
@@ -99,34 +101,37 @@ def execute(profile, payload, timeout, *, _contour_transport=False):
         if not isinstance(status,dict) or status.get('language_override') is not True:
             raise voice_contour.BackendRejected('worker does not support explicit language')
         query='?'+urllib.parse.urlencode({'language':payload['language']})
-    request = urllib.request.Request(url + '/v1/transcribe' + query, data=audio, method='POST', headers={
-        'Authorization': 'Bearer ' + token, 'Content-Type': 'application/octet-stream',
-        'Accept': 'application/json', 'X-Filename': payload['filename'],
-    })
-    try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:
-            raw = response.read(2 * 1024 * 1024 + 1)
-            if len(raw) > 2 * 1024 * 1024:
-                raise voice_contour.BackendRejected('voice worker response exceeds bound')
-            result = json.loads(raw)
-    except urllib.error.HTTPError as exc:
-        # Preserve only worker-owned enumerated diagnostics, not raw response
-        # text, credentials, transcript content or arbitrary exception details.
-        code = 'backend_rejected'
+    guard = voice_gpu.CURRENT.get()
+    with guard.claim(profile,timeout) if guard else nullcontext(None) as claim:
+        request = urllib.request.Request(url + '/v1/transcribe' + query, data=audio, method='POST', headers={
+            'Authorization': 'Bearer ' + token, 'Content-Type': 'application/octet-stream',
+            'Accept': 'application/json', 'X-Filename': payload['filename'],
+            **({'X-Request-Id':claim.request_id} if claim else {}),
+        })
         try:
-            raw = exc.read(4097)
-            data = json.loads(raw) if len(raw) <= 4096 else None
-            if isinstance(data,dict):
-                for field in ('detail','error'):
-                    candidate = data.get(field)
-                    if isinstance(candidate,str) and candidate in voice_contour.SAFE_WORKER_CODES:
-                        code = candidate
-                        break
-        except (OSError,ValueError):
-            pass
-        finally:
-            exc.close()
-        raise voice_contour.BackendRejected(code) from None
+            with urllib.request.urlopen(request, timeout=claim.remaining() if claim else timeout) as response:
+                raw = response.read(2 * 1024 * 1024 + 1)
+                if len(raw) > 2 * 1024 * 1024:
+                    raise voice_contour.BackendRejected('voice worker response exceeds bound')
+                result = json.loads(raw)
+        except urllib.error.HTTPError as exc:
+            # Preserve only worker-owned enumerated diagnostics, not raw response
+            # text, credentials, transcript content or arbitrary exception details.
+            code = 'backend_rejected'
+            try:
+                raw = exc.read(4097)
+                data = json.loads(raw) if len(raw) <= 4096 else None
+                if isinstance(data,dict):
+                    for field in ('detail','error'):
+                        candidate = data.get(field)
+                        if isinstance(candidate,str) and candidate in voice_contour.SAFE_WORKER_CODES:
+                            code = candidate
+                            break
+            except (OSError,ValueError):
+                pass
+            finally:
+                exc.close()
+            raise voice_contour.BackendRejected(code) from None
     if not isinstance(result, dict) or not isinstance(result.get('text'), str):
         raise voice_contour.BackendRejected('voice worker returned invalid result')
     if required_model is not None and result.get('model') != required_model:

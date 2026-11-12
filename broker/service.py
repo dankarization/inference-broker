@@ -2044,6 +2044,9 @@ class Broker:
         fence = self.executor_fence()
         if fence is None:
             return True
+        from . import voice_gpu
+        if fence['request_id'].startswith(voice_gpu.PREFIX):
+            return voice_gpu.reconcile(self, fence)
         if self.whisper_executor and self.whisper_executor.can_release(fence["request_id"]):
             self.clear_executor_fence(fence["request_id"])
             return self.executor_fence() is None
@@ -2254,7 +2257,9 @@ class Broker:
                 self._finish_execution(row, result, "CPU voice adapter call completed")
                 return
             self.wol.wake()
-            result = voice.execute(row["profile"], json.loads(row["payload"]), profile.request_timeout_seconds)
+            from . import voice_gpu
+            with voice_gpu.queued(self, row):
+                result = voice.execute(row["profile"], json.loads(row["payload"]), profile.request_timeout_seconds)
             self._finish_execution(row, result, "voice executor call completed")
             return
         self.wol.wake()

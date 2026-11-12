@@ -103,3 +103,33 @@ bodies map to `backend_rejected`; raw worker text, transcripts, tokens and arbit
 exception messages are never stored in this diagnostic. A terminal error is not
 permission for automatic retries or duplicate inference. Historical generic
 receipts cannot be retroactively assigned an unobserved code.
+
+### Queued GPU custody and non-preemptive Windows handoff
+
+Every production queued Windows voice call now runs under a request-owned fence
+in the existing `gpu_executor_fences` table, not a second queue. CPU results do
+not allocate that fence. The current queue execution waits for natural Ollama
+residency expiry; it never evicts a resident model or cancels another caller.
+Only after a known-empty Ollama allocation and a compatible idle worker does it
+persist `voice|<fixed-profile>|<UUID>` BEFORE uploading audio with X-Request-Id.
+
+Workers must advertise request_owned_release=true. Missing capability fails
+BEFORE upload. The matching Windows PR accepts optional canonical UUID headers
+without enabling mandatory tracking for old callers. Worker /v1/release checks
+that UUID under the same worker admission lock and refuses foreign/missing owner
+or active inference. No secret/environment override from a client is accepted.
+
+Transcript completion is distinct from resource release. A response timeout or
+release failure leaves the durable fence. Dispatch remains blocked until the
+exact worker reports the matching request idle and its model/GPU released; only
+that owned idle request can be asked to release. No inferred GPU release from
+HTTP completion, cancellation, last-request mismatch or an unreachable worker.
+The fence survives broker restart; native ASR fences keep their existing rules.
+No repeated inference is started to repair an unknown outcome.
+
+Deploy the compatible Windows transport first while its worker is idle. Default
+legacy callers remain accepted, so no shared env/token/task action needs to be
+replaced. Verify request_owned_release and actual model identity through existing
+private credentials, then apply the matched broker candidate while queue is
+idle, preserving all source/config/controls and existing receipt IDs. Do not
+install the new broker alone against an old untracked release API.

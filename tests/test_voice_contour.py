@@ -1,4 +1,5 @@
 import base64
+from contextlib import nullcontext
 import io
 import json
 import os
@@ -37,7 +38,8 @@ class ContourTests(unittest.TestCase):
                     error=urllib.error.HTTPError('http://127.0.0.1:18083/v1/transcribe',422,'rejected',{},response)
                     with patch.dict(os.environ,{'BROKER_WHISPER_LARGE_URL':'http://127.0.0.1:18083',
                             'BROKER_WHISPER_LARGE_TOKEN':'synthetic-token'},clear=True), \
-                            patch('urllib.request.urlopen',side_effect=error) as http,patch.object(c,'cloud') as cloud:
+                            patch('urllib.request.urlopen',side_effect=error) as http,patch.object(c,'cloud') as cloud, \
+                            patch('broker.voice_gpu.queued',return_value=nullcontext()):
                         broker.dispatch_once()
                     receipt=broker.status(job['id'])
                     self.assertEqual(receipt['state'],'failed')
