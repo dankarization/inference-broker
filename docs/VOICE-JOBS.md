@@ -22,3 +22,51 @@ The standalone `clients/broker_voice_client.py` submitter is disabled unless `BR
 Raw native segments remain in the queued result, available to clients requesting
 JSON/SRT; the broker does not synthesize timestamps or fall back to CPU/cloud.
 Responses exceeding 2 MiB are rejected rather than accepted after truncation.
+
+## Shared staged voice contour (contract56302)
+
+Media Loader defaults to queued profile `voice-contour-v1`, source `local-voice`.
+The existing voice execution lease encloses CPU → selected Windows → cloud;
+there are no nested broker submissions, direct client-to-Windows calls or
+separate queues. Payload example:
+
+```json
+{"filename":"audio.ogg","audio_base64":"<base64>","source_duration_seconds":2911.424,"windows_model":"large","language":"auto","response_format":"segments-v1","local_only":true}
+```
+
+`windows_model` defaults medium and selects ONLY second tier. `language` defaults
+auto; `local_only` defaults false independently of model/timestamps. Existing
+low-level Windows lanes remain compatible and run under the same queue.
+
+CPU uses the existing private native-CPU adapter bridge, gated when original
+source duration exceeds600s, FLAC admission is too large, configuration is
+unavailable or its transport cannot honor explicit language. The original
+source duration survives chunking: splitting a48min video does not make it
+eligible for CPU. Known adapter terminal failure can proceed to Windows;
+ambiguous durable-adapter outcome remains an error requiring reconciliation.
+
+Windows Whisper auto language sends no query; explicit language requires
+`/v1/status.language_override=true` BEFORE audio upload, then query language and
+matching result.settings.language. Missing capability is a known gate, not
+permission to ignore the user's language. GigaAM supports auto/Russian only.
+Known rejection/unconfigured worker may proceed to cloud, but ambiguous
+transport timeout does not start another inference/spend. Native segment
+capability is required for segments-v1 at whichever tier succeeds.
+
+Cloud runs ONLY last and ONLY when local_only=false. Broker-owned settings:
+`BROKER_CLOUD_STT_TOKEN` (or existing OPENAI_API_KEY), root URL
+`BROKER_CLOUD_STT_URL` (default https://api.openai.com), text model
+`BROKER_CLOUD_STT_MODEL` (preserves gpt-4o-mini-transcribe), timestamp model
+`BROKER_CLOUD_STT_SEGMENTS_MODEL` (whisper-1 verbose_json only until its documented
+2027-02-26 retirement). No caller URLs/tokens/models are accepted. Missing cloud
+credential is an explicit final-tier failure, never fabricated success. No
+cloud call occurs on local-only; stage policy is checked again at execution.
+Legacy text-only cloud models cannot generate native timestamps. Segments are
+validated for finite bounds, order and transcript reconciliation, not invented.
+
+Result `contour` records schema/tier/local_only/requested_language/windows_model
+and ordered attempts with CPU gate reasons. Requested policy and actual worker
+reported/detected language are separate facts. All input/result artifacts retain
+the same broker IDs and source policy. Do not change source weights/admission,
+restart unrelated active jobs or replace a live Archivist release to deploy this
+additive profile: use a reviewed delta against the actual live revision.

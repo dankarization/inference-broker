@@ -5,9 +5,11 @@ import io
 import json
 import os
 import socket
+import re
+import urllib.parse
 import urllib.request
 import wave
-from . import voice_cpu
+from . import voice_cpu, voice_contour
 
 MAX_AUDIO_BYTES = 8 * 1024 * 1024
 
@@ -21,7 +23,11 @@ _HTTP_WORKERS = {
 
 
 def validate(payload, profile):
-    allowed = {"audio_base64", "filename", "response_format"} if profile == voice_cpu.PROFILE else {"audio_base64", "filename"}
+    if profile == voice_contour.PROFILE:
+        payload = voice_contour.validate(payload)
+        validate({k:payload[k] for k in ("audio_base64","filename")}, 'voice-gigaam-v1')
+        return payload
+    allowed = {"audio_base64", "filename", "response_format"} if profile == voice_cpu.PROFILE else {"audio_base64", "filename", "language"}
     if not isinstance(payload, dict) or set(payload) - allowed:
         raise ValueError("voice payload requires only audio_base64 and filename")
     encoded, filename = payload.get("audio_base64"), payload.get("filename")
@@ -47,11 +53,20 @@ def validate(payload, profile):
                     raise ValueError("Wyoming requires 16 kHz mono PCM16 WAV")
         except (wave.Error, EOFError):
             raise ValueError("Wyoming requires 16 kHz mono PCM16 WAV") from None
-    return {"audio_base64": encoded, "filename": filename}
+    result = {"audio_base64": encoded, "filename": filename}
+    if "language" in payload:
+        language=payload["language"]
+        if not isinstance(language,str) or not re.fullmatch(r'[a-z]{2,3}',language):
+            raise ValueError('invalid explicit language')
+        if profile=='voice-gigaam-v1' and language!='ru':raise ValueError('GigaAM language unsupported')
+        result['language']=language
+    return result
 
 
 def execute(profile, payload, timeout):
     validate(payload, profile)
+    if profile==voice_contour.PROFILE:
+        return voice_contour.execute(payload,timeout,execute)
     audio = base64.b64decode(payload['audio_base64'])
     if profile == 'voice-wyoming-v1':
         return _wyoming(audio, timeout)
@@ -61,7 +76,16 @@ def execute(profile, payload, timeout):
     url = os.environ.get('BROKER_' + prefix + '_URL', '').rstrip('/')
     token = os.environ.get('BROKER_' + prefix + '_TOKEN', '')
     if not url or not token:
-        raise RuntimeError(prefix + ' worker URL/token not configured')
+        raise voice_contour.BackendUnconfigured(prefix + ' worker URL/token not configured')
+    if payload.get('language') and prefix!='GIGAAM':
+        status_request=urllib.request.Request(url+'/v1/status',headers={'Authorization':'Bearer '+token})
+        with urllib.request.urlopen(status_request,timeout=min(5,timeout)) as response:
+            status_raw=response.read(65537)
+            if len(status_raw)>65536:raise voice_contour.BackendRejected('worker status too large')
+            status=json.loads(status_raw)
+        if not isinstance(status,dict) or status.get('language_override') is not True:
+            raise voice_contour.BackendRejected('worker does not support explicit language')
+        query='?'+urllib.parse.urlencode({'language':payload['language']})
     request = urllib.request.Request(url + '/v1/transcribe' + query, data=audio, method='POST', headers={
         'Authorization': 'Bearer ' + token, 'Content-Type': 'application/octet-stream',
         'Accept': 'application/json', 'X-Filename': payload['filename'],
@@ -69,12 +93,12 @@ def execute(profile, payload, timeout):
     with urllib.request.urlopen(request, timeout=timeout) as response:
         raw = response.read(2 * 1024 * 1024 + 1)
         if len(raw) > 2 * 1024 * 1024:
-            raise RuntimeError('voice worker response exceeds bound')
+            raise voice_contour.BackendRejected('voice worker response exceeds bound')
         result = json.loads(raw)
     if not isinstance(result, dict) or not isinstance(result.get('text'), str):
-        raise RuntimeError('voice worker returned invalid result')
+        raise voice_contour.BackendRejected('voice worker returned invalid result')
     if required_model is not None and result.get('model') != required_model:
-        raise RuntimeError('voice worker model identity is invalid')
+        raise voice_contour.BackendRejected('voice worker model identity is invalid')
     return result
 
 
