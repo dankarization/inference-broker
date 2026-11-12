@@ -31,6 +31,7 @@ def validate(payload):
     allowed={'audio_base64','filename','windows_model','response_format','language','local_only','source_duration_seconds'}
     if not isinstance(payload,dict) or set(payload)-allowed:
         raise ValueError('invalid voice contour fields')
+    if payload.get('filename') != 'audio.ogg':raise ValueError('contour requires canonical audio.ogg')
     model=payload.get('windows_model','medium')
     language=payload.get('language','auto')
     fmt=payload.get('response_format','text')
@@ -70,8 +71,8 @@ def cpu(audio,request_id,timeout):
     started=time.monotonic()
     with tempfile.TemporaryDirectory(prefix='broker-voice-cpu-') as tmp:
         source=Path(tmp)/'audio.ogg';target=Path(tmp)/'audio.flac';source.write_bytes(audio)
-        subprocess.run(['ffmpeg','-nostdin','-v','error','-protocol_whitelist','file','-i',str(source),
-            '-map','0:a:0','-vn','-map_metadata','-1','-ac','1','-ar','16000','-c:a','flac',str(target)],
+        subprocess.run(['ffmpeg','-nostdin','-v','error','-protocol_whitelist','file','-f','ogg','-i',str(source),
+            '-t','300.1','-fs',str(voice_cpu.MAX_AUDIO+1),'-map','0:a:0','-vn','-map_metadata','-1','-ac','1','-ar','16000','-c:a','flac',str(target)],
             stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,
             check=True,timeout=min(120,timeout))
         if not 0<target.stat().st_size<=voice_cpu.MAX_AUDIO:
