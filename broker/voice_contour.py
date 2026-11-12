@@ -37,7 +37,7 @@ def validate(payload):
     fmt=payload.get('response_format','text')
     duration=payload.get('source_duration_seconds')
     if (not isinstance(model,str) or model not in WINDOWS or not isinstance(language,str)
-            or not re.fullmatch(r'auto|[a-z]{2,3}',language) or fmt not in {'text','segments-v1'}
+            or not re.fullmatch(r'auto|[a-z]{2,3}',language) or not isinstance(fmt,str) or fmt not in {'text','segments-v1'}
             or type(payload.get('local_only',False)) is not bool
             or type(duration) not in (int,float) or not math.isfinite(duration) or not 0<duration<=7200):
         raise ValueError('invalid voice contour options')

@@ -79,7 +79,7 @@ class ContourTests(unittest.TestCase):
 
     def test_queued_profile_validate_keeps_legacy_voice_contracts(self):
         self.assertEqual(voice.validate(payload(),'voice-contour-v1')['windows_model'],'medium')
-        for key,value in [('local_only','yes'),('language','en;cmd'),('source_duration_seconds',float('nan'))]:
+        for key,value in [('local_only','yes'),('language','en;cmd'),('source_duration_seconds',float('nan')),('response_format',[])]:
             with self.assertRaises(ValueError):voice.validate(payload(**{key:value}),'voice-contour-v1')
 
     def test_existing_broker_deduplicates_and_dispatches_contour_under_voice_lease(self):
