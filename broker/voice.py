@@ -11,23 +11,12 @@ from . import voice_cpu
 
 MAX_AUDIO_BYTES = 8 * 1024 * 1024
 
-# Server-owned worker routing for the HTTP voice lanes. Every lane keeps its own
-# base URL and token: no profile may borrow another worker's credentials, and a
-# missing configuration fails closed instead of falling back to a sibling
-# worker. `query` is the fixed worker-side request contract for that lane;
-# `required_model` is the only result identity the broker requires (GigaAM).
+# Fixed server-owned lanes: no caller endpoints or sibling fallback.
+# Require reported model identity, not merely a configured port label.
 _HTTP_WORKERS = {
-    # Live GigaAM service; result identity is verified by model id.
     'voice-gigaam-v1': ('GIGAAM', '', 'gigaam-v3-e2e-rnnt'),
-    # Existing MAIN-PC Whisper medium lane; its fixed worker contract still
-    # requests background processing in Russian. Result model id is not pinned.
-    'voice-whisper-gpu-v1': ('WHISPER_GPU', '?profile=background&language=ru', None),
-    # Distinct large-v3 worker, configured separately from the medium worker.
-    # No language/profile query: the worker chooses the decoding language itself
-    # so its behaviour matches the live CPU service. Its result model id is not
-    # required to be (and is not required to differ from) the medium model id;
-    # the separate URL/token is the identity boundary.
-    'voice-whisper-gpu-large-v3-v1': ('WHISPER_LARGE', '', None),
+    'voice-whisper-gpu-v1': ('WHISPER_GPU', '', 'whisper-medium-int8-mainpc-cuda'),
+    'voice-whisper-gpu-large-v3-v1': ('WHISPER_LARGE', '', 'whisper-large-v3-mainpc-cuda'),
 }
 
 
@@ -78,11 +67,14 @@ def execute(profile, payload, timeout):
         'Accept': 'application/json', 'X-Filename': payload['filename'],
     })
     with urllib.request.urlopen(request, timeout=timeout) as response:
-        result = json.loads(response.read(1024 * 1024 + 1))
+        raw = response.read(2 * 1024 * 1024 + 1)
+        if len(raw) > 2 * 1024 * 1024:
+            raise RuntimeError('voice worker response exceeds bound')
+        result = json.loads(raw)
     if not isinstance(result, dict) or not isinstance(result.get('text'), str):
         raise RuntimeError('voice worker returned invalid result')
     if required_model is not None and result.get('model') != required_model:
-        raise RuntimeError('GigaAM worker identity is invalid')
+        raise RuntimeError('voice worker model identity is invalid')
     return result
 
 
