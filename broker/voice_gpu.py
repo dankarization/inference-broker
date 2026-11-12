@@ -92,7 +92,9 @@ def queued(broker, row):
 
 
 class Claim:
-    def __init__(self,request_id,deadline):self.request_id,self.deadline=request_id,deadline
+    def __init__(self,request_id,deadline):
+        self.request_id,self.deadline=request_id,deadline
+        self.upload_started=False
     def remaining(self):
         value=self.deadline-time.monotonic()
         if value<=0:raise TimeoutError('queued voice GPU execution deadline')
@@ -129,9 +131,13 @@ class Guard:
             claim.remaining()
             yield claim
         finally:
+            # Before entering HTTP transport there can be no remote request.
+            # After transport starts, uncertainty still requires worker proof.
+            if not claim.upload_started:
+                self.broker.clear_executor_fence(encoded)
             # HTTP response may arrive just before worker's finally clears
             # active_jobs/records last_request_id; allow that bounded race.
-            for _ in range(10):
+            for _ in range(10 if claim.upload_started else 0):
                 if reconcile(self.broker,{'request_id':encoded,'job_id':self.job_id}):break
                 try:
                     observed=status(profile)

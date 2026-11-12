@@ -17,6 +17,9 @@ from . import voice_cpu, voice_contour
 MAX_AUDIO_BYTES = 8 * 1024 * 1024
 # Bounded whole-source contour only (2h 24kbit/s Opus < 22 MiB).
 MAX_CONTOUR_AUDIO_BYTES = 32 * 1024 * 1024
+# Supported faster-whisper tokenizer codes (not a claim of per-model capability).
+# Reject invalid codes before GPU custody/upload; Windows also validates them.
+WHISPER_LANGUAGES = frozenset('af am ar as az ba be bg bn bo br bs ca cs cy da de el en es et eu fa fi fo fr gl gu ha haw he hi hr ht hu hy id is it ja jw ka kk km kn ko la lb ln lo lt lv mg mi mk ml mn mr ms mt my ne nl nn no oc pa pl ps pt ro ru sa sd si sk sl sn so sq sr su sv sw ta te tg th tk tl tr tt uk ur uz vi yi yo zh yue'.split())
 
 # Fixed server-owned lanes: no caller endpoints or sibling fallback.
 # Require reported model identity, not merely a configured port label.
@@ -65,6 +68,8 @@ def validate(payload, profile, *, _contour_transport=False):
         if not isinstance(language,str) or not re.fullmatch(r'[a-z]{2,3}',language):
             raise ValueError('invalid explicit language')
         if profile=='voice-gigaam-v1' and language!='ru':raise ValueError('GigaAM language unsupported')
+        if profile in ('voice-whisper-gpu-v1','voice-whisper-gpu-large-v3-v1') and language not in WHISPER_LANGUAGES:
+            raise ValueError('unsupported Whisper language')
         result['language']=language
     return result
 
@@ -109,7 +114,9 @@ def execute(profile, payload, timeout, *, _contour_transport=False):
             **({'X-Request-Id':claim.request_id} if claim else {}),
         })
         try:
-            with urllib.request.urlopen(request, timeout=claim.remaining() if claim else timeout) as response:
+            transport_timeout=claim.remaining() if claim else timeout
+            if claim:claim.upload_started=True
+            with urllib.request.urlopen(request, timeout=transport_timeout) as response:
                 raw = response.read(2 * 1024 * 1024 + 1)
                 if len(raw) > 2 * 1024 * 1024:
                     raise voice_contour.BackendRejected('voice worker response exceeds bound')

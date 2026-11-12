@@ -41,6 +41,7 @@ class VoiceGPUTests(unittest.TestCase):
             with g.Guard(broker,'job').claim(PROFILE,10) as claim:
                 self.assertEqual(claim.request_id,ID)
                 self.assertEqual(broker.fence['request_id'],g.PREFIX+PROFILE+'|'+ID)
+                claim.upload_started=True
                 observed.update(model_loaded=True,gpu_release_confirmed=False,last_request_id=ID)
             self.assertIsNone(broker.fence)
             sleep.assert_called_once()
@@ -89,7 +90,8 @@ class VoiceGPUTests(unittest.TestCase):
         with patch.object(g,'worker',side_effect=lambda *a,**k:dict(observed)), \
                 patch.object(g.uuid,'uuid4',return_value=ID),patch.object(g.time,'sleep'):
             with self.assertRaisesRegex(TimeoutError,'inference unknown'):
-                with g.Guard(broker,'job').claim(PROFILE,10):
+                with g.Guard(broker,'job').claim(PROFILE,10) as claim:
+                    claim.upload_started=True
                     observed.update(active_jobs=1)
                     raise TimeoutError('inference unknown')
             self.assertIsNotNone(broker.fence)
@@ -155,6 +157,24 @@ class VoiceGPUTests(unittest.TestCase):
                 self.assertEqual(paths.count('transcribe'),1)
                 self.assertEqual(paths.count('release'),1)
             finally:broker.db.close()
+
+    def test_expired_local_budget_before_any_upload_clears_only_own_fence(self):
+        for times in ([0,2],[0,0,2]):
+            broker=Store();broker.ollama.ps.return_value={'models':[]}
+            with patch.object(g.time,'monotonic',side_effect=times),patch.object(g,'worker',return_value=ready()) as worker:
+                with self.assertRaises(TimeoutError):
+                    with g.Guard(broker,'job').claim(PROFILE,1) as claim:
+                        claim.remaining()  # mirrors timeout evaluation before urlopen
+            self.assertIsNone(broker.fence)
+            self.assertEqual(worker.call_count,1)  # only preflight status; no release
+
+    def test_preupload_exception_is_not_suppressed_by_cleanup(self):
+        broker=Store();broker.ollama.ps.return_value={'models':[]}
+        with patch.object(g,'worker',return_value=ready()):
+            with self.assertRaisesRegex(ValueError,'local request invalid'):
+                with g.Guard(broker,'job').claim(PROFILE,10):
+                    raise ValueError('local request invalid')
+        self.assertIsNone(broker.fence)
 
     def test_native_asr_fence_is_not_interpreted_as_voice(self):
         broker=Store();broker.fence={'request_id':ID,'job_id':'job'}

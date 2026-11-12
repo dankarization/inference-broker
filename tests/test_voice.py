@@ -30,6 +30,17 @@ class VoiceTests(unittest.TestCase):
         self.policy = SourcePolicy(path)
         self.payload = {'filename': 'a.ogg', 'audio_base64': base64.b64encode(b'audio').decode()}
 
+    def test_unsupported_whisper_language_never_admitted_or_claimed(self):
+        for profile in ('voice-whisper-gpu-v1','voice-whisper-gpu-large-v3-v1'):
+            for language in ('zz','eng'):
+                with self.subTest(profile=profile,language=language),patch('broker.voice_gpu.Guard.claim') as claim:
+                    with self.assertRaisesRegex(ValueError,'unsupported Whisper language'):
+                        self.broker.submit(profile,'transcribe',dict(self.payload,language=language),source='local-voice')
+                    claim.assert_not_called()
+                    self.assertIsNone(self.broker.executor_fence())
+        for language in ('en','ru','haw','yue'):
+            self.assertEqual(voice.validate(dict(self.payload,language=language),'voice-whisper-gpu-v1')['language'],language)
+
     def voice(self):
         return self.broker.submit('voice-gigaam-v1', 'transcribe', self.payload, source='local-voice')['id']
 

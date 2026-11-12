@@ -12,7 +12,7 @@ Profiles are server-owned: `voice-wyoming-v1`, `voice-gigaam-v1`,
 
 Audio must be nonempty and at most 8 MiB decoded; filename is 1–128 ASCII letters, digits, `.`, `_`, or `-`. Wyoming accepts only mono 16 kHz PCM16 WAV; convert before submitting. HTTP workers accept formats supported by their own service. Do not send URLs, paths, raw model names or endpoint credentials. The POST response includes the broker job `id`. Poll `GET /v1/jobs/{id}` until `completed`, `failed`, or `cancelled`; completed `result` contains the worker response including `text` (Wyoming returns `{"text": ...}`). Inspect actual response/status before integration; existing external/source item IDs support broker idempotency rules. `POST /v1/jobs/{id}/cancel` marks a running job cancel-requested; it is not preempted.
 
-Server configuration: `BROKER_WYOMING_HOST`/`BROKER_WYOMING_PORT` (defaults 127.0.0.1/10300); `BROKER_GIGAAM_URL` and `BROKER_GIGAAM_TOKEN`; `BROKER_WHISPER_GPU_URL` and `BROKER_WHISPER_GPU_TOKEN`; `BROKER_WHISPER_LARGE_URL` and `BROKER_WHISPER_LARGE_TOKEN`. URLs are worker base URLs; HTTP clients POST raw file bytes to `/v1/transcribe`. GigaAM retains its original no-query contract. Both Whisper lanes omit forced language/profile query parameters so the worker auto-detects language. Each HTTP lane requires its reported model identity: `gigaam-v3-e2e-rnnt`, `whisper-medium-int8-mainpc-cuda`, or `whisper-large-v3-mainpc-cuda` respectively. A Large endpoint returning medium is rejected. Each lane fails closed if its own URL/token is missing; no lane falls back to a sibling worker. Worker credentials remain server-side and are never stored in the repository. Ensure network reachability and start/configure workers separately. The broker does not manage Wyoming service startup. Calls timeout at the profile's 1800-second socket timeout; the lease covers that deadline plus the normal broker margin. Neither HTTP interface exposes a cancellation endpoint in the inspected clients; Wyoming cancellation is likewise not assumed. The broker retains the slot until the call returns or the lease expires, matching existing Ollama behavior. Timeout, disconnection, process death or expired lease does not prove that the remote GPU has been released; residual GPU use after a killed worker is a known phase-1 limitation. Voice dispatch does not unload Ollama or manage resident models, so GPU memory availability and worker lifecycle must be arranged operationally. No durable Whisper fence exists in this broker tree.
+Server configuration: `BROKER_WYOMING_HOST`/`BROKER_WYOMING_PORT` (defaults 127.0.0.1/10300); `BROKER_GIGAAM_URL` and `BROKER_GIGAAM_TOKEN`; `BROKER_WHISPER_GPU_URL` and `BROKER_WHISPER_GPU_TOKEN`; `BROKER_WHISPER_LARGE_URL` and `BROKER_WHISPER_LARGE_TOKEN`. URLs are worker base URLs; HTTP clients POST raw file bytes to `/v1/transcribe`. GigaAM retains its original no-query contract. Both Whisper lanes omit forced language/profile query parameters so the worker auto-detects language. Each HTTP lane requires its reported model identity: `gigaam-v3-e2e-rnnt`, `whisper-medium-int8-mainpc-cuda`, or `whisper-large-v3-mainpc-cuda` respectively. A Large endpoint returning medium is rejected. Each lane fails closed if its own URL/token is missing; no lane falls back to a sibling worker. Worker credentials remain server-side and are never stored in the repository. Ensure network reachability and start/configure workers separately. The broker does not manage Wyoming service startup. Calls use the profile execution deadline; the queue lease includes the normal broker margin. Cancellation of remote inference is not assumed. Queued Windows calls use the durable request-owned GPU fence described below: timeout, disconnection, process death or expired lease does not prove GPU release. The broker waits for natural Ollama expiry and never preempts a resident model.
 
 Inline audio and transcript are stored in the broker database, subject to the configured source retention policy; protect access and choose retention accordingly. This contract does not deploy, start workers, or change Archivist/OpenClaw callers.
 
@@ -47,7 +47,7 @@ ambiguous durable-adapter outcome remains an error requiring reconciliation.
 
 Windows Whisper auto language sends no query; explicit language requires
 `/v1/status.language_override=true` BEFORE audio upload, then query language and
-matching result.settings.language. Missing capability is a known gate, not
+matching result.settings.language. Unsupported Whisper tokenizer codes are rejected before Windows custody/upload. Missing capability is a known gate, not
 permission to ignore the user's language. GigaAM supports auto/Russian only.
 Known rejection/unconfigured worker may proceed to cloud, but ambiguous
 transport timeout does not start another inference/spend. Native segment
@@ -125,6 +125,9 @@ exact worker reports the matching request idle and its model/GPU released; only
 that owned idle request can be asked to release. No inferred GPU release from
 HTTP completion, cancellation, last-request mismatch or an unreachable worker.
 The fence survives broker restart; native ASR fences keep their existing rules.
+A local validation/deadline failure before entering HTTP transport clears only
+that never-uploaded request's own fence. Once transport has been entered, an
+uncertain remote outcome still requires matching worker release proof.
 No repeated inference is started to repair an unknown outcome.
 
 Deploy the compatible Windows transport first while its worker is idle. Default
