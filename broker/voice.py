@@ -11,6 +11,25 @@ from . import voice_cpu
 
 MAX_AUDIO_BYTES = 8 * 1024 * 1024
 
+# Server-owned worker routing for the HTTP voice lanes. Every lane keeps its own
+# base URL and token: no profile may borrow another worker's credentials, and a
+# missing configuration fails closed instead of falling back to a sibling
+# worker. `query` is the fixed worker-side request contract for that lane;
+# `required_model` is the only result identity the broker requires (GigaAM).
+_HTTP_WORKERS = {
+    # Live GigaAM service; result identity is verified by model id.
+    'voice-gigaam-v1': ('GIGAAM', '', 'gigaam-v3-e2e-rnnt'),
+    # Existing MAIN-PC Whisper medium lane; its fixed worker contract still
+    # requests background processing in Russian. Result model id is not pinned.
+    'voice-whisper-gpu-v1': ('WHISPER_GPU', '?profile=background&language=ru', None),
+    # Distinct large-v3 worker, configured separately from the medium worker.
+    # No language/profile query: the worker chooses the decoding language itself
+    # so its behaviour matches the live CPU service. Its result model id is not
+    # required to be (and is not required to differ from) the medium model id;
+    # the separate URL/token is the identity boundary.
+    'voice-whisper-gpu-large-v3-v1': ('WHISPER_LARGE', '', None),
+}
+
 
 def validate(payload, profile):
     allowed = {"audio_base64", "filename", "response_format"} if profile == voice_cpu.PROFILE else {"audio_base64", "filename"}
@@ -47,13 +66,14 @@ def execute(profile, payload, timeout):
     audio = base64.b64decode(payload['audio_base64'])
     if profile == 'voice-wyoming-v1':
         return _wyoming(audio, timeout)
-    prefix = 'GIGAAM' if profile == 'voice-gigaam-v1' else 'WHISPER_GPU'
+    if profile not in _HTTP_WORKERS:
+        raise RuntimeError('unknown voice profile')
+    prefix, query, required_model = _HTTP_WORKERS[profile]
     url = os.environ.get('BROKER_' + prefix + '_URL', '').rstrip('/')
     token = os.environ.get('BROKER_' + prefix + '_TOKEN', '')
     if not url or not token:
         raise RuntimeError(prefix + ' worker URL/token not configured')
-    endpoint = '/v1/transcribe' + ('?profile=background&language=ru' if prefix == 'WHISPER_GPU' else '')
-    request = urllib.request.Request(url + endpoint, data=audio, method='POST', headers={
+    request = urllib.request.Request(url + '/v1/transcribe' + query, data=audio, method='POST', headers={
         'Authorization': 'Bearer ' + token, 'Content-Type': 'application/octet-stream',
         'Accept': 'application/json', 'X-Filename': payload['filename'],
     })
@@ -61,7 +81,7 @@ def execute(profile, payload, timeout):
         result = json.loads(response.read(1024 * 1024 + 1))
     if not isinstance(result, dict) or not isinstance(result.get('text'), str):
         raise RuntimeError('voice worker returned invalid result')
-    if prefix == 'GIGAAM' and result.get('model') != 'gigaam-v3-e2e-rnnt':
+    if required_model is not None and result.get('model') != required_model:
         raise RuntimeError('GigaAM worker identity is invalid')
     return result
 

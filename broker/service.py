@@ -28,7 +28,7 @@ from .compat import (CompatibilityError, UNCENSORED_EVAL_PROFILES, NEXTCLOUD_PRO
                      validate_shutterstock_canary_payload,
                      validate_shutterstock_video_payload,
                      validate_syncopia_memory_payload, validate_uncensored_eval_payload)
-from .profiles import EVALUATION_PROFILE_NAMES, OPENCLAW_PROFILE_NAMES, PROFILES
+from .profiles import EVALUATION_PROFILE_NAMES, OPENCLAW_EXECUTOR_PROFILE_NAMES, PROFILES
 from . import nightly_eval, syncopia_daily
 from .profiles import NIGHTLY_PROFILE_NAMES, VOICE_PROFILE_NAMES
 from . import voice
@@ -714,7 +714,7 @@ class Broker:
         # Keep synchronous adapter contracts, while /v1/jobs runtime overrides
         # are applied after their schema/media validation.
         if model is not None or options is not None:
-            if profile not in OPENCLAW_PROFILE_NAMES | EVALUATION_PROFILE_NAMES | NIGHTLY_PROFILE_NAMES and profile != "interactive" and profile != "cron":
+            if profile not in OPENCLAW_EXECUTOR_PROFILE_NAMES | EVALUATION_PROFILE_NAMES | NIGHTLY_PROFILE_NAMES and profile != "interactive" and profile != "cron":
                 payload = legacy_payload
                 if options is not None:
                     adapter_options = {k: v for k, v in options.items() if k not in {"num_ctx", "num_predict"}}
@@ -755,9 +755,9 @@ class Broker:
                     or not isinstance(source_item_id, str) or re.fullmatch(r"[0-9]{1,128}", source_item_id) is None):
                     raise ValueError("Gemma26 requires bounded exact correlation/file identities")
             payload = validate_nextcloud_payload(payload, profile)
-        if (source == "openclaw" or profile in OPENCLAW_PROFILE_NAMES) and kind != "chat":
+        if (source == "openclaw" or profile in OPENCLAW_EXECUTOR_PROFILE_NAMES) and kind != "chat":
             raise ValueError("OpenClaw profile requires source openclaw and kind chat")
-        if source == "openclaw" or profile in OPENCLAW_PROFILE_NAMES:
+        if source == "openclaw" or profile in OPENCLAW_EXECUTOR_PROFILE_NAMES:
             if producer_storage is not None or not isinstance(payload, dict):
                 raise ValueError("OpenClaw requires inline chat payload")
             payload = normalize_openclaw_request({**payload, "model": payload.get("model", PROFILES[profile].model)}, profile_override=self._target_profile(profile, payload))
@@ -2318,7 +2318,7 @@ class Broker:
             after = qwen64_snapshot(self.ollama, effective=True)
             result = dict(result, _broker_execution_evidence=qwen64_evidence(qwen64_before, after, sampled_at=self.clock()))
             self._loaded_models_cache = [after]
-        if row["profile"] in OPENCLAW_PROFILE_NAMES:
+        if row["profile"] in OPENCLAW_EXECUTOR_PROFILE_NAMES:
             validate_openclaw_result(result, profile.model)
         if row["profile"] in EVALUATION_PROFILE_NAMES:
             validate_evaluation_result(result, profile.model)

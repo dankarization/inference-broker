@@ -10,7 +10,8 @@ import uuid
 from pathlib import Path
 
 PROFILES = {'wyoming': 'voice-wyoming-v1', 'gigaam': 'voice-gigaam-v1',
-            'whisper-gpu': 'voice-whisper-gpu-v1'}
+            'whisper-gpu': 'voice-whisper-gpu-v1',
+            'whisper-gpu-large': 'voice-whisper-gpu-large-v3-v1'}
 MAX_AUDIO = 8 * 1024 * 1024
 
 

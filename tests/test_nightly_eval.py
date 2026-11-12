@@ -166,16 +166,29 @@ class NightlyTests(unittest.TestCase):
 
     def test_all_31_preexisting_profiles_are_unchanged(self):
         # Additive daily capacity is not one of the immutable original 31 profiles.
+        # The two OCR lanes added for the current MAIN-PC catalogue are likewise
+        # additive and are excluded here so this stays a freeze on the 31
+        # pre-existing profiles rather than a moving target.
         from broker.syncopia_daily import PROFILE as DAILY_PROFILE
+        from broker.profiles import OPENCLAW_LEGACY_PROFILE_NAMES
         added_fields = {'default_context', 'executor', 'occupancy_class', 'occupancy_cohort',
                         'occupancy_max_jobs', 'occupancy_peak_vram_bytes', 'occupancy_evidence'}
+        added_profiles = {'openclaw-deepseek-ocr', 'openclaw-glm-ocr'}
         old = {k: {field: value for field, value in asdict(v).items() if field not in added_fields}
                for k, v in PROFILES.items()
                if k not in NIGHTLY_PROFILE_NAMES and k != DAILY_PROFILE and k not in VOICE_PROFILE_NAMES
-               and k != "stt-whisper" and not k.startswith("uncensored-eval-")}
+               and k != "stt-whisper" and not k.startswith("uncensored-eval-")
+               and k not in added_profiles}
         self.assertEqual(len(old), 31)
         self.assertEqual(hashlib.sha256(json.dumps(old, sort_keys=True, separators=(',', ':')).encode()).hexdigest(),
                          'ddc9184d744685ed87969710c82a87cb53e7c7889780556b89b5e92824b611e2')
+        # The added OCR lanes and the retained (deleted-artifact) lanes must all
+        # remain distinct, real profiles with the same field shape.
+        for name in sorted(added_profiles | OPENCLAW_LEGACY_PROFILE_NAMES):
+            with self.subTest(profile=name):
+                self.assertIn(name, PROFILES)
+                self.assertTrue(PROFILES[name].model)
+                self.assertIsNone(PROFILES[name].occupancy_cohort)
         self.assertEqual({p.model for k, p in PROFILES.items() if k in NIGHTLY_PROFILE_NAMES}, set(lane.MODEL_DIGESTS))
         for p in (PROFILES[k] for k in NIGHTLY_PROFILE_NAMES):
             self.assertEqual((p.max_context, p.max_output, p.max_images, p.max_schema_bytes, p.request_timeout_seconds),
