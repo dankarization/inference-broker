@@ -72,7 +72,7 @@ def cpu(audio,request_id,timeout):
     with tempfile.TemporaryDirectory(prefix='broker-voice-cpu-') as tmp:
         source=Path(tmp)/'audio.ogg';target=Path(tmp)/'audio.flac';source.write_bytes(audio)
         subprocess.run(['ffmpeg','-nostdin','-v','error','-protocol_whitelist','file','-f','ogg','-i',str(source),
-            '-t','300.1','-fs',str(voice_cpu.MAX_AUDIO+1),'-map','0:a:0','-vn','-map_metadata','-1','-ac','1','-ar','16000','-c:a','flac',str(target)],
+            '-t',str(CPU_MAX_SECONDS+.1),'-fs',str(voice_cpu.MAX_AUDIO+1),'-map','0:a:0','-vn','-map_metadata','-1','-ac','1','-ar','16000','-c:a','flac',str(target)],
             stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,
             check=True,timeout=min(120,timeout))
         if not 0<target.stat().st_size<=voice_cpu.MAX_AUDIO:
@@ -133,7 +133,7 @@ def execute(payload,timeout,windows):
     def finish(result,tier):
         if not isinstance(result,dict) or not isinstance(result.get('text'),str) or not result['text'].strip():
             raise ValueError('backend returned no transcript')
-        if payload['response_format']=='segments-v1':native(result,min(payload['source_duration_seconds'],300))
+        if payload['response_format']=='segments-v1':native(result,payload['source_duration_seconds'])
         result=dict(result,contour={'schema':'voice-contour-v1','tier':tier,'local_only':payload['local_only'],
             'requested_language':payload['language'],'windows_model':payload['windows_model'], 'attempts':trace+[{'tier':tier,'status':'success'}]})
         return result

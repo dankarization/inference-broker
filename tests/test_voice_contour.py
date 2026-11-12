@@ -18,6 +18,52 @@ def result(model='whisper-medium-int8-mainpc-cuda',device='cuda'):
 
 
 class ContourTests(unittest.TestCase):
+    def test_whole_source_native_segments_can_exceed_five_minutes(self):
+        r=result('whisper-large-v3-mainpc-cuda')
+        r['segments']=[{'start':0.,'end':2911.424,'text':'hello'}]
+        with patch.object(c,'cpu') as cpu:
+            out=c.execute(payload(source_duration_seconds=2911.424, windows_model='large',
+                response_format='segments-v1',local_only=True),10,Mock(return_value=r))
+        self.assertEqual(out['segments'][0]['end'],2911.424)
+        cpu.assert_not_called()
+
+    def test_contour_audio_bound_does_not_expand_legacy_voice_admission(self):
+        # Scale bounds down in this unit test; no materialized audio/model/cache.
+        p=payload(audio_base64=base64.b64encode(b'x'*16).decode())
+        with patch.object(voice,'MAX_AUDIO_BYTES',8), patch.object(voice,'MAX_CONTOUR_AUDIO_BYTES',32):
+            self.assertEqual(voice.validate(p,c.PROFILE)['filename'],'audio.ogg')
+            with self.assertRaises(ValueError):
+                voice.validate({'filename':'audio.ogg','audio_base64':p['audio_base64']},
+                    'voice-whisper-gpu-large-v3-v1')
+            with self.assertRaises(ValueError):
+                voice.validate(payload(audio_base64=base64.b64encode(b'x'*33).decode()),c.PROFILE)
+
+    def test_contour_large_transport_retains_same_executor_and_validates_full_response(self):
+        p=payload(audio_base64=base64.b64encode(b'x'*16).decode(),
+            source_duration_seconds=2911.424,windows_model='large',local_only=True)
+        with patch.object(voice,'MAX_AUDIO_BYTES',8),patch.object(voice,'MAX_CONTOUR_AUDIO_BYTES',32), \
+                patch.dict(os.environ,{'BROKER_WHISPER_LARGE_URL':'http://127.0.0.1:18083',
+                    'BROKER_WHISPER_LARGE_TOKEN':'synthetic'},clear=True), \
+                patch('urllib.request.urlopen',return_value=io.BytesIO(json.dumps(result('whisper-large-v3-mainpc-cuda')).encode())) as http:
+            out=voice.execute(c.PROFILE,p,10)
+        self.assertEqual(out['contour']['tier'],'windows')
+        self.assertEqual(http.call_args.args[0].data,b'x'*16)
+
+    def test_cpu_encoding_does_not_truncate_eligible_ten_minute_source(self):
+        import tempfile
+        from pathlib import Path
+        observed=[]
+        def run(command,**kwargs):
+            observed.append(command)
+            Path(command[-1]).write_bytes(b'fLaCaudio')
+        cpu_result={'text':'hello','timing':{'segments':[{'start':599.,'end':600.,'text':'hello'}]},
+            'voice_provenance':{'model':'rhasspy/faster-whisper-medium-int8'}}
+        with patch('broker.voice_cpu.configuration'),patch('broker.voice_cpu.execute',return_value=cpu_result), \
+                patch('subprocess.run',side_effect=run):
+            out=c.cpu(b'audio','id',10)
+        self.assertEqual(observed[0][observed[0].index('-t')+1],'600.1')
+        self.assertEqual(out['segments'][0]['end'],600.)
+
     def test_cpu_first_even_when_large_requested(self):
         windows=Mock();r=result('rhasspy/faster-whisper-medium-int8','cpu')
         with patch.object(c,'cpu',return_value=r) as cpu,patch.object(c,'cloud') as cloud:

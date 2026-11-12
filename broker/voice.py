@@ -12,6 +12,8 @@ import wave
 from . import voice_cpu, voice_contour
 
 MAX_AUDIO_BYTES = 8 * 1024 * 1024
+# Bounded whole-source contour only (2h 24kbit/s Opus < 22 MiB).
+MAX_CONTOUR_AUDIO_BYTES = 32 * 1024 * 1024
 
 # Fixed server-owned lanes: no caller endpoints or sibling fallback.
 # Require reported model identity, not merely a configured port label.
@@ -22,23 +24,24 @@ _HTTP_WORKERS = {
 }
 
 
-def validate(payload, profile):
+def validate(payload, profile, *, _contour_transport=False):
     if profile == voice_contour.PROFILE:
         payload = voice_contour.validate(payload)
-        validate({k:payload[k] for k in ("audio_base64","filename")}, 'voice-gigaam-v1')
+        validate({k:payload[k] for k in ("audio_base64","filename")}, 'voice-gigaam-v1', _contour_transport=True)
         return payload
     allowed = {"audio_base64", "filename", "response_format"} if profile == voice_cpu.PROFILE else {"audio_base64", "filename", "language"}
     if not isinstance(payload, dict) or set(payload) - allowed:
         raise ValueError("voice payload requires only audio_base64 and filename")
     encoded, filename = payload.get("audio_base64"), payload.get("filename")
-    if not isinstance(encoded, str) or len(encoded) > ((MAX_AUDIO_BYTES + 2) // 3) * 4:
+    limit = MAX_CONTOUR_AUDIO_BYTES if _contour_transport else MAX_AUDIO_BYTES
+    if not isinstance(encoded, str) or len(encoded) > ((limit + 2) // 3) * 4:
         raise ValueError("voice audio exceeds limit or is not base64")
     try:
         audio = base64.b64decode(encoded, validate=True)
     except (ValueError, binascii.Error):
         raise ValueError("invalid audio base64") from None
-    if not audio or len(audio) > MAX_AUDIO_BYTES:
-        raise ValueError("voice audio must be nonempty and at most 8 MiB")
+    if not audio or len(audio) > limit:
+        raise ValueError(f"voice audio must be nonempty and at most {limit} bytes")
     if not isinstance(filename, str) or not filename or len(filename) > 128 or any(c not in 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-' for c in filename):
         raise ValueError("invalid filename")
     if profile == voice_cpu.PROFILE:
@@ -63,10 +66,12 @@ def validate(payload, profile):
     return result
 
 
-def execute(profile, payload, timeout):
-    validate(payload, profile)
+def execute(profile, payload, timeout, *, _contour_transport=False):
+    validate(payload, profile, _contour_transport=_contour_transport)
     if profile==voice_contour.PROFILE:
-        return voice_contour.execute(payload,timeout,execute)
+        def windows(model_profile, audio_payload, remaining):
+            return execute(model_profile, audio_payload, remaining, _contour_transport=True)
+        return voice_contour.execute(payload,timeout,windows)
     audio = base64.b64decode(payload['audio_base64'])
     if profile == 'voice-wyoming-v1':
         return _wyoming(audio, timeout)

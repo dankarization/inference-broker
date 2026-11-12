@@ -41,8 +41,8 @@ low-level Windows lanes remain compatible and run under the same queue.
 CPU uses the existing private native-CPU adapter bridge, gated when original
 source duration exceeds600s, FLAC admission is too large, configuration is
 unavailable or its transport cannot honor explicit language. The original
-source duration survives chunking: splitting a48min video does not make it
-eligible for CPU. Known adapter terminal failure can proceed to Windows;
+source duration controls admission: a48min video is never eligible for CPU.
+CPU preparation preserves up to its full600s contract, not just the first300s. Known adapter terminal failure can proceed to Windows;
 ambiguous durable-adapter outcome remains an error requiring reconciliation.
 
 Windows Whisper auto language sends no query; explicit language requires
@@ -70,3 +70,25 @@ reported/detected language are separate facts. All input/result artifacts retain
 the same broker IDs and source policy. Do not change source weights/admission,
 restart unrelated active jobs or replace a live Archivist release to deploy this
 additive profile: use a reviewed delta against the actual live revision.
+
+### Whole-source transport (56378)
+
+The five-minute Media Loader split was not a Whisper limitation and is removed.
+One source (up to7200s) is one deterministic24kbit/s mono Opus upload and one
+queued contour execution. Only `voice-contour-v1` accepts up to32MiB of encoded
+audio after base64 decoding; old direct voice lanes and CPU FLAC retain8MiB.
+This accommodates two hours of24kbit/s Opus with framing (~22MiB) without slicing
+or changing quality. An internal callback retains this contour bound during
+Windows execution; callers cannot enlarge legacy limits via payload fields.
+Segments are validated against full original duration rather than an artificial
+300s cap. Request/result deadlines and response2MiB bounds still fail closed.
+
+Checked Windows worker SOURCE defaults are512MiB HTTP body,7200s decoded audio,
+840s inference timeout; broker contour timeout1800s. Effective production env
+values must be independently verified before rollout, not inferred from defaults.
+No model inference, downloads, controls, task cancellation or live restarts are
+performed by this source correction. Existing five-minute receipts remain owned;
+never overwrite their payloads, silently start a replacement, or discard their
+terminal evidence. A reviewed same-media migration must reconcile each receipt,
+reuse a completed full-source result where possible, and preserve predecessor
+IDs before admitting only the necessary whole-source replacement for failures.
