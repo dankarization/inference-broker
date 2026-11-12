@@ -30,6 +30,17 @@ class VoiceTests(unittest.TestCase):
         self.policy = SourcePolicy(path)
         self.payload = {'filename': 'a.ogg', 'audio_base64': base64.b64encode(b'audio').decode()}
 
+    def test_unsupported_whisper_language_never_admitted_or_claimed(self):
+        for profile in ('voice-whisper-gpu-v1','voice-whisper-gpu-large-v3-v1'):
+            for language in ('zz','eng'):
+                with self.subTest(profile=profile,language=language),patch('broker.voice_gpu.Guard.claim') as claim:
+                    with self.assertRaisesRegex(ValueError,'unsupported Whisper language'):
+                        self.broker.submit(profile,'transcribe',dict(self.payload,language=language),source='local-voice')
+                    claim.assert_not_called()
+                    self.assertIsNone(self.broker.executor_fence())
+        for language in ('en','ru','haw','yue'):
+            self.assertEqual(voice.validate(dict(self.payload,language=language),'voice-whisper-gpu-v1')['language'],language)
+
     def voice(self):
         return self.broker.submit('voice-gigaam-v1', 'transcribe', self.payload, source='local-voice')['id']
 
@@ -212,9 +223,8 @@ class VoiceTests(unittest.TestCase):
 
     def test_whisper_large_v3_uses_its_own_worker_and_no_forced_language(self):
         # The large-v3 lane must call a separately configured base URL/token and
-        # must not force a broker-side language; the worker picks it, matching
-        # the live CPU service. Its result model id is not pinned to the medium
-        # worker's identity.
+        # must not force a broker-side language; the worker picks it.
+        # Its reported identity must be Large, not medium.
         server, received = self._wire_server({'text': 'large', 'model': 'whisper-large-v3-mainpc-cuda'})
         medium_env = {'BROKER_WHISPER_GPU_URL': 'http://127.0.0.1:1',
                       'BROKER_WHISPER_GPU_TOKEN': 'medium-token'}
@@ -224,18 +234,17 @@ class VoiceTests(unittest.TestCase):
             result = voice.execute('voice-whisper-gpu-large-v3-v1', self.payload, 5)
         self.assertEqual(result, {'text': 'large', 'model': 'whisper-large-v3-mainpc-cuda'})
         self.assertEqual(received, {'path': '/v1/transcribe', 'auth': 'Bearer large-token', 'audio': b'audio'})
-        # Even a result that echoes the medium model id is accepted: the
-        # separate URL/token, not the model id, is the identity boundary.
+        # A misconfigured Large port reporting medium must fail closed.
         server2, received2 = self._wire_server({'text': 'large', 'model': 'whisper-medium-int8-mainpc-cuda'})
         with patch.dict(os.environ, {**medium_env,
                                      'BROKER_WHISPER_LARGE_URL': 'http://127.0.0.1:%d' % server2.server_port,
                                      'BROKER_WHISPER_LARGE_TOKEN': 'large-token'}):
-            self.assertEqual(voice.execute('voice-whisper-gpu-large-v3-v1', self.payload, 5)['text'], 'large')
+            with self.assertRaisesRegex(RuntimeError, 'model identity'):
+                voice.execute('voice-whisper-gpu-large-v3-v1', self.payload, 5)
         self.assertEqual(received2['auth'], 'Bearer large-token')
 
-    def test_medium_and_gigaam_contracts_are_unchanged(self):
-        # Regression: the pre-existing lanes keep their exact URLs, tokens and
-        # fixed query strings. Only the large-v3 lane drops the language query.
+    def test_medium_auto_language_and_gigaam_contract(self):
+        # Both Whisper lanes use worker auto-language; GigaAM is unchanged.
         gigaam, gigaam_seen = self._wire_server({'text': 'g', 'model': 'gigaam-v3-e2e-rnnt'})
         medium, medium_seen = self._wire_server({'text': 'm', 'model': 'whisper-medium-int8-mainpc-cuda'})
         with patch.dict(os.environ, {
@@ -248,11 +257,11 @@ class VoiceTests(unittest.TestCase):
             self.assertEqual(voice.execute('voice-whisper-gpu-v1', self.payload, 5)['text'], 'm')
         self.assertEqual(gigaam_seen['path'], '/v1/transcribe')
         self.assertEqual(gigaam_seen['auth'], 'Bearer gigaam-token')
-        self.assertEqual(medium_seen['path'], '/v1/transcribe?profile=background&language=ru')
+        self.assertEqual(medium_seen['path'], '/v1/transcribe')
         self.assertEqual(medium_seen['auth'], 'Bearer medium-token')
         self.assertEqual(voice._HTTP_WORKERS['voice-gigaam-v1'], ('GIGAAM', '', 'gigaam-v3-e2e-rnnt'))
         self.assertEqual(voice._HTTP_WORKERS['voice-whisper-gpu-v1'],
-                         ('WHISPER_GPU', '?profile=background&language=ru', None))
+                         ('WHISPER_GPU', '', 'whisper-medium-int8-mainpc-cuda'))
 
     def test_voice_lanes_fail_closed_without_their_own_credentials(self):
         # A missing credential for one lane must never fall back to a sibling
@@ -280,7 +289,7 @@ class VoiceTests(unittest.TestCase):
     def test_large_v3_profile_is_a_voice_lane_and_survives_dispatch(self):
         self.assertIn('voice-whisper-gpu-large-v3-v1', VOICE_PROFILE_NAMES)
         self.assertEqual(voice._HTTP_WORKERS['voice-whisper-gpu-large-v3-v1'],
-                         ('WHISPER_LARGE', '', None))
+                         ('WHISPER_LARGE', '', 'whisper-large-v3-mainpc-cuda'))
         profile = PROFILES['voice-whisper-gpu-large-v3-v1']
         self.assertEqual((profile.executor, profile.request_timeout_seconds), ('voice', 1800))
         self.assertEqual(profile.model, 'voice-whisper-gpu-large-v3-v1')

@@ -180,6 +180,10 @@ class NightlyTests(unittest.TestCase):
                and k != "stt-whisper" and not k.startswith("uncensored-eval-")
                and k not in added_profiles}
         self.assertEqual(len(old), 31)
+        from tests.profile_catalogue_baseline import original_catalogue
+        # Check every authorized ceiling explicitly, then retain the original
+        # immutable snapshot for all remaining fields; do not bless a new hash.
+        old = original_catalogue(self, old)
         self.assertEqual(hashlib.sha256(json.dumps(old, sort_keys=True, separators=(',', ':')).encode()).hexdigest(),
                          'ddc9184d744685ed87969710c82a87cb53e7c7889780556b89b5e92824b611e2')
         # The added OCR lanes and the retained (deleted-artifact) lanes must all

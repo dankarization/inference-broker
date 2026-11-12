@@ -2044,6 +2044,9 @@ class Broker:
         fence = self.executor_fence()
         if fence is None:
             return True
+        from . import voice_gpu
+        if fence['request_id'].startswith(voice_gpu.PREFIX):
+            return voice_gpu.reconcile(self, fence)
         if self.whisper_executor and self.whisper_executor.can_release(fence["request_id"]):
             self.clear_executor_fence(fence["request_id"])
             return self.executor_fence() is None
@@ -2207,7 +2210,7 @@ class Broker:
             with self.lock, self.db:
                 finished = self.clock()
                 error_summary = ("nightly execution failed; no raw executor detail retained"
-                                 if row["source"] == nightly_eval.SOURCE else "ASR execution failed (" + type(exc).__name__ + ")" if execution_row["kind"] == "transcribe" else bounded_error_summary(exc))
+                                 if row["source"] == nightly_eval.SOURCE else voice.safe_error_summary(exc) if execution_row["kind"] == "transcribe" else bounded_error_summary(exc))
                 self._complete_time_batch(row["id"], finished)
                 self.db.execute("UPDATE jobs SET state='failed',finished=?,lease_until=NULL,error=? WHERE id=?", (finished, error_summary, row["id"]))
                 self.storage.record_terminal_retention(
@@ -2254,7 +2257,9 @@ class Broker:
                 self._finish_execution(row, result, "CPU voice adapter call completed")
                 return
             self.wol.wake()
-            result = voice.execute(row["profile"], json.loads(row["payload"]), profile.request_timeout_seconds)
+            from . import voice_gpu
+            with voice_gpu.queued(self, row):
+                result = voice.execute(row["profile"], json.loads(row["payload"]), profile.request_timeout_seconds)
             self._finish_execution(row, result, "voice executor call completed")
             return
         self.wol.wake()

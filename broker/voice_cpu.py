@@ -22,6 +22,13 @@ MAX_AUDIO = 8 * 1024 * 1024
 MAX_RESPONSE = 2 * 1024 * 1024
 PATH = '/v1/transcription-jobs'
 
+class CPUAdmissionRejected(RuntimeError):
+    """Adapter explicitly rejected admission; no remote inference was accepted."""
+
+class CPUJobFailed(RuntimeError):
+    """Durable adapter reports a known terminal failure, not transport loss."""
+
+
 
 def configuration():
     if os.environ.get('BROKER_CPU_VOICE_ENABLED') != '1':
@@ -130,6 +137,8 @@ def execute(audio, job_id, timeout):
         raise RuntimeError('CPU adapter capability unavailable')
     audio_hash = hashlib.sha256(audio).hexdigest()
     status, ack = request('POST', PATH, audio, 'broker-voice-' + job_id)
+    if status in (400,404,413,429):
+        raise CPUAdmissionRejected('CPU adapter rejected admission')
     adapter_id = ack.get('job_id')
     if status not in (200,202) or ack.get('schema_version') != 1 or not isinstance(adapter_id, str) or not re.fullmatch('[a-f0-9]{32}', adapter_id) or ack.get('status_path') != PATH+'/'+adapter_id or ack.get('media_sha256') != audio_hash or ack.get('routing_policy') != 'local-only-v1' or ack.get('response_format') != 'segments-v1':
         raise RuntimeError('CPU adapter admission unconfirmed; remote outcome unknown')
@@ -142,6 +151,8 @@ def execute(audio, job_id, timeout):
             remaining = deadline - time.monotonic()
             if remaining <= 0: raise RuntimeError('CPU adapter timeout; remote outcome unknown')
             time.sleep(min(1, remaining)); continue
+        if state in ('failed','expired') or (state=='done' and data.get('result_http_status') != 200):
+            raise CPUJobFailed('CPU adapter terminal failure')
         if state != 'done' or data.get('result_http_status') != 200 or not isinstance(data.get('result'), dict):
             raise RuntimeError('CPU adapter did not complete successfully')
         result = data['result']; routing = result.get('routing', {}); attempts = routing.get('attempts')

@@ -5,45 +5,49 @@ import io
 import json
 import os
 import socket
+import re
+import urllib.parse
 import urllib.request
+import urllib.error
 import wave
-from . import voice_cpu
+from contextlib import nullcontext
+from . import voice_gpu
+from . import voice_cpu, voice_contour
 
 MAX_AUDIO_BYTES = 8 * 1024 * 1024
+# Bounded whole-source contour only (2h 24kbit/s Opus < 22 MiB).
+MAX_CONTOUR_AUDIO_BYTES = 32 * 1024 * 1024
+# Supported faster-whisper tokenizer codes (not a claim of per-model capability).
+# Reject invalid codes before GPU custody/upload; Windows also validates them.
+WHISPER_LANGUAGES = frozenset('af am ar as az ba be bg bn bo br bs ca cs cy da de el en es et eu fa fi fo fr gl gu ha haw he hi hr ht hu hy id is it ja jw ka kk km kn ko la lb ln lo lt lv mg mi mk ml mn mr ms mt my ne nl nn no oc pa pl ps pt ro ru sa sd si sk sl sn so sq sr su sv sw ta te tg th tk tl tr tt uk ur uz vi yi yo zh yue'.split())
 
-# Server-owned worker routing for the HTTP voice lanes. Every lane keeps its own
-# base URL and token: no profile may borrow another worker's credentials, and a
-# missing configuration fails closed instead of falling back to a sibling
-# worker. `query` is the fixed worker-side request contract for that lane;
-# `required_model` is the only result identity the broker requires (GigaAM).
+# Fixed server-owned lanes: no caller endpoints or sibling fallback.
+# Require reported model identity, not merely a configured port label.
 _HTTP_WORKERS = {
-    # Live GigaAM service; result identity is verified by model id.
     'voice-gigaam-v1': ('GIGAAM', '', 'gigaam-v3-e2e-rnnt'),
-    # Existing MAIN-PC Whisper medium lane; its fixed worker contract still
-    # requests background processing in Russian. Result model id is not pinned.
-    'voice-whisper-gpu-v1': ('WHISPER_GPU', '?profile=background&language=ru', None),
-    # Distinct large-v3 worker, configured separately from the medium worker.
-    # No language/profile query: the worker chooses the decoding language itself
-    # so its behaviour matches the live CPU service. Its result model id is not
-    # required to be (and is not required to differ from) the medium model id;
-    # the separate URL/token is the identity boundary.
-    'voice-whisper-gpu-large-v3-v1': ('WHISPER_LARGE', '', None),
+    'voice-whisper-gpu-v1': ('WHISPER_GPU', '', 'whisper-medium-int8-mainpc-cuda'),
+    'voice-whisper-gpu-large-v3-v1': ('WHISPER_LARGE', '', 'whisper-large-v3-mainpc-cuda'),
 }
 
 
-def validate(payload, profile):
-    allowed = {"audio_base64", "filename", "response_format"} if profile == voice_cpu.PROFILE else {"audio_base64", "filename"}
+def validate(payload, profile, *, _contour_transport=False):
+    if profile == voice_contour.PROFILE:
+        payload = voice_contour.validate(payload)
+        validate({k:payload[k] for k in ("audio_base64","filename")}, 'voice-gigaam-v1', _contour_transport=True)
+        return payload
+    allowed = {"audio_base64", "filename", "response_format"} if profile == voice_cpu.PROFILE else {"audio_base64", "filename", "language"}
     if not isinstance(payload, dict) or set(payload) - allowed:
         raise ValueError("voice payload requires only audio_base64 and filename")
     encoded, filename = payload.get("audio_base64"), payload.get("filename")
-    if not isinstance(encoded, str) or len(encoded) > ((MAX_AUDIO_BYTES + 2) // 3) * 4:
+    limit = MAX_CONTOUR_AUDIO_BYTES if _contour_transport else MAX_AUDIO_BYTES
+    if not isinstance(encoded, str) or len(encoded) > ((limit + 2) // 3) * 4:
         raise ValueError("voice audio exceeds limit or is not base64")
     try:
         audio = base64.b64decode(encoded, validate=True)
     except (ValueError, binascii.Error):
         raise ValueError("invalid audio base64") from None
-    if not audio or len(audio) > MAX_AUDIO_BYTES:
-        raise ValueError("voice audio must be nonempty and at most 8 MiB")
+    if not audio or len(audio) > limit:
+        raise ValueError(f"voice audio must be nonempty and at most {limit} bytes")
     if not isinstance(filename, str) or not filename or len(filename) > 128 or any(c not in 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-' for c in filename):
         raise ValueError("invalid filename")
     if profile == voice_cpu.PROFILE:
@@ -58,11 +62,31 @@ def validate(payload, profile):
                     raise ValueError("Wyoming requires 16 kHz mono PCM16 WAV")
         except (wave.Error, EOFError):
             raise ValueError("Wyoming requires 16 kHz mono PCM16 WAV") from None
-    return {"audio_base64": encoded, "filename": filename}
+    result = {"audio_base64": encoded, "filename": filename}
+    if "language" in payload:
+        language=payload["language"]
+        if not isinstance(language,str) or not re.fullmatch(r'[a-z]{2,3}',language):
+            raise ValueError('invalid explicit language')
+        if profile=='voice-gigaam-v1' and language!='ru':raise ValueError('GigaAM language unsupported')
+        if profile in ('voice-whisper-gpu-v1','voice-whisper-gpu-large-v3-v1') and language not in WHISPER_LANGUAGES:
+            raise ValueError('unsupported Whisper language')
+        result['language']=language
+    return result
 
 
-def execute(profile, payload, timeout):
-    validate(payload, profile)
+def safe_error_summary(error):
+    # Never store raw backend response/exception text in a transcript receipt.
+    if isinstance(error, (voice_contour.BackendRejected, voice_contour.LocalContourExhausted)):
+        return 'ASR execution failed (' + type(error).__name__ + ': ' + error.safe_code + ')'
+    return 'ASR execution failed (' + type(error).__name__ + ')'
+
+
+def execute(profile, payload, timeout, *, _contour_transport=False):
+    validate(payload, profile, _contour_transport=_contour_transport)
+    if profile==voice_contour.PROFILE:
+        def windows(model_profile, audio_payload, remaining):
+            return execute(model_profile, audio_payload, remaining, _contour_transport=True)
+        return voice_contour.execute(payload,timeout,windows)
     audio = base64.b64decode(payload['audio_base64'])
     if profile == 'voice-wyoming-v1':
         return _wyoming(audio, timeout)
@@ -72,17 +96,53 @@ def execute(profile, payload, timeout):
     url = os.environ.get('BROKER_' + prefix + '_URL', '').rstrip('/')
     token = os.environ.get('BROKER_' + prefix + '_TOKEN', '')
     if not url or not token:
-        raise RuntimeError(prefix + ' worker URL/token not configured')
-    request = urllib.request.Request(url + '/v1/transcribe' + query, data=audio, method='POST', headers={
-        'Authorization': 'Bearer ' + token, 'Content-Type': 'application/octet-stream',
-        'Accept': 'application/json', 'X-Filename': payload['filename'],
-    })
-    with urllib.request.urlopen(request, timeout=timeout) as response:
-        result = json.loads(response.read(1024 * 1024 + 1))
+        raise voice_contour.BackendUnconfigured(prefix + ' worker URL/token not configured')
+    if payload.get('language') and prefix!='GIGAAM':
+        status_request=urllib.request.Request(url+'/v1/status',headers={'Authorization':'Bearer '+token})
+        with urllib.request.urlopen(status_request,timeout=min(5,timeout)) as response:
+            status_raw=response.read(65537)
+            if len(status_raw)>65536:raise voice_contour.BackendRejected('worker status too large')
+            status=json.loads(status_raw)
+        if not isinstance(status,dict) or status.get('language_override') is not True:
+            raise voice_contour.BackendRejected('worker does not support explicit language')
+        query='?'+urllib.parse.urlencode({'language':payload['language']})
+    guard = voice_gpu.CURRENT.get()
+    with guard.claim(profile,timeout) if guard else nullcontext(None) as claim:
+        request = urllib.request.Request(url + '/v1/transcribe' + query, data=audio, method='POST', headers={
+            'Authorization': 'Bearer ' + token, 'Content-Type': 'application/octet-stream',
+            'Accept': 'application/json', 'X-Filename': payload['filename'],
+            **({'X-Request-Id':claim.request_id} if claim else {}),
+        })
+        try:
+            transport_timeout=claim.remaining() if claim else timeout
+            if claim:claim.upload_started=True
+            with urllib.request.urlopen(request, timeout=transport_timeout) as response:
+                raw = response.read(2 * 1024 * 1024 + 1)
+                if len(raw) > 2 * 1024 * 1024:
+                    raise voice_contour.BackendRejected('voice worker response exceeds bound')
+                result = json.loads(raw)
+        except urllib.error.HTTPError as exc:
+            # Preserve only worker-owned enumerated diagnostics, not raw response
+            # text, credentials, transcript content or arbitrary exception details.
+            code = 'backend_rejected'
+            try:
+                raw = exc.read(4097)
+                data = json.loads(raw) if len(raw) <= 4096 else None
+                if isinstance(data,dict):
+                    for field in ('detail','error'):
+                        candidate = data.get(field)
+                        if isinstance(candidate,str) and candidate in voice_contour.SAFE_WORKER_CODES:
+                            code = candidate
+                            break
+            except (OSError,ValueError):
+                pass
+            finally:
+                exc.close()
+            raise voice_contour.BackendRejected(code) from None
     if not isinstance(result, dict) or not isinstance(result.get('text'), str):
-        raise RuntimeError('voice worker returned invalid result')
+        raise voice_contour.BackendRejected('voice worker returned invalid result')
     if required_model is not None and result.get('model') != required_model:
-        raise RuntimeError('GigaAM worker identity is invalid')
+        raise voice_contour.BackendRejected('voice worker model identity is invalid')
     return result
 
 
