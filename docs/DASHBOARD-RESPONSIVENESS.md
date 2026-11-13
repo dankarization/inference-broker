@@ -1,5 +1,9 @@
 # Dashboard observer candidate (2026-11-13)
 
+Subsequent explicitly authorized production rehearsal/rollout is recorded in
+[DASHBOARD-PRODUCTION-ROLLOUT.md](DASHBOARD-PRODUCTION-ROLLOUT.md).
+The no-production-change statements below describe the original candidate phase.
+
 ## Source identity / scope
 
 Branch: `fix/dashboard-responsive-20261113`. Base `origin/main` 368b2d4;
@@ -109,7 +113,7 @@ on the production baseline; the two additional tests cover WAL consistency and
 nonblocking validator behavior. Task-owned residual RAM test files were removed.
 An earlier disk-temp run timed out after 300s; not counted as successful.
 
-## Migration footprint and rollout (NOT executed; separate approval required)
+## Migration footprint and original rollout plan (subsequently executed with approval)
 
 Seven additive indexes, no columns/rows/triggers changed by this patch:
 `dashboard-proofs/indexes.sql` contains exact, idempotent, transactional DDL.

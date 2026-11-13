@@ -1,0 +1,182 @@
+{
+  "checked_at": 1794576839.4348803,
+  "source_matches_candidate": true,
+  "only_unit_cwd_changed": true,
+  "service": [
+    "MainPID=1564325",
+    "WorkingDirectory=/home/dankar/.local/state/ollama-inference-broker/dashboard-20261113-7e893d9/release",
+    "ActiveState=active"
+  ],
+  "events": {
+    "wal.checkpoint": 2,
+    "observer.dashboard_timing": 8,
+    "scheduler.selected": 2,
+    "job.running": 2,
+    "job.completed": 1
+  },
+  "observer_errors": {},
+  "dashboard_stage_timings_ms": [
+    {
+      "forecast": 3.345,
+      "history": 0.193,
+      "snapshot": 7.621
+    },
+    {
+      "forecast": 3.198,
+      "history": 0.179,
+      "snapshot": 7.342
+    },
+    {
+      "forecast": 3.132,
+      "history": 0.186,
+      "snapshot": 16.774
+    },
+    {
+      "forecast": 3.145,
+      "history": 0.184,
+      "snapshot": 7.353
+    },
+    {
+      "forecast": 8.304,
+      "history": 0.442,
+      "snapshot": 20.065
+    },
+    {
+      "forecast": 3.165,
+      "history": 0.184,
+      "snapshot": 19.738
+    },
+    {
+      "forecast": 4.181,
+      "history": 2.342,
+      "snapshot": 25.36
+    },
+    {
+      "forecast": 3.146,
+      "history": 0.195,
+      "snapshot": 17.473
+    }
+  ],
+  "snapshot_age_seconds": 0.012,
+  "counts": {
+    "cancelled": 289,
+    "completed": 22771,
+    "failed": 1066,
+    "queued": 795,
+    "running": 1
+  },
+  "paused": false,
+  "maintenance": false,
+  "free_bytes": 7846440960,
+  "physical_artifact_bytes": 5468712960,
+  "files": {
+    "new-release-override.conf": {
+      "bytes": 211,
+      "physical_bytes": 4096,
+      "mode": "0o600",
+      "nlink": 1
+    },
+    "drained-backup.sqlite3": {
+      "bytes": 1822621696,
+      "physical_bytes": 1822621696,
+      "mode": "0o400",
+      "nlink": 1
+    },
+    "summarize_production.py": {
+      "bytes": 2904,
+      "physical_bytes": 4096,
+      "mode": "0o664",
+      "nlink": 1
+    },
+    "rehearsal.json": {
+      "bytes": 1928,
+      "physical_bytes": 4096,
+      "mode": "0o600",
+      "nlink": 1
+    },
+    "drained-backup.sqlite3-shm": {
+      "bytes": 32768,
+      "physical_bytes": 32768,
+      "mode": "0o400",
+      "nlink": 1
+    },
+    "drained-backup.sqlite3-wal": {
+      "bytes": 0,
+      "physical_bytes": 0,
+      "mode": "0o400",
+      "nlink": 1
+    },
+    "original-release-override.conf": {
+      "bytes": 198,
+      "physical_bytes": 4096,
+      "mode": "0o600",
+      "nlink": 1
+    },
+    "candidate-sha256.json": {
+      "bytes": 4028,
+      "physical_bytes": 4096,
+      "mode": "0o664",
+      "nlink": 1
+    },
+    "deploy_cutover.py": {
+      "bytes": 12554,
+      "physical_bytes": 16384,
+      "mode": "0o664",
+      "nlink": 1
+    },
+    "rollout.json": {
+      "bytes": 4639,
+      "physical_bytes": 8192,
+      "mode": "0o600",
+      "nlink": 1
+    },
+    "deploy_rehearse.py": {
+      "bytes": 4418,
+      "physical_bytes": 8192,
+      "mode": "0o664",
+      "nlink": 1
+    },
+    "production-baseline-sha256.json": {
+      "bytes": 4028,
+      "physical_bytes": 4096,
+      "mode": "0o664",
+      "nlink": 1
+    },
+    "online-backup.sqlite3": {
+      "bytes": 1822621696,
+      "physical_bytes": 1822621696,
+      "mode": "0o400",
+      "nlink": 1
+    },
+    "indexes.sql": {
+      "bytes": 1326,
+      "physical_bytes": 4096,
+      "mode": "0o664",
+      "nlink": 1
+    },
+    "rehearsal.sqlite3": {
+      "bytes": 1822621696,
+      "physical_bytes": 1822625792,
+      "mode": "0o600",
+      "nlink": 1
+    },
+    "original-sources.json": {
+      "bytes": 1196,
+      "physical_bytes": 4096,
+      "mode": "0o600",
+      "nlink": 1
+    },
+    "post-rollout-check.json": {
+      "bytes": 992,
+      "physical_bytes": 4096,
+      "mode": "0o664",
+      "nlink": 1
+    },
+    "normal-execution-proof.json": {
+      "bytes": 350,
+      "physical_bytes": 4096,
+      "mode": "0o600",
+      "nlink": 1
+    }
+  }
+}

@@ -1,0 +1,12 @@
+{
+  "browser": "Chromium",
+  "url": "http://192.168.2.19:8088/dashboard",
+  "initial_rows": 10,
+  "paged_rows": 40,
+  "retained_rows": 40,
+  "native_tab_visibility": true,
+  "hidden_interval_seconds": 31,
+  "hidden_reads": 0,
+  "resume_dashboard_reads": 1,
+  "overlap_reads": 1
+}

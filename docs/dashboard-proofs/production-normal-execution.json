@@ -1,0 +1,19 @@
+{
+  "states": [
+    {
+      "state": "running",
+      "elapsed_seconds": 0.001,
+      "attempt_count": 1,
+      "retry_count": 0
+    },
+    {
+      "state": "completed",
+      "elapsed_seconds": 6.005,
+      "attempt_count": 1,
+      "retry_count": 0
+    }
+  ],
+  "observed_seconds": 6.005,
+  "terminal_observed": true,
+  "no_jobs_submitted": true
+}

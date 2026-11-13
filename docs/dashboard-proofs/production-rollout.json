@@ -1,0 +1,203 @@
+{
+  "candidate": "7e893d938ccaccbc48bf79535b83f4a75cca1d15",
+  "phase": "complete",
+  "events": [
+    {
+      "event": "preflight_passed",
+      "at": 1794576314.6955307,
+      "initial_counts": {
+        "completed": 22769,
+        "queued": 797,
+        "cancelled": 289,
+        "failed": 1066,
+        "running": 1
+      }
+    },
+    {
+      "event": "draining_without_cancellation",
+      "at": 1794576314.7299137
+    },
+    {
+      "event": "waiting_for_existing_execution",
+      "at": 1794576314.731154,
+      "elapsed_seconds": 0,
+      "active": 1,
+      "fences": 0
+    },
+    {
+      "event": "waiting_for_existing_execution",
+      "at": 1794576374.8192186,
+      "elapsed_seconds": 60,
+      "active": 1,
+      "fences": 0
+    },
+    {
+      "event": "waiting_for_existing_execution",
+      "at": 1794576434.9157393,
+      "elapsed_seconds": 120,
+      "active": 1,
+      "fences": 0
+    },
+    {
+      "event": "admission_fenced",
+      "at": 1794576444.0251143,
+      "active": 0,
+      "fences": 0,
+      "paused": true
+    },
+    {
+      "event": "drained_backup_ready",
+      "at": 1794576485.5085132,
+      "seconds": 41.47,
+      "bytes": 1822621696
+    },
+    {
+      "event": "stopping_idle_broker",
+      "at": 1794576485.7200515
+    },
+    {
+      "event": "smoke_passed",
+      "at": 1794576488.162218,
+      "downtime_seconds": 2.225,
+      "dashboard": [
+        {
+          "ms": 13.064,
+          "state": "live"
+        },
+        {
+          "ms": 12.767,
+          "state": "live"
+        },
+        {
+          "ms": 22.631,
+          "state": "live"
+        }
+      ]
+    },
+    {
+      "event": "original_controls_restored",
+      "at": 1794576488.190443
+    },
+    {
+      "event": "complete",
+      "at": 1794576668.923866,
+      "normal_job_completed": false,
+      "final_counts": {
+        "completed": 22770,
+        "queued": 796,
+        "cancelled": 289,
+        "failed": 1066,
+        "running": 1
+      }
+    }
+  ],
+  "window_plan": "online drained backup before stop; migration + quick_check + startup only inside stop window",
+  "original_paused": false,
+  "initial": {
+    "digest": "5d4981d0a87a672b898435d561dc8a770939ee58db9174cc8dc9179c8d9df4e1",
+    "counts": {
+      "completed": 22769,
+      "queued": 797,
+      "cancelled": 289,
+      "failed": 1066,
+      "running": 1
+    }
+  },
+  "drain_seconds": 129.193,
+  "final_backup_seconds": 41.47,
+  "final_backup_quick_check_seconds": 0.304,
+  "pre_stop": {
+    "digest": "5cb09bc7748f1e2ea76d996cda13042e6a2ae8132d17cd849b0917e497f13943",
+    "counts": {
+      "completed": 22770,
+      "queued": 797,
+      "cancelled": 289,
+      "failed": 1066
+    }
+  },
+  "stop_at": 1794576485.7122018,
+  "stopped": {
+    "digest": "5cb09bc7748f1e2ea76d996cda13042e6a2ae8132d17cd849b0917e497f13943",
+    "counts": {
+      "completed": 22770,
+      "queued": 797,
+      "cancelled": 289,
+      "failed": 1066
+    }
+  },
+  "production_migration_seconds": 0.647,
+  "indexes": {
+    "audit_observer_windows": 4988928,
+    "jobs_observer_all": 802816,
+    "jobs_observer_fifo": 57344,
+    "jobs_observer_heads": 57344,
+    "jobs_observer_public": 720896,
+    "jobs_observer_public_fifo": 57344,
+    "jobs_observer_public_heads": 57344
+  },
+  "production_quick_check_seconds": 0.3,
+  "checkpoint": [
+    [
+      0,
+      0,
+      0
+    ]
+  ],
+  "migrated": {
+    "digest": "5cb09bc7748f1e2ea76d996cda13042e6a2ae8132d17cd849b0917e497f13943",
+    "counts": {
+      "completed": 22770,
+      "queued": 797,
+      "cancelled": 289,
+      "failed": 1066
+    }
+  },
+  "downtime_seconds": 2.225,
+  "http_dashboard": [
+    {
+      "ms": 13.064,
+      "state": "live"
+    },
+    {
+      "ms": 12.767,
+      "state": "live"
+    },
+    {
+      "ms": 22.631,
+      "state": "live"
+    }
+  ],
+  "history_unique_rows": 60,
+  "post_start_paused": {
+    "digest": "5cb09bc7748f1e2ea76d996cda13042e6a2ae8132d17cd849b0917e497f13943",
+    "counts": {
+      "completed": 22770,
+      "queued": 797,
+      "cancelled": 289,
+      "failed": 1066
+    }
+  },
+  "resumed_at": 1794576488.1904387,
+  "normal_job_observed_running": true,
+  "normal_job_completed": false,
+  "final": {
+    "digest": "e83ea574bc33ae6a2c193d624d3870416e84d478c612d6e0357e845973f84679",
+    "counts": {
+      "completed": 22770,
+      "queued": 796,
+      "cancelled": 289,
+      "failed": 1066,
+      "running": 1
+    }
+  },
+  "final_health": {
+    "status": "busy",
+    "resource": "mainpc-gpu",
+    "queue_depth": 796,
+    "timestamp": 1794576490.3342762,
+    "active_job_present": true,
+    "blocked_job_present": false
+  },
+  "final_free_bytes": 7847608320,
+  "physical_artifact_bytes": 5468700672
+}

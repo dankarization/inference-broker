@@ -1,0 +1,80 @@
+{
+  "storage_budget_bytes": 6442450944,
+  "reserve_bytes": 4294967296,
+  "free_before_bytes": 13485649920,
+  "online_backup_seconds": 105.829,
+  "copy_seconds": 36.601,
+  "integrity_before": "ok",
+  "integrity_before_seconds": 19.175,
+  "before": {
+    "identity_state_attempt_digest": "74b78db181abf864079ad98578031252e9e62100d55a0d6981ac572e3a9d4b5f",
+    "counts": {
+      "completed": 22768,
+      "queued": 798,
+      "cancelled": 289,
+      "failed": 1066,
+      "running": 1
+    }
+  },
+  "db_before_bytes": 1822621696,
+  "indexes_ms": {
+    "audit_observer_windows": 128.87,
+    "jobs_observer_all": 51.462,
+    "jobs_observer_fifo": 34.306,
+    "jobs_observer_heads": 33.181,
+    "jobs_observer_public": 76.214,
+    "jobs_observer_public_fifo": 34.612,
+    "jobs_observer_public_heads": 34.251
+  },
+  "migration_seconds": 0.587,
+  "wal_after_commit_bytes": 6884552,
+  "index_bytes": {
+    "audit_observer_windows": 4988928,
+    "jobs_observer_all": 802816,
+    "jobs_observer_fifo": 57344,
+    "jobs_observer_heads": 57344,
+    "jobs_observer_public": 720896,
+    "jobs_observer_public_fifo": 57344,
+    "jobs_observer_public_heads": 57344
+  },
+  "after": {
+    "identity_state_attempt_digest": "74b78db181abf864079ad98578031252e9e62100d55a0d6981ac572e3a9d4b5f",
+    "counts": {
+      "completed": 22768,
+      "queued": 798,
+      "cancelled": 289,
+      "failed": 1066,
+      "running": 1
+    }
+  },
+  "checkpoint": [
+    [
+      0,
+      0,
+      0
+    ]
+  ],
+  "checkpoint_seconds": 0.001,
+  "integrity_after": "ok",
+  "db_after_bytes": 1822621696,
+  "public_dashboard": [
+    {
+      "ms": 27.987,
+      "state": "live",
+      "history_rows": 10
+    },
+    {
+      "ms": 27.236,
+      "state": "live",
+      "history_rows": 10
+    },
+    {
+      "ms": 27.115,
+      "state": "live",
+      "history_rows": 10
+    }
+  ],
+  "free_after_bytes": 10077650944,
+  "physical_bytes": 3645997056,
+  "short_stop_gate": false
+}
