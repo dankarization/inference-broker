@@ -29,7 +29,7 @@ from .compat import (CompatibilityError, UNCENSORED_EVAL_PROFILES, NEXTCLOUD_PRO
                      validate_shutterstock_video_payload,
                      validate_syncopia_memory_payload, validate_uncensored_eval_payload)
 from .profiles import EVALUATION_PROFILE_NAMES, OPENCLAW_EXECUTOR_PROFILE_NAMES, PROFILES
-from . import nightly_eval, syncopia_daily
+from . import nightly_eval, syncopia_daily, syncopia_summary
 from .profiles import NIGHTLY_PROFILE_NAMES, VOICE_PROFILE_NAMES
 from . import voice
 from .evaluation import normalize_request as normalize_evaluation_request
@@ -284,7 +284,7 @@ class SourcePolicy:
 
 
 class Broker:
-    """One-resource scheduler with FIFO source heads and time-weighted batches."""
+    """One-resource scheduler with source-local heads and time-weighted batches."""
     def __init__(self, database: str | Path, ollama, wol, clock=time.time,
                  lease_seconds=60, *,
                  wal_autocheckpoint_pages=DEFAULT_WAL_AUTOCHECKPOINT_PAGES,
@@ -293,7 +293,10 @@ class Broker:
                  checkpoint_interval_seconds=DEFAULT_CHECKPOINT_INTERVAL_SECONDS,
                  min_free_space_bytes=DEFAULT_MIN_FREE_SPACE_BYTES,
                  source_policy: SourcePolicy | None = None, whisper_executor=None,
-                 asr_release_on_llm_demand=False):
+                 asr_release_on_llm_demand=False, nextcloud_priority=None):
+        if nextcloud_priority is not None and source_policy is None:
+            raise ValueError('Nextcloud priority requires existing source policy')
+        self.nextcloud_priority = nextcloud_priority
         self.ollama, self.wol, self.clock, self.lease_seconds = ollama, wol, clock, lease_seconds
         self.whisper_executor = whisper_executor
         self._asr_ready_after = 0.0
@@ -439,6 +442,13 @@ class Broker:
             )
             self.db.execute("UPDATE jobs SET queued_at=created WHERE queued_at IS NULL")
             self._retire_priority_column()
+            # Source-local metadata, unrelated to retired global priority.
+            # Existing rows remain historical; identities and queue ages survive.
+            if "nextcloud_priority" not in columns:
+                self.db.execute(
+                    "ALTER TABLE jobs ADD COLUMN nextcloud_priority "
+                    "TEXT NOT NULL DEFAULT 'historical'"
+                )
             migrate_storage_schema(
                 self.db,
                 wal_autocheckpoint_pages=self.wal_autocheckpoint_pages,
@@ -684,7 +694,8 @@ class Broker:
                source_item_id: str | None = None,
                external_id: str | None = None,
                producer_storage: dict[str, Any] | None = None,
-               model: str | None = None, options: dict | None = None, weight=None) -> dict:
+               model: str | None = None, options: dict | None = None, weight=None,
+               nextcloud_priority: str | None = None) -> dict:
         if profile not in PROFILES:
             raise ValueError("unknown profile")
         if kind not in {"chat", "generate", "transcribe"}:
@@ -696,12 +707,16 @@ class Broker:
                 raise ValueError("ASR requires configured executor, dedicated profile and idempotency key")
             payload = validate_asr_payload(payload)
         source = source or profile
+        nextcloud_priority = self._nextcloud_priority(source, nextcloud_priority)
         if kind == "transcribe" and (model is not None or options is not None):
             raise ValueError("transcription uses its dedicated executor contract")
         if not isinstance(payload, dict):
             raise ValueError("payload must be an object")
         payload = deepcopy(payload)
         legacy_payload = deepcopy(payload)
+        if profile in syncopia_summary.MODELS:
+            # Fail closed on model/mode/budget before generic metadata fallback.
+            syncopia_summary.normalize_request(legacy_payload, profile, model, options)
         requested_model = model if model is not None else payload.get("model")
         if model is not None:
             payload["model"] = model
@@ -795,6 +810,10 @@ class Broker:
                 })
             except CompatibilityError as exc:
                 raise ValueError(str(exc)) from exc
+        if profile in syncopia_summary.MODELS:
+            payload = syncopia_summary.prepare(
+                profile, source, kind, legacy_payload, model, options,
+                external_id, source_item_id, producer_storage)
         if profile == "syncopia-memory-qwen38":
             if source != "syncopia-telegram-memory":
                 raise ValueError("Syncopia memory profile must use its dedicated source")
@@ -862,6 +881,14 @@ class Broker:
                             "job retention expired; recover the durable producer artifact"
                         )
                 if existing is not None:
+                    # Native summaries share the memory source, not its legacy
+                    # permissive correlation semantics. Protect both directions
+                    # of a collision with an old/default-model job.
+                    if profile in syncopia_summary.MODELS or existing["profile"] in syncopia_summary.MODELS:
+                        if (existing["profile"] != profile or existing["kind"] != kind
+                                or existing["source_item_id"] != source_item_id
+                                or content_evidence(payload) != (existing["input_hash"], existing["input_bytes"])):
+                            raise ValueError("summary v1 idempotency identity conflict")
                     existing_has_producer_storage = (
                         existing["producer_attempt_id"] is not None
                         or existing["input_storage_mode"] != "broker_temporary"
@@ -902,7 +929,13 @@ class Broker:
                             raise ValueError("idempotency key was used for another request")
                         if source in {"nextcloud", "pilot-mainpc", "local-voice", nightly_eval.SOURCE} and existing["source_item_id"] != source_item_id:
                             raise ValueError("source correlation item conflict")
+                        if source == "nextcloud":
+                            self._promote_nextcloud_locked(existing, nextcloud_priority)
                         return self.status(existing["id"])
+            if profile in syncopia_summary.MODELS:
+                # Existing exact receipts returned above. Only new admissions
+                # depend on live metadata; dispatch still revalidates it too.
+                syncopia_summary.persisted_contract(self.ollama, profile, payload)
             if source == nightly_eval.SOURCE:
                 entry = (self.source_policy.snapshot()["sources"].get(source)
                          if self.source_policy is not None else None)
@@ -948,14 +981,15 @@ class Broker:
                 "INSERT INTO jobs(id,profile,kind,source,payload,state,created,"
                 "queued_at,source_item_id,external_id,input_storage_mode,input_ref,input_hash,"
                 "input_bytes,result_storage_mode,artifact_schema_version,producer_attempt_id,"
-                "ack_required,legacy_result_fallback) "
-                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                "ack_required,legacy_result_fallback,nextcloud_priority) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (job_id, profile, kind, source, json.dumps(payload), "queued", now,
                  now, source_item_id, external_id, storage_fields["input_storage_mode"],
                  storage_fields["input_ref"], storage_fields["input_hash"],
                  storage_fields["input_bytes"], storage_fields["result_storage_mode"],
                  storage_fields["artifact_schema_version"], storage_fields["producer_attempt_id"],
-                 storage_fields["ack_required"], storage_fields["legacy_result_fallback"]),
+                 storage_fields["ack_required"], storage_fields["legacy_result_fallback"],
+                 nextcloud_priority),
             )
             self.storage.record_admission(job_id, source, storage_fields, now)
             self._audit(
@@ -972,6 +1006,60 @@ class Broker:
             )
             self._refresh_health_cache_locked()
         return self.status(job_id)
+
+    @staticmethod
+    def _nextcloud_priority(source: str, value: str | None) -> str:
+        if value is None:
+            return "historical"
+        if source != "nextcloud" or not isinstance(value, str) or value not in {"historical", "new_upload"}:
+            raise ValueError("nextcloud_priority requires source nextcloud and historical or new_upload")
+        return value
+
+    @staticmethod
+    def nextcloud_capabilities() -> dict:
+        return {
+            "contract": "nextcloud-new-upload-v1", "source": "nextcloud",
+            "submit_field": "nextcloud_priority", "values": ["historical", "new_upload"],
+            "default": "historical", "scope": "within_source_weighted_turn",
+            "requires_source_policy_for_priority": True,
+            "non_preemptive": True, "queued_promotion_only": True,
+            "promotion_endpoint": "/v1/jobs/{id}/nextcloud-priority",
+            "idempotent_promotion": True, "replay_never_demotes": True,
+            "correlation_fields": ["source", "external_id", "source_item_id"],
+        }
+
+    def _promote_nextcloud_locked(self, row, requested: str) -> None:
+        # Caller holds the broker lock and transaction after identity checks.
+        # Repeat/lost-ACK requests cannot create work or reset queue age.
+        if (row["source"] == "nextcloud" and row["state"] == "queued"
+                and requested == "new_upload" and row["nextcloud_priority"] != "new_upload"):
+            self.db.execute(
+                "UPDATE jobs SET nextcloud_priority='new_upload' WHERE id=? AND state='queued'",
+                (row["id"],),
+            )
+            self._audit(
+                "nextcloud.priority_promoted", job_id=row["id"], source="nextcloud",
+                from_state="queued", to_state="queued", occurred=self.clock(),
+                reason="confirmed new upload; source-local queued promotion",
+            )
+
+    def promote_nextcloud(self, job_id: str, body: dict) -> dict | None:
+        """Monotonic queued-only metadata update with exact correlation guards."""
+        if (not isinstance(body, dict) or set(body) != {
+                "source", "external_id", "source_item_id", "nextcloud_priority"}
+                or body["source"] != "nextcloud" or body["nextcloud_priority"] != "new_upload"):
+            raise ValueError("promotion requires exact Nextcloud correlation and new_upload priority")
+        for name in ("external_id", "source_item_id"):
+            if self._correlation_value(name, body[name]) is None:
+                raise ValueError("promotion requires both correlation IDs")
+        with self.lock, self.db:
+            row = self.db.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
+            if row is None:
+                return None
+            if any(row[name] != body[name] for name in ("source", "external_id", "source_item_id")):
+                raise ValueError("Nextcloud promotion correlation conflict")
+            self._promote_nextcloud_locked(row, "new_upload")
+            return self.status(job_id)
 
     @staticmethod
     def _bulk_source(source: str) -> str:
@@ -1101,6 +1189,7 @@ class Broker:
         result = {name: job.get(name) for name in (
             "id", "source", "profile", "kind", "external_id", "source_item_id", "state",
             "created", "queued_at", "started", "finished", "input_hash", "input_bytes",
+            "nextcloud_priority",
         )}
         result["projection"] = "nextcloud-final-v1"
         if job.get("profile") == "nextcloud-eval-qwen":
@@ -1175,10 +1264,15 @@ class Broker:
     def _job(self, row):
         data = dict(row)
         data.pop("priority", None)  # inert historic column is never public
+        if data["source"] != "nextcloud":
+            data.pop("nextcloud_priority", None)
         for field in LEGACY_HIDDEN_STORAGE_FIELDS:
             data.pop(field, None)
         if data["source"] in {"pilot-mainpc", nightly_eval.SOURCE} or data["profile"] in {QWEN64_PROFILE, voice.voice_cpu.PROFILE}:
             # Exact durable client correlation survives terminal payload cleanup.
+            data["input_hash"] = row["input_hash"]
+            data["input_bytes"] = row["input_bytes"]
+        if data["profile"] in syncopia_summary.MODELS:
             data["input_hash"] = row["input_hash"]
             data["input_bytes"] = row["input_bytes"]
         data["payload"] = json.loads(data["payload"])
@@ -1444,6 +1538,7 @@ class Broker:
             allowed, db=db, release_running=running is not None,
             limit_per_source=bounded,
             include_producer_storage=include_producer_storage,
+            source_priority=policy is not None,
         )
         snapshot = self._scheduler_snapshot or {}
         cycle = deepcopy(snapshot.get("time_cycle"))
@@ -1490,6 +1585,8 @@ class Broker:
                 "eligible_sources": eligible,
                 "wait_seconds": round(wait, 3),
             })
+            if picked["source"] == "nextcloud":
+                selections[-1]["nextcloud_priority"] = picked["nextcloud_priority"]
             remaining = [row for row in remaining if row["id"] != picked["id"]]
             if policy is not None:
                 self._record_time_usage(
@@ -1639,17 +1736,21 @@ class Broker:
         with self.lock:
             rows = self.db.execute(
                 "SELECT id AS job_id,source,profile,state,created,finished,"
-                "source_item_id,external_id FROM jobs WHERE "
+                "source_item_id,external_id,nextcloud_priority FROM jobs WHERE "
                 + " AND ".join(clauses)
                 + " ORDER BY created DESC,id DESC LIMIT ?",
                 (*values, bounded_limit),
             )
-            return [dict(row) for row in rows]
+            result = [dict(row) for row in rows]
+            for job in result:
+                if job["source"] != "nextcloud":
+                    job.pop("nextcloud_priority", None)
+            return result
 
     def _candidates(self, allowed_sources: frozenset[str] | None = None, db=None,
                     release_running: bool = False, limit_per_source: int | None = None,
-                    include_producer_storage: bool = True):
-        """Queued rows eligible now, ordered FIFO.
+                    include_producer_storage: bool = True, source_priority: bool = True):
+        """Eligible rows in global age order; source heads apply local priority.
 
         Per-source concurrency and min-interval backpressure are applied here
         exactly as before; this method returns the full ordered candidate list
@@ -1663,7 +1764,7 @@ class Broker:
         # projection narrow for both observers and the real dispatcher avoids
         # materializing every queued request while sorting a large backlog.
         query = (
-            "SELECT id,profile,source,created,queued_at,attempt_count,json_extract(payload, '$.model') AS target_model "
+            "SELECT id,profile,source,created,queued_at,attempt_count,external_id,source_item_id,nextcloud_priority,json_extract(payload, '$.model') AS target_model "
             "FROM jobs INDEXED BY jobs_queued_candidates WHERE state='queued'"
         )
         values: tuple = ()
@@ -1674,10 +1775,14 @@ class Broker:
         if not include_producer_storage:
             query += " AND " + PUBLIC_JOB_PREDICATE
         if limit_per_source is not None:
+            rank_order = (
+                "CASE WHEN source='nextcloud' AND nextcloud_priority='new_upload' THEN 0 ELSE 1 END,"
+                if source_priority else ""
+            ) + "queued_at,id"
             query = (
-                "SELECT id,profile,source,created,queued_at,attempt_count,target_model FROM ("
-                "SELECT id,profile,source,created,queued_at,attempt_count,target_model,"
-                "row_number() OVER (PARTITION BY source ORDER BY queued_at,id) AS source_rank "
+                "SELECT id,profile,source,created,queued_at,attempt_count,external_id,source_item_id,nextcloud_priority,target_model FROM ("
+                "SELECT id,profile,source,created,queued_at,attempt_count,external_id,source_item_id,nextcloud_priority,target_model,"
+                f"row_number() OVER (PARTITION BY source ORDER BY {rank_order}) AS source_rank "
                 "FROM (" + query + ")"
                 ") WHERE source_rank<=? ORDER BY queued_at,id"
             )
@@ -1707,15 +1812,18 @@ class Broker:
 
     @staticmethod
     def _source_heads(candidates) -> dict[tuple[str, str], Any]:
-        """Return exactly one FIFO-eligible job for each source/model lane.
+        """Return exactly one source-local eligible head per source/model lane.
 
-        A source's oldest eligible row is its only dispatchable head.  This is
-        important when one source has jobs targeting different models: model
-        affinity must not let a younger job overtake that source's FIFO head.
+        All sources remain FIFO except Nextcloud, whose confirmed new uploads
+        precede historical rows (FIFO within each class). Model affinity cannot
+        overtake that source-local head; no extra source/model share is created.
         """
         heads_by_source: dict[str, Any] = {}
         for row in candidates:
             heads_by_source.setdefault(row["source"], row)
+            if (row["source"] == "nextcloud" and row["nextcloud_priority"] == "new_upload"
+                    and heads_by_source["nextcloud"]["nextcloud_priority"] != "new_upload"):
+                heads_by_source["nextcloud"] = row
         return {
             Broker._lane_key(row): row for row in heads_by_source.values()
         }
@@ -1959,6 +2067,11 @@ class Broker:
         if policy is not None and allowed_sources is None:
             allowed_sources = policy.enabled_sources()
         candidates = self._candidates(allowed_sources)
+        if self.nextcloud_priority is not None:
+            from .nextcloud_priority import EffectivePolicy
+            candidates, weight = self.nextcloud_priority.candidates(candidates)
+            if policy is not None and weight is not None:
+                policy = EffectivePolicy(policy, weight)
         if not candidates:
             self._last_scheduler_decision = None
             self._scheduler_snapshot = None
@@ -1978,6 +2091,8 @@ class Broker:
                 self._last_scheduler_decision = None
                 self._scheduler_snapshot = None
                 return None
+        if selected["source"] == "nextcloud":
+            decision["nextcloud_priority"] = selected["nextcloud_priority"]
         self._last_scheduler_decision = dict(decision)
         self._publish_scheduler_snapshot()
         return selected
@@ -2053,6 +2168,8 @@ class Broker:
         return False
 
     def dispatch_once(self, allowed_sources: frozenset[str] | None = None, policy: SourcePolicy | None = None, drain_check: bool = False) -> bool:
+        if self.nextcloud_priority is not None and policy is None:
+            policy = self.source_policy
         with self.lock:
             if drain_check:
                 return bool(self.db.execute("SELECT 1 FROM jobs WHERE state IN ('running','cancel_requested') LIMIT 1").fetchone())
@@ -2133,7 +2250,8 @@ class Broker:
                 permitted = (allowed_sources if allowed_sources is not None else
                              policy.enabled_sources() if policy is not None else queued_sources)
                 allowed_sources = permitted - {ASR_PROFILE}
-        with self.lock, self.db:
+        from contextlib import nullcontext
+        with self.lock, (self.nextcloud_priority.hold(self.db) if self.nextcloud_priority is not None else nullcontext()), self.db:
             if self.queue_paused():
                 return False
             if self.executor_fence() != fence:
@@ -2249,6 +2367,14 @@ class Broker:
             if (row["source"] != syncopia_daily.SOURCE or row["kind"] != "chat"
                     or syncopia_daily.normalize_request(payload) != payload):
                 raise ValueError("daily capacity persisted contract drift")
+        summary_evidence = None
+        if row["profile"] in syncopia_summary.MODELS:
+            payload = json.loads(row["payload"])
+            if row["source"] != syncopia_summary.SOURCE or row["kind"] != "chat":
+                raise ValueError("summary v1 persisted source/kind drift")
+            if content_evidence(payload) != (row["input_hash"], row["input_bytes"]):
+                raise ValueError("summary v1 persisted input identity drift")
+            summary_evidence = syncopia_summary.persisted_contract(self.ollama, row["profile"], payload)
         if profile.executor == "voice":
             if row["profile"] == voice.voice_cpu.PROFILE:
                 import base64
@@ -2313,6 +2439,8 @@ class Broker:
         request = {k: v for k, v in payload.items() if k not in {"model", "keep_alive"}}
         if nightly_evidence is not None:
             request.pop("native_thinking", None)
+        if summary_evidence is not None:
+            request.pop("summary_contract", None)
         request.update({"model": profile.model, "stream": False, "options": options,
                         "keep_alive": f"{profile.keep_alive_seconds}s"})
         request["_broker_timeout_seconds"] = profile.request_timeout_seconds
@@ -2332,6 +2460,9 @@ class Broker:
             result = nightly_eval.project_result(result, profile.model)
             result["execution_evidence"] = nightly_eval.project_evidence(
                 dict(nightly_evidence, runtime_context_length=context))
+        if summary_evidence is not None:
+            result = dict(result, execution_evidence=syncopia_summary.execution_evidence(
+                self.ollama, row["profile"], payload, result))
         self._finish_execution(row, result, reason)
 
     def _finish_execution(self, row, result, reason):
@@ -2481,3 +2612,4 @@ class Dispatcher(threading.Thread):
             else:
                 self.broker.dispatch_once(allowed, policy)
             self.stop_event.wait(self.interval)
+

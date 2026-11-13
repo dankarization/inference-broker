@@ -99,9 +99,6 @@ PROFILES = {
         "openclaw-qwen3-vl-2b", "qwen3-vl:2b-instruct-q4_K_M", 262_144, 2_048, 300,
         request_timeout_seconds=600, max_images=4,
     ),
-    # OCR and route ceilings are the live 2026-11-09 `/api/show` values for the
-    # installed tags, not the old smoke bounds.  Image counts stay bounded until
-    # each artifact gets its own media test.
     "openclaw-deepseek-ocr": Profile(
         "openclaw-deepseek-ocr", "deepseek-ocr:latest", 8_192, 2_048, 300,
         request_timeout_seconds=600, max_images=4,
@@ -162,6 +159,15 @@ PROFILES = {
         "syncopia-memory-qwen38-128k-v1", "qwen3.8:ad-iq2-xs", 131_072, 8_192, 1_800,
         max_concurrency=1, request_timeout_seconds=900,
     ),
+    # Opt-in native-Boolean summaries; legacy memory/daily profiles unchanged.
+    "syncopia-summary-gemma12-v1": Profile(
+        "syncopia-summary-gemma12-v1", "gemma4:12b", 131_072, 65_536, 300,
+        request_timeout_seconds=1800,
+    ),
+    "syncopia-summary-bolt-e4b-v1": Profile(
+        "syncopia-summary-bolt-e4b-v1", "nemotron-3.5-bolt:e4b", 65_536, 32_768, 300,
+        request_timeout_seconds=1800,
+    ),
     # Seven isolated, text-only comparison lanes.  They deliberately share one
     # source so their evaluations cannot borrow any production caller's share.
     # 64k is the normal comparison default; 128k is an explicit stress ceiling.
@@ -204,8 +210,7 @@ PROFILES = {
 }
 
 # Distinct scheduler lanes; model labels are not caller-controlled Ollama models.
-VOICE_PROFILE_NAMES = frozenset({"voice-wyoming-v1", "voice-gigaam-v1", "voice-whisper-gpu-v1",
-                                 "voice-whisper-gpu-large-v3-v1", "voice-native-cpu-v1", "voice-contour-v1"})
+VOICE_PROFILE_NAMES = frozenset({"voice-wyoming-v1", "voice-gigaam-v1", "voice-whisper-gpu-v1", "voice-whisper-gpu-large-v3-v1", "voice-native-cpu-v1", "voice-contour-v1"})
 for _name in VOICE_PROFILE_NAMES:
     PROFILES[_name] = Profile(_name, _name, 0, 0, 0, request_timeout_seconds=1800,
                              executor="voice")
@@ -224,20 +229,12 @@ for _name, _model in (
     PROFILES[_name] = Profile(_name, _model, 32_768, 8_192, 300,
                              request_timeout_seconds=1800)
 
-# Wire models accepted by the OpenClaw route.  This is the selector, not the
-# artefact inventory: `openclaw-gpt-oss`, `openclaw-smolvlm2-2b` and
-# `openclaw-smolvlm2-500m` keep their profile definitions (a queued job may name
-# one of them) but are deliberately unreachable from the route because those
-# artefacts were deleted from MAIN-PC.  Do not re-add a model here without the
-# artefact being present on the executor.
 _OPENCLAW_ROUTE_PROFILE_NAMES = (
     "openclaw", "openclaw-gemma4", "openclaw-qwen3-vl", "openclaw-nemotron3",
     "openclaw-unc-rvn-iq2xxs", "openclaw-ministral3", "openclaw-nemotron-nano",
     "openclaw-gemma4-26b", "openclaw-bolt-e4b", "openclaw-qwen3-vl-2b",
     "openclaw-deepseek-ocr", "openclaw-glm-ocr",
 )
-# Retained profiles that are no longer OpenClaw route candidates.  They stay
-# available to the durable `/v1/jobs` path under their own sources.
 OPENCLAW_LEGACY_PROFILE_NAMES = (
     "openclaw-gpt-oss", "openclaw-smolvlm2-2b", "openclaw-smolvlm2-500m",
 )
@@ -246,10 +243,6 @@ OPENCLAW_PROFILES_BY_MODEL = {
 }
 OPENCLAW_PROFILE_NAMES = frozenset(_OPENCLAW_ROUTE_PROFILE_NAMES)
 OPENCLAW_LEGACY_PROFILE_NAMES = frozenset(OPENCLAW_LEGACY_PROFILE_NAMES)
-# Every profile the OpenClaw executor contract still governs: the current route
-# plus retained profiles that a queued job may still name. Admission/dispatch
-# guards and result validation use this wider set; only the route set decides
-# which wire models `/openclaw/api/chat` accepts.
 OPENCLAW_EXECUTOR_PROFILE_NAMES = OPENCLAW_PROFILE_NAMES | OPENCLAW_LEGACY_PROFILE_NAMES
 
 EVALUATION_PROFILE_NAMES = frozenset({
