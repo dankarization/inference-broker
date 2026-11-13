@@ -116,17 +116,17 @@ const fixture = {
   ]}
 };
 
-async function boot(data, unavailableShell = false, fail = false) {
+async function boot(data, unavailableShell = false, fail = false, noObserver = false) {
   const document = parseHTML(fs.readFileSync(path.join(root, 'broker/static',
     unavailableShell ? 'dashboard-unavailable.html' : 'dashboard.html'), 'utf8'));
-  const requests = [], observerCallbacks = [], timers = [];
+  const requests = [], observerCallbacks = [], timers = [], observations = [];
   const context = vm.createContext({
     document, Intl, Date, console, Set, Map,
     location: {reload() { context.reloaded = true; }},
     confirm: () => true,
     IntersectionObserver: class {
       constructor(callback) { observerCallbacks.push(callback); }
-      observe() {}
+      observe() { observations.push(true); }
     },
     setInterval: (callback, ms) => {
       const timer = {id: timers.length + 1, callback, ms, active: true};
@@ -140,11 +140,12 @@ async function boot(data, unavailableShell = false, fail = false) {
     }
   });
   context.window = context;
+  if (noObserver) delete context.IntersectionObserver;
   context.scrollTo = (x, y) => { context.scrollX = x; context.scrollY = y; };
   vm.runInContext(fs.readFileSync(path.join(root, 'broker/table_sort.js'), 'utf8'), context);
   vm.runInContext(fs.readFileSync(path.join(root, 'broker/static/dashboard.js'), 'utf8'), context);
   await vm.runInContext('dashboardReady', context);
-  return {context, document, requests, observerCallbacks, timers,
+  return {context, document, requests, observerCallbacks, timers, observations,
     active: () => timers.filter(timer => timer.active),
     flush: async (turns = 8) => { for (let i = 0; i < turns; i++) await new Promise(resolve => setImmediate(resolve)); },
     id: id => document.getElementById(id)};
@@ -258,8 +259,10 @@ const durationCases = JSON.parse(
   assert.equal(context.reloaded, undefined);
 
   // Appended history shares the initial renderer, de-duplicates and recovers after failure.
+  const beforeFailedPage = page.observations.length;
   context.fetch = async () => { throw new Error('history offline'); };
   await page.observerCallbacks[0]([{isIntersecting: true}]);
+  assert.equal(page.observations.length, beforeFailedPage, 'failed history must not rearm a tight retry loop');
   assert.match(id('history-error').textContent, /history offline/);
   assert.equal(id('history-error').hidden, false);
   context.fetch = async () => ({ok: true, json: async () => ({
@@ -272,6 +275,40 @@ const durationCases = JSON.parse(
   assert.equal(id('history-sentinel').dataset.cursor, '');
   assert.equal(id('history-error').textContent, '');
   assert.equal(id('history-error').hidden, true);
+
+  // Hidden/overlapping reads cannot issue a second network request.
+  const guarded = await boot(fixture);
+  let finishRead, reads = 0;
+  guarded.context.fetch = () => {
+    reads++;
+    return new Promise(resolve => { finishRead = resolve; });
+  };
+  guarded.document.hidden = true;
+  await guarded.context.loadDashboard();
+  await guarded.observerCallbacks[0]([{isIntersecting: true}]);
+  assert.equal(reads, 0);
+  guarded.document.hidden = false;
+  const pendingRead = guarded.context.loadDashboard();
+  await guarded.context.loadDashboard();
+  await guarded.observerCallbacks[0]([{isIntersecting: true}]);
+  assert.equal(reads, 1);
+  finishRead({ok: true, json: async () => fixture});
+  await pendingRead;
+  let finishPage;
+  guarded.context.fetch = () => {
+    reads++;
+    return new Promise(resolve => { finishPage = resolve; });
+  };
+  const pendingPage = guarded.observerCallbacks[0]([{isIntersecting: true}]);
+  await guarded.observerCallbacks[0]([{isIntersecting: true}]);
+  await guarded.context.loadDashboard();
+  assert.equal(reads, 2);
+  finishPage({ok: true, json: async () => ({items: [history('older')], next_cursor: 'old:cursor'})});
+  await pendingPage;
+  guarded.context.fetch = async () => ({ok: true, json: async () => fixture});
+  await guarded.context.loadDashboard();
+  assert.equal(guarded.id('history-body').rows.length, 2);
+  assert.equal(guarded.id('history-sentinel').dataset.cursor, 'old:cursor');
 
   // Policy controls retain serialized latest-desired writes and failure recovery.
   const weightForm = document.querySelector('.weight-form'), select = weightForm.elements.weight;
@@ -324,6 +361,9 @@ const durationCases = JSON.parse(
   const offline = await boot(fixture, false, true);
   assert.equal(offline.id('dashboard-live').hidden, true);
   assert.match(offline.id('dashboard-error').textContent, /offline/);
+  const legacy = await boot(fixture, false, false, true);
+  assert.equal(legacy.id('dashboard-error').hidden, true);
+  assert.equal(legacy.observerCallbacks.length, 0);
   const recovered = await boot(fixture, true);
   assert.equal(recovered.context.reloaded, true);
   assert.equal(recovered.active().length, 0);

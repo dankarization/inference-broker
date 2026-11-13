@@ -1,0 +1,130 @@
+{
+  "source": "production baseline cf8d9ed",
+  "init_ms": 38.628,
+  "rows": 100000,
+  "payload_bytes": 8192,
+  "bounded": [
+    {
+      "ms": 751.605,
+      "state": "unavailable"
+    },
+    {
+      "ms": 751.383,
+      "state": "unavailable"
+    },
+    {
+      "ms": 750.984,
+      "state": "unavailable"
+    }
+  ],
+  "profile": [
+    {
+      "ms": 1986.714,
+      "state": "live"
+    },
+    {
+      "ms": 2060.83,
+      "state": "live"
+    },
+    {
+      "ms": 2071.281,
+      "state": "live"
+    }
+  ],
+  "stages_ms": {
+    "snapshot": [
+      750.524,
+      750.612,
+      750.051,
+      1733.152,
+      1798.955,
+      1816.579,
+      750.099,
+      749.515,
+      749.565,
+      750.003,
+      748.981,
+      747.594,
+      748.498,
+      750.777,
+      749.873,
+      749.36,
+      750.736,
+      749.995
+    ],
+    "forecast": [
+      252.212,
+      260.535,
+      253.35
+    ],
+    "history": [
+      0.468,
+      0.465,
+      0.44,
+      3.217,
+      1.898,
+      1.891,
+      1.901,
+      2.009,
+      1.829
+    ]
+  },
+  "concurrent": [
+    {
+      "ms": 752.788,
+      "state": "stale"
+    },
+    {
+      "ms": 754.836,
+      "state": "stale"
+    },
+    {
+      "ms": 755.573,
+      "state": "stale"
+    },
+    {
+      "ms": 756.088,
+      "state": "stale"
+    },
+    {
+      "ms": 751.776,
+      "state": "stale"
+    },
+    {
+      "ms": 752.289,
+      "state": "stale"
+    },
+    {
+      "ms": 752.136,
+      "state": "stale"
+    },
+    {
+      "ms": 756.244,
+      "state": "stale"
+    },
+    {
+      "ms": 751.622,
+      "state": "stale"
+    },
+    {
+      "ms": 751.946,
+      "state": "stale"
+    },
+    {
+      "ms": 753.583,
+      "state": "stale"
+    },
+    {
+      "ms": 751.491,
+      "state": "stale"
+    }
+  ],
+  "writer_max_ms": 188.034,
+  "writer_median_ms": 15.724,
+  "writer_p95_ms": 40.07,
+  "checkpoint_ms": 5.572,
+  "writes": 60,
+  "pagination_unique": 180,
+  "indexes": [],
+  "database_bytes": 978321408
+}

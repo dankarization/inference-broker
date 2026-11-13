@@ -492,6 +492,25 @@ class Broker:
                 "CREATE INDEX IF NOT EXISTS jobs_source_state_retry "
                 "ON jobs(source,state,retry_count)"
             )
+            # Additive covering aggregates and bounded forecast seeks.
+            for name, predicate in (("all", ""), ("public", " WHERE " + PUBLIC_JOB_PREDICATE)):
+                self.db.execute(
+                    f"CREATE INDEX IF NOT EXISTS jobs_observer_{name} "
+                    "ON jobs(source,state,retry_count,lease_until)" + predicate)
+            self.db.execute(
+                "CREATE INDEX IF NOT EXISTS audit_observer_windows "
+                "ON audit_events(source,event_type,occurred,producer_storage)")
+            self.db.execute(
+                "CREATE INDEX IF NOT EXISTS jobs_observer_heads ON jobs(source,"
+                "CASE WHEN source='nextcloud' AND nextcloud_priority='new_upload' THEN 0 ELSE 1 END,"
+                "queued_at,id) WHERE state='queued'")
+            self.db.execute(
+                "CREATE INDEX IF NOT EXISTS jobs_observer_fifo "
+                "ON jobs(source,queued_at,id) WHERE state='queued'")
+            for name, order in (("heads", "CASE WHEN source='nextcloud' AND nextcloud_priority='new_upload' THEN 0 ELSE 1 END,"), ("fifo", "")):
+                self.db.execute(
+                    f"CREATE INDEX IF NOT EXISTS jobs_observer_public_{name} "
+                    f"ON jobs(source,{order}queued_at,id) WHERE state='queued' AND " + PUBLIC_JOB_PREDICATE)
             # Candidate selection/forecast must not visit queued payload rows.
             self.db.execute(
                 "CREATE INDEX IF NOT EXISTS jobs_queued_candidates "
@@ -1457,10 +1476,11 @@ class Broker:
             "sqlite_error": sqlite_error,
         }
 
-    def _observer_read(self, reader):
+    def _observer_read(self, reader, *, operation="observer"):
         """Run a bounded read without waiting for the dispatcher connection."""
         connection = None
-        deadline = time.monotonic() + OBSERVER_READ_DEADLINE_SECONDS
+        started = time.monotonic()
+        deadline = started + OBSERVER_READ_DEADLINE_SECONDS
         try:
             connection = sqlite3.connect(
                 self.database, timeout=OBSERVER_READ_DEADLINE_SECONDS,
@@ -1473,8 +1493,12 @@ class Broker:
             connection.set_progress_handler(
                 lambda: int(time.monotonic() >= deadline), 1_000,
             )
+            # A consistent, bounded WAL snapshot; finally closes even on interrupt.
+            connection.execute("BEGIN")
             return reader(connection), None
         except sqlite3.Error as error:
+            LOGGER.warning(json.dumps({"event": "observer.operation_failed",
+                "operation": operation, "elapsed_ms": round((time.monotonic()-started)*1000, 3)}, sort_keys=True))
             return None, self._observer_error(error)
         finally:
             if connection is not None:
@@ -1613,24 +1637,29 @@ class Broker:
             for name, entry in ((policy_snapshot or {}).get("sources") or {}).items()
         }
         now = self.clock()
-        snapshot, error = self._observer_read(
-            lambda db: {
-                **dashboard_snapshot(
+        def read_dashboard(db):
+            timings = {}
+            def stage(name, reader):
+                started = time.monotonic()
+                try:
+                    return reader()
+                finally:
+                    timings[name] = round((time.monotonic()-started)*1000, 3)
+            try:
+                data = stage("snapshot", lambda: dashboard_snapshot(
                     db, now=now, policy_snapshot=policy_snapshot,
-                    include_producer_storage=include_producer_storage,
-                ),
-                "queue_paused": bool(db.execute("SELECT paused FROM queue_control WHERE id=1").fetchone()[0]),
-                "forecast": self._forecast(
-                    db, policy, now, 10,
-                    include_producer_storage=include_producer_storage,
-                ),
-                "history": self._terminal_history(
-                    db, limit=10,
-                    include_producer_storage=include_producer_storage,
-                    source_weights=source_weights,
-                ),
-            }
-        )
+                    include_producer_storage=include_producer_storage))
+                data["queue_paused"] = bool(db.execute("SELECT paused FROM queue_control WHERE id=1").fetchone()[0])
+                data["forecast"] = stage("forecast", lambda: self._forecast(
+                    db, policy, now, 10, include_producer_storage=include_producer_storage))
+                data["history"] = stage("history", lambda: self._terminal_history(
+                    db, limit=10, include_producer_storage=include_producer_storage,
+                    source_weights=source_weights))
+                return data
+            finally:
+                LOGGER.info(json.dumps({"event": "observer.dashboard_timing",
+                    "public": not include_producer_storage, "stages_ms": timings}, sort_keys=True))
+        snapshot, error = self._observer_read(read_dashboard, operation="dashboard")
         if snapshot is not None:
             snapshot["observation"] = self._observation("live", now)
             self._dashboard_cache[include_producer_storage] = snapshot
@@ -1648,18 +1677,26 @@ class Broker:
     ) -> str:
         """Return a cheap validator without running dashboard observer queries."""
         policy_snapshot = policy.snapshot() if policy is not None else None
-        with self.lock:
-            revision = {
-                "database_changes": self.db.total_changes,
-                "include_producer_storage": include_producer_storage,
-                "instance": self._dashboard_instance,
-                "policy": policy_snapshot,
-                # Dashboard windows, delayed state, forecasts, timestamps and
-                # observer availability can change without a database write.
-                # Match the HTML refresh cadence so a cached response is never
-                # reused for more than one 30-second observation interval.
-                "time_epoch": int(self.clock() // DASHBOARD_VALIDATOR_INTERVAL_SECONDS),
-            }
+        # Never queue an HTTP validator behind a long dispatcher transaction.
+        # A busy writer gets an uncacheable unique revision, not a validator
+        # based on uncommitted total_changes and an older reader snapshot.
+        acquired = self.lock.acquire(blocking=False)
+        try:
+            changes = self.db.total_changes if acquired else uuid.uuid4().hex
+        finally:
+            if acquired:
+                self.lock.release()
+        revision = {
+            "database_changes": changes,
+            "include_producer_storage": include_producer_storage,
+            "instance": self._dashboard_instance,
+            "policy": policy_snapshot,
+            # Dashboard windows, delayed state, forecasts, timestamps and
+            # observer availability can change without a database write.
+            # Match the HTML refresh cadence so a cached response is never
+            # reused for more than one 30-second observation interval.
+            "time_epoch": int(self.clock() // DASHBOARD_VALIDATOR_INTERVAL_SECONDS),
+        }
         digest = hashlib.sha256(json.dumps(
             revision, sort_keys=True, separators=(",", ":"),
         ).encode("utf-8")).hexdigest()
@@ -1760,6 +1797,32 @@ class Broker:
         connection = db if db is not None else self.db
         if allowed_sources is not None and not allowed_sources:
             return []
+        if limit_per_source is not None:
+            # Seek heads before JSON extraction, rather than rank the whole backlog.
+            sources = sorted(allowed_sources) if allowed_sources is not None else [
+                row[0] for row in connection.execute(
+                    "SELECT DISTINCT source FROM jobs INDEXED BY jobs_state_source WHERE state='queued'")]
+            priority = ("CASE WHEN source='nextcloud' AND nextcloud_priority='new_upload' "
+                        "THEN 0 ELSE 1 END,") if source_priority else ""
+            index = "jobs_observer_heads" if source_priority else "jobs_observer_fifo"
+            if not include_producer_storage:
+                index = index.replace("jobs_observer_", "jobs_observer_public_")
+            public = "" if include_producer_storage else " AND " + PUBLIC_JOB_PREDICATE
+            heads = []
+            for source in sources:
+                heads.extend(connection.execute(
+                    "SELECT id,profile,source,created,queued_at,attempt_count,external_id,source_item_id,"
+                    "nextcloud_priority,json_extract(payload,'$.model') AS target_model "
+                    f"FROM jobs INDEXED BY {index} WHERE state='queued' AND source=?" + public +
+                    " ORDER BY " + priority + "queued_at,id LIMIT ?", (source, limit_per_source)))
+            running = dict(connection.execute(
+                "SELECT source,count(*) FROM jobs WHERE state IN ('running','cancel_requested') GROUP BY source"))
+            schedules = dict(connection.execute("SELECT source,next_allowed FROM source_schedules"))
+            now = self.clock()
+            return sorted((row for row in heads
+                if (release_running or running.get(row['source'], 0) < PROFILES[row['profile']].max_concurrency)
+                and (schedules.get(row['source']) is None or schedules[row['source']] <= now)),
+                key=lambda row: (row['queued_at'], row['id']))
         # Scheduler selection never needs payload/result_json.  Keeping this
         # projection narrow for both observers and the real dispatcher avoids
         # materializing every queued request while sorting a large backlog.
@@ -1774,21 +1837,7 @@ class Broker:
             values = tuple(sorted(allowed_sources))
         if not include_producer_storage:
             query += " AND " + PUBLIC_JOB_PREDICATE
-        if limit_per_source is not None:
-            rank_order = (
-                "CASE WHEN source='nextcloud' AND nextcloud_priority='new_upload' THEN 0 ELSE 1 END,"
-                if source_priority else ""
-            ) + "queued_at,id"
-            query = (
-                "SELECT id,profile,source,created,queued_at,attempt_count,external_id,source_item_id,nextcloud_priority,target_model FROM ("
-                "SELECT id,profile,source,created,queued_at,attempt_count,external_id,source_item_id,nextcloud_priority,target_model,"
-                f"row_number() OVER (PARTITION BY source ORDER BY {rank_order}) AS source_rank "
-                "FROM (" + query + ")"
-                ") WHERE source_rank<=? ORDER BY queued_at,id"
-            )
-            values += (limit_per_source,)
-        else:
-            query += " ORDER BY queued_at, id"
+        query += " ORDER BY queued_at, id"
         now = self.clock()
         running_by_source = dict(connection.execute(
             "SELECT source,count(*) FROM jobs "

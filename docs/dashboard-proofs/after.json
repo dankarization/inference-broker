@@ -1,0 +1,189 @@
+{
+  "source": "dashboard candidate based on cf8d9ed",
+  "init_ms": 4085.493,
+  "rows": 100000,
+  "payload_bytes": 8192,
+  "bounded": [
+    {
+      "ms": 66.71,
+      "state": "live"
+    },
+    {
+      "ms": 66.143,
+      "state": "live"
+    },
+    {
+      "ms": 74.152,
+      "state": "live"
+    }
+  ],
+  "profile": [
+    {
+      "ms": 65.092,
+      "state": "live"
+    },
+    {
+      "ms": 60.596,
+      "state": "live"
+    },
+    {
+      "ms": 61.169,
+      "state": "live"
+    }
+  ],
+  "stages_ms": {
+    "snapshot": [
+      57.544,
+      57.7,
+      66.91,
+      56.986,
+      53.279,
+      53.32,
+      126.478,
+      128.498,
+      128.318,
+      141.878,
+      104.372,
+      119.434,
+      114.391,
+      139.704,
+      112.618,
+      103.883,
+      112.46,
+      132.967
+    ],
+    "forecast": [
+      7.963,
+      7.166,
+      6.267,
+      7.111,
+      6.39,
+      6.753,
+      33.689,
+      36.51,
+      41.657,
+      37.59,
+      19.369,
+      27.438,
+      23.367,
+      16.923,
+      17.614,
+      10.91,
+      12.193,
+      19.229
+    ],
+    "history": [
+      0.476,
+      0.435,
+      0.324,
+      0.342,
+      0.342,
+      0.421,
+      1.433,
+      1.402,
+      1.394,
+      1.577,
+      1.098,
+      1.788,
+      1.112,
+      1.196,
+      1.04,
+      0.658,
+      0.536,
+      0.744,
+      1.445,
+      1.243,
+      1.229,
+      1.186,
+      1.217,
+      1.31
+    ]
+  },
+  "concurrent": [
+    {
+      "ms": 164.157,
+      "state": "live"
+    },
+    {
+      "ms": 168.693,
+      "state": "live"
+    },
+    {
+      "ms": 183.009,
+      "state": "live"
+    },
+    {
+      "ms": 173.49,
+      "state": "live"
+    },
+    {
+      "ms": 151.541,
+      "state": "live"
+    },
+    {
+      "ms": 126.838,
+      "state": "live"
+    },
+    {
+      "ms": 160.256,
+      "state": "live"
+    },
+    {
+      "ms": 141.584,
+      "state": "live"
+    },
+    {
+      "ms": 132.492,
+      "state": "live"
+    },
+    {
+      "ms": 147.486,
+      "state": "live"
+    },
+    {
+      "ms": 116.841,
+      "state": "live"
+    },
+    {
+      "ms": 133.783,
+      "state": "live"
+    }
+  ],
+  "writer_max_ms": 28.275,
+  "writer_median_ms": 14.359,
+  "writer_p95_ms": 22.735,
+  "checkpoint_ms": 415.425,
+  "writes": 60,
+  "pagination_unique": 180,
+  "indexes": [
+    {
+      "name": "audit_observer_windows",
+      "bytes": 2957312
+    },
+    {
+      "name": "jobs_observer_all",
+      "bytes": 2932736
+    },
+    {
+      "name": "jobs_observer_fifo",
+      "bytes": 733184
+    },
+    {
+      "name": "jobs_observer_heads",
+      "bytes": 753664
+    },
+    {
+      "name": "jobs_observer_public",
+      "bytes": 2203648
+    },
+    {
+      "name": "jobs_observer_public_fifo",
+      "bytes": 552960
+    },
+    {
+      "name": "jobs_observer_public_heads",
+      "bytes": 569344
+    }
+  ],
+  "database_bytes": 978321408
+}

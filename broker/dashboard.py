@@ -63,18 +63,17 @@ def snapshot(
     policy_sources = (policy_snapshot or {}).get("sources", {})
     policy_active = policy_snapshot is not None
     public_clause = "" if include_producer_storage else " AND " + PUBLIC_JOB_PREDICATE
+    observer_index = "jobs_observer_all" if include_producer_storage else "jobs_observer_public"
     schedules = dict(db.execute("SELECT source,next_allowed FROM source_schedules"))
-    # Do not discover sources by scanning all historical jobs.  `jobs` holds
-    # payloads and can be multiple GiB, so even an index-only global scan can
-    # exceed the observer deadline on a cold cache.  Policy/schedule sources
-    # are known directly; active unconfigured sources remain visible through
-    # a covering state/source index.
+    # Preserve historical-only sources, but scan narrow covering metadata
+    # instead of visiting payload-heavy table pages to test public visibility.
+    # This remains O(history rows), not a constant-cost source registry.
     source_names = set(policy_sources)
     source_names.update(schedules)
     source_names.update(
         row["source"]
         for row in db.execute(
-            "SELECT DISTINCT source FROM jobs INDEXED BY jobs_state_source "
+            f"SELECT DISTINCT source FROM jobs INDEXED BY {observer_index} "
             "WHERE state IN ('queued','running','cancel_requested','completed','failed','cancelled')" + public_clause
         )
     )
@@ -92,7 +91,7 @@ def snapshot(
             row["state"]: row["count"]
             for row in db.execute(
                 "SELECT state,count(*) AS count FROM jobs "
-                "INDEXED BY jobs_source_state WHERE source=?" + public_clause +
+                f"INDEXED BY {observer_index} WHERE source=?" + public_clause +
                 " GROUP BY state",
                 (source,),
             )
@@ -107,18 +106,18 @@ def snapshot(
             "SELECT "
             "coalesce(sum(occurred>=?),0) AS completed_1h,"
             "coalesce(sum(occurred>=?),0) AS completed_24h "
-            "FROM audit_events INDEXED BY audit_events_source_time "
+            "FROM audit_events INDEXED BY audit_observer_windows "
             "WHERE source=? AND occurred>=? AND event_type='job.completed'" +
             ("" if include_producer_storage else " AND producer_storage=0"),
             (now - 3_600, now - 86_400, source, now - 86_400),
         ).fetchone()
         retry = db.execute(
-            "SELECT count(*) FROM jobs INDEXED BY jobs_source_state_retry "
+            f"SELECT count(*) FROM jobs INDEXED BY {observer_index} "
             "WHERE source=? AND state='queued' AND retry_count>0" + public_clause,
             (source,),
         ).fetchone()[0]
         lease = db.execute(
-            "SELECT count(*) FROM jobs INDEXED BY jobs_source_state "
+            f"SELECT count(*) FROM jobs INDEXED BY {observer_index} "
             "WHERE source=? AND state IN ('running','cancel_requested') "
             "AND lease_until IS NOT NULL" + public_clause,
             (source,),

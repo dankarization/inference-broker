@@ -1,0 +1,33 @@
+{
+  "fixture": "same task-owned 100000-job synthetic DB",
+  "per_index_ms": {
+    "audit_observer_windows": 218.003,
+    "jobs_observer_all": 1750.192,
+    "jobs_observer_fifo": 537.247,
+    "jobs_observer_heads": 539.725,
+    "jobs_observer_public": 520.39,
+    "jobs_observer_public_fifo": 578.308,
+    "jobs_observer_public_heads": 575.27
+  },
+  "total_transaction_ms": 5268.242,
+  "index_bytes": {
+    "audit_observer_windows": 2957312,
+    "jobs_observer_all": 2932736,
+    "jobs_observer_fifo": 733184,
+    "jobs_observer_heads": 753664,
+    "jobs_observer_public": 2203648,
+    "jobs_observer_public_fifo": 552960,
+    "jobs_observer_public_heads": 569344
+  },
+  "wal_bytes_after_commit": 10786192,
+  "checkpoint": [
+    [
+      0,
+      0,
+      0
+    ]
+  ],
+  "checkpoint_ms": 3.132,
+  "temp_store": "MEMORY",
+  "note": "single local rehearsal, existing free pages reused; not a production estimate or peak"
+}
