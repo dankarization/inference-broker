@@ -107,7 +107,7 @@ const fixture = {
   sources: [source('weight-10', 10), source('unknown', null), source('weight-1-b', 1),
     source('weight-2', 2), source('weight-1-a', 1)],
   active_jobs: [{id: '<script>job</script>', source: 'source', weight: 3, state: 'running',
-    started: 1787992200, lease_until: null, attempt_count: 1, retry_count: 0}],
+    model: 'generic:override', started: 1787992200, lease_until: null, attempt_count: 1, retry_count: 0}],
   overall: {states: {completed: 0}, completed_last_hour: 0, completed_last_24_hours: 0},
   history: [history('job-<one>')],
   forecast: {current_model: 'model', contingency: '<contingent>', next_selections: [
@@ -181,9 +181,10 @@ const durationCases = JSON.parse(
   assert.equal(document.querySelector('.weight-form').elements.weight.options.length, 10);
   assert.equal(id('active-body').rows[0].cells[0].textContent, '<script>job</script>');
   assert.equal(id('active-body').rows[0].cells[0].children.length, 0);
-  assert.equal(id('active-body').rows[0].cells[4].textContent, '2026-08-29 12:30:00 UTC+04:00 (Asia/Tbilisi)');
-  assert.equal(id('active-body').rows[0].cells[4].title, '2026-08-29T08:30:00Z (epoch 1787992200)');
-  assert.equal(id('active-body').rows[0].cells[5].textContent, '—');
+  assert.equal(id('active-body').rows[0].cells[2].textContent, 'generic:override');
+  assert.equal(id('active-body').rows[0].cells[5].textContent, '2026-08-29 12:30:00 UTC+04:00 (Asia/Tbilisi)');
+  assert.equal(id('active-body').rows[0].cells[5].title, '2026-08-29T08:30:00Z (epoch 1787992200)');
+  assert.equal(id('active-body').rows[0].cells[6].textContent, '—');
   assert.equal(id('forecast-body').rows[0].cells[2].textContent, 'interactive');
   assert.equal(id('forecast-body').rows[0].cells[7].textContent, '02:30');
   assert.equal(id('forecast-body').rows[0].cells[7].getAttribute('data-sort-value'), '150.2');

@@ -103,3 +103,21 @@ A real-browser check (headless Chromium over CDP, no npm dependency) is not part
 of the suite; `scripts/dashboard_browser_fixture.py` starts the real HTTP routes
 over a temporary seeded queue for interactive or scripted layout checks, and
 accepts `--assets-dir` to serve a previous revision for a before/after measure.
+
+### Operational model identity
+
+History and Active jobs expose scalar model identity, not payloads or result
+bodies. `requested_model` is the job override (otherwise the profile default);
+`observed_model` is the backend result's top-level string `model`, when retained.
+The display `model` prefers observed identity, then requested identity.
+`model_identity_source` distinguishes `observed`, `requested`, and
+`profile_default`. Forecast remains a prediction of the requested target, so a
+backend that reports a different canonical model can legitimately differ from
+history. Source and profile remain independent job metadata.
+
+Legacy or storage-compacted jobs with no surviving identity fall back to the
+profile default; this does **not** prove which model executed. Malformed or
+non-string historical identity is ignored. No schema changes or backfills are
+required. History scalar extraction is limited to the selected page (maximum
+30 rows), retaining indexed keyset pagination and public-storage filtering;
+large retained JSON values still incur parsing cost within that bounded page.

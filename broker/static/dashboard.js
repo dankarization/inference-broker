@@ -131,9 +131,9 @@ function renderDashboard(data) {
       cell(item.completed_last_hour), cell(item.completed_last_24_hours), bulkCell(item.source, states)]);
   }), 15);
   fillBody('active-body', data.active_jobs.map(item => row([
-    cell(item.id, true), cell(item.source), cell(item.weight), cell(item.state),
+    cell(item.id, true), cell(item.source), cell(item.model), cell(item.weight), cell(item.state),
     timestamp(cell(null), item.started), timestamp(cell(null), item.lease_until),
-    cell(item.attempt_count, true), cell(item.retry_count)])), 8);
+    cell(item.attempt_count, true), cell(item.retry_count)])), 9);
   const pause = byId('queue-pause');
   pause.dataset.paused = String(Boolean(data.queue_paused));
   pause.textContent = data.queue_paused ? 'Resume queue' : 'Pause queue';

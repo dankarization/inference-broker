@@ -32,8 +32,30 @@ def format_duration(seconds: float | None) -> str:
     return f"{hours:d}:{minutes:02d}:{sec:02d}"
 
 
+# Apply only to bounded windows; never return request/result bodies.
+MODEL_IDENTITY_SQL = """
+CASE WHEN json_valid(payload) THEN
+ CASE WHEN json_type(payload,'$.model')='text'
+ THEN json_extract(payload,'$.model') END END AS requested_model,
+CASE WHEN json_valid(result_json) THEN
+ CASE WHEN json_type(result_json,'$.model')='text'
+ THEN json_extract(result_json,'$.model') END END AS observed_model
+"""
+
+
+def model_identity(row: dict[str, Any]) -> dict[str, Any]:
+    """Backend identity wins; profile fallback is not evidence of execution."""
+    profile = PROFILES.get(row.get("profile"))
+    requested = row.get("requested_model") or (profile.model if profile else None)
+    observed = row.get("observed_model") or None
+    return dict(row, requested_model=requested, observed_model=observed,
+                model=observed or requested,
+                model_identity_source="observed" if observed else
+                "requested" if row.get("requested_model") else "profile_default")
+
+
 def history_display(row: dict[str, Any]) -> dict[str, Any]:
-    """Shared display values for dashboard JSON and paged history (no payload reads)."""
+    """Shared display values for dashboard JSON and paged history (scalar identity only)."""
     finished = row.get("finished")
     started = row.get("started")
     duration = (
@@ -41,10 +63,8 @@ def history_display(row: dict[str, Any]) -> dict[str, Any]:
         if row.get("state") == "completed" and started is not None
         and finished is not None and finished >= started else None
     )
-    profile = PROFILES.get(row.get("profile"))
     return dict(
-        row,
-        model=profile.model if profile else None,
+        model_identity(row),
         model_turn_seconds=duration,
         model_turn_display=format_duration(duration),
         finished_display=(
@@ -153,11 +173,12 @@ def snapshot(
 
     active_jobs = []
     for row in db.execute(
-        "SELECT id,source,state,created,started,lease_until,attempt_count,retry_count "
-        "FROM jobs WHERE state IN ('running','cancel_requested')" + public_clause +
+        "SELECT id,source,profile,state,created,started,lease_until,attempt_count,retry_count, "
+        + MODEL_IDENTITY_SQL + " "
+        + "FROM jobs WHERE state IN ('running','cancel_requested')" + public_clause +
         " ORDER BY started,created,id"
     ):
-        job = dict(row)
+        job = model_identity(dict(row))
         job["weight"] = source_weights.get(job["source"])
         active_jobs.append(job)
     return {

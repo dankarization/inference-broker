@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import Any
 
 from .analytics import analytics_snapshot, attempt_history, audit_history
-from .dashboard import history_display, snapshot as dashboard_snapshot
+from .dashboard import MODEL_IDENTITY_SQL, history_display, snapshot as dashboard_snapshot
 from .qwen_budget import (PROFILE as QWEN64_PROFILE, CONTRACT as QWEN64_CONTRACT,
                           snapshot as qwen64_snapshot, evidence as qwen64_evidence,
                           project as project_qwen64_evidence)
@@ -1720,8 +1720,9 @@ class Broker:
             else "jobs_public_terminal_history"
         )
         rows = db.execute(
-            "SELECT id,source,profile,state,created,started,finished,attempt_count,retry_count "
-            f"FROM jobs INDEXED BY {history_index} "
+            "SELECT id,source,profile,state,created,started,finished,attempt_count,retry_count, "
+            + MODEL_IDENTITY_SQL + " "
+            + f"FROM jobs INDEXED BY {history_index} "
             "WHERE state IN ('completed','failed','cancelled') AND finished IS NOT NULL"
             + storage_clause + clause +
             " ORDER BY finished DESC,id DESC LIMIT ?",
