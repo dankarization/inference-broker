@@ -757,8 +757,8 @@ class Broker:
         if source == "local-voice" or profile in VOICE_PROFILE_NAMES:
             if source != "local-voice" or profile not in VOICE_PROFILE_NAMES or kind != "transcribe":
                 raise ValueError("voice requires local-voice source, voice profile and transcribe kind")
-            if profile == voice.voice_cpu.PROFILE and (not external_id or not source_item_id):
-                raise ValueError("CPU voice requires durable correlation IDs")
+            if profile in {voice.voice_cpu.PROFILE, voice.diarization.PROFILE} and (not external_id or not source_item_id):
+                raise ValueError("CPU/diarization voice requires durable correlation IDs")
             payload = voice.validate(payload, profile)
         if profile == syncopia_daily.PROFILE:
             if source != syncopia_daily.SOURCE or kind != "chat":

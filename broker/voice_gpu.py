@@ -37,7 +37,8 @@ def worker(profile, path, *, request_id=None, release=False):
     if request_id:headers['X-Request-Id']=request_id
     req=urllib.request.Request(url+path,headers=headers,method='POST' if release else 'GET',
         data=b'' if release else None)
-    with urllib.request.urlopen(req,timeout=5) as response:
+    from .voice import open_worker
+    with open_worker(profile, req, 5) as response:
         raw=response.read(65537)
         if len(raw)>65536:raise RuntimeError('voice custody response exceeds bound')
         result=json.loads(raw)
