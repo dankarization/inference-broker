@@ -76,13 +76,22 @@ class NextcloudPriority:
                 raise ValueError('restricted owner principal required')
             value = conn.execute('SELECT arch.priority_read(%s::jsonb) value',
                                  (json.dumps(requests),)).fetchone()['value']
-            if value.get('schema') != SCHEMA or not isinstance(value.get('jobs'),dict):
+            required = {'schema', 'jobs', 'floor', 'scope_complete', 'blockers', 'reasons'}
+            if (not isinstance(value, dict) or not required <= value.keys()
+                    or value['schema'] != SCHEMA or not isinstance(value['jobs'], dict)
+                    or type(value['scope_complete']) is not bool
+                    or (value['floor'] is not None and type(value['floor']) is not int)
+                    or any(not isinstance(key, str) or type(tier) is not int or tier < 1
+                           for key, tier in value['jobs'].items())):
                 raise ValueError('priority contract mismatch')
-            self.value = value
-            self.last = dict(reason='live_ownerwide_aggregate', floor=value['floor'],
-                             blockers=value['blockers'], scope_complete=value['scope_complete'], reasons=value['reasons'])
+            # Diagnostic fields are opaque owner JSON, not eligibility authority.
+            # Publish only after every field used by selection has been validated.
+            last = dict(reason='live_ownerwide_aggregate', floor=value['floor'],
+                        blockers=value['blockers'], scope_complete=value['scope_complete'], reasons=value['reasons'])
+            self.last, self.value = last, value
         except Exception as exc:
             # Fail closed for Nextcloud; no DB/credentials/hidden rows in diagnostic.
+            self.value = None
             stack.close()
             self.last = dict(reason='priority_unavailable', error_type=type(exc).__name__)
         try:

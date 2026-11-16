@@ -79,3 +79,16 @@ Primary/deferred eligible tiers use effective source weights 7/10, without
 rewriting the policy file. `GET /v1/nextcloud/priority` exposes enabled/contract
 state, not connection credentials or hidden owner rows.
 See [conditional forecast](FORECAST.md) for read-only projection limitations.
+
+Malformed/partial owner responses are rejected before publishing eligibility:
+all required keys, Boolean completeness, integer-or-null floor and positive
+integer job tiers must validate. The unavailable path clears authority so a
+broken owner response cannot stop otherwise eligible peer sources. This is a
+defensive code hardening, not a change to the external schema or live deployment.
+
+Correlation matching is not authentication. Inline jobs can be admitted or
+promoted by callers on the trusted broker interface, just like the legacy job
+controls. If other clients on that interface are untrusted, isolate the server
+behind an appropriate authentication boundary; do not treat a file ID or
+correlation key as a source credential. This sync does not introduce a new
+source-auth protocol or change existing producer credentials.

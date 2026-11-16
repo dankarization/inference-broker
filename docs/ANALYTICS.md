@@ -130,9 +130,10 @@ starvation (максимальный wait), actual-vs-expected share и смен
 идентификаторы HTML-экранируются и ограничены тремя компактными значениями.
 
 В отчёте отображается effective **weight** каждого source: это единственный
-операторский scheduling-параметр. Runtime policy использует weights для
-weighted round-robin между sources, а внутри выбранного source сохраняется
-FIFO. Unit отчёта читает `broker.env` перед `report.env`, поэтому использует
+операторский scheduling-параметр. Runtime policy выделяет sources доли
+execution time пропорционально `1 / weight`; model turns внутри source не
+создают новых долей, FIFO сохраняется внутри совместимой model lane.
+Unit отчёта читает `broker.env` перед `report.env`, поэтому использует
 тот же `BROKER_SOURCES_POLICY`, что и broker; `report.env` может переопределить
 путь, если это необходимо.
 
