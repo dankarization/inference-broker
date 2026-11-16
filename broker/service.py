@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from copy import deepcopy
+from contextlib import contextmanager
 from dataclasses import replace
 import math
 import hashlib
@@ -17,7 +18,9 @@ from pathlib import Path
 from typing import Any
 
 from .analytics import analytics_snapshot, attempt_history, audit_history
-from .dashboard import history_display, snapshot as dashboard_snapshot
+from .forecast import (ForecastPolicy, ForecastSnapshotChanged, capture_owner_preview,
+                       revalidate_owner_preview)
+from .dashboard import MODEL_IDENTITY_SQL, history_display, snapshot as dashboard_snapshot
 from .qwen_budget import (PROFILE as QWEN64_PROFILE, CONTRACT as QWEN64_CONTRACT,
                           snapshot as qwen64_snapshot, evidence as qwen64_evidence,
                           project as project_qwen64_evidence)
@@ -29,7 +32,7 @@ from .compat import (CompatibilityError, UNCENSORED_EVAL_PROFILES, NEXTCLOUD_PRO
                      validate_shutterstock_video_payload,
                      validate_syncopia_memory_payload, validate_uncensored_eval_payload)
 from .profiles import EVALUATION_PROFILE_NAMES, OPENCLAW_EXECUTOR_PROFILE_NAMES, PROFILES
-from . import nightly_eval, syncopia_daily
+from . import nightly_eval, syncopia_daily, syncopia_summary
 from .profiles import NIGHTLY_PROFILE_NAMES, VOICE_PROFILE_NAMES
 from . import voice
 from .evaluation import normalize_request as normalize_evaluation_request
@@ -62,6 +65,15 @@ LOGGER = logging.getLogger("ollama_inference_broker.audit")
 OBSERVER_READ_DEADLINE_SECONDS = 0.75
 SCHEDULING_HORIZON_SECONDS = 60 * 60
 FORECAST_DEFAULT_EXECUTION_SECONDS = 300.0
+# Source-local model turns; never preempt an attempt already holding the slot.
+MODEL_BATCH_MAX_JOBS = 10
+MODEL_BATCH_MAX_SECONDS = 300.0
+MODEL_BATCH_MAX_WAIT_SECONDS = 600.0
+# Legacy queued rows may lack a model (profile fallback) or valid JSON. Keep
+# this expression identical in the two indexes and their bounded seek queries.
+QUEUED_MODEL_SQL = "CASE WHEN json_valid(payload) THEN json_extract(payload,'$.model') END"
+SOURCE_PRIORITY_SQL = ("CASE WHEN source='nextcloud' AND nextcloud_priority='new_upload' "
+                       "THEN 0 ELSE 1 END")
 MAX_ERROR_SUMMARY_CHARACTERS = 1024
 DASHBOARD_VALIDATOR_INTERVAL_SECONDS = 30.0
 
@@ -284,7 +296,7 @@ class SourcePolicy:
 
 
 class Broker:
-    """One-resource scheduler with FIFO source heads and time-weighted batches."""
+    """One-resource scheduler with source-local heads and time-weighted batches."""
     def __init__(self, database: str | Path, ollama, wol, clock=time.time,
                  lease_seconds=60, *,
                  wal_autocheckpoint_pages=DEFAULT_WAL_AUTOCHECKPOINT_PAGES,
@@ -293,7 +305,10 @@ class Broker:
                  checkpoint_interval_seconds=DEFAULT_CHECKPOINT_INTERVAL_SECONDS,
                  min_free_space_bytes=DEFAULT_MIN_FREE_SPACE_BYTES,
                  source_policy: SourcePolicy | None = None, whisper_executor=None,
-                 asr_release_on_llm_demand=False):
+                 asr_release_on_llm_demand=False, nextcloud_priority=None):
+        if nextcloud_priority is not None and source_policy is None:
+            raise ValueError('Nextcloud priority requires existing source policy')
+        self.nextcloud_priority = nextcloud_priority
         self.ollama, self.wol, self.clock, self.lease_seconds = ollama, wol, clock, lease_seconds
         self.whisper_executor = whisper_executor
         self._asr_ready_after = 0.0
@@ -323,11 +338,15 @@ class Broker:
         # recovery stay in SQLite; a restart simply begins a fresh fair
         # 60-minute allocation from the durable ready queue.
         self._time_cycle: dict[str, Any] | None = None
+        self._model_batches: dict[str, dict[str, Any]] = {}
         self._duration_estimates: dict[tuple[str, str], float] = {}
         # Account attempts independently; completion order need not match claim order.
         self._active_time_batches: dict[str, dict[str, Any]] = {}
         # Immutable copy written under the lock for the lock-free forecast.
         self._scheduler_snapshot: dict[str, Any] | None = None
+        self._nextcloud_forecast_preview = None
+        self._pending_forecast_preview = None
+        self._forecast_publication_pending = False
         self.source_policy = source_policy
         self.wal_autocheckpoint_pages = int(wal_autocheckpoint_pages)
         self.journal_size_limit_bytes = int(journal_size_limit_bytes)
@@ -357,6 +376,8 @@ class Broker:
             min_free_space_bytes=int(min_free_space_bytes),
         )
         self.recover()
+        self._restore_model_batches()
+        self._publish_scheduler_snapshot()
         self.storage.reconcile()
         with self.lock:
             self._refresh_health_cache_locked()
@@ -439,6 +460,13 @@ class Broker:
             )
             self.db.execute("UPDATE jobs SET queued_at=created WHERE queued_at IS NULL")
             self._retire_priority_column()
+            # Source-local metadata, unrelated to retired global priority.
+            # Existing rows remain historical; identities and queue ages survive.
+            if "nextcloud_priority" not in columns:
+                self.db.execute(
+                    "ALTER TABLE jobs ADD COLUMN nextcloud_priority "
+                    "TEXT NOT NULL DEFAULT 'historical'"
+                )
             migrate_storage_schema(
                 self.db,
                 wal_autocheckpoint_pages=self.wal_autocheckpoint_pages,
@@ -482,6 +510,36 @@ class Broker:
                 "CREATE INDEX IF NOT EXISTS jobs_source_state_retry "
                 "ON jobs(source,state,retry_count)"
             )
+            # Additive covering aggregates and bounded forecast seeks.
+            for name, predicate in (("all", ""), ("public", " WHERE " + PUBLIC_JOB_PREDICATE)):
+                self.db.execute(
+                    f"CREATE INDEX IF NOT EXISTS jobs_observer_{name} "
+                    "ON jobs(source,state,retry_count,lease_until)" + predicate)
+            self.db.execute(
+                "CREATE INDEX IF NOT EXISTS audit_observer_windows "
+                "ON audit_events(source,event_type,occurred,producer_storage)")
+            self.db.execute(
+                "CREATE INDEX IF NOT EXISTS audit_scheduler_turns "
+                "ON audit_events(source,sequence DESC) WHERE event_type='scheduler.selected'")
+            self.db.execute(
+                "CREATE INDEX IF NOT EXISTS jobs_observer_heads ON jobs(source,"
+                "CASE WHEN source='nextcloud' AND nextcloud_priority='new_upload' THEN 0 ELSE 1 END,"
+                "queued_at,id) WHERE state='queued'")
+            self.db.execute(
+                "CREATE INDEX IF NOT EXISTS jobs_observer_fifo "
+                "ON jobs(source,queued_at,id) WHERE state='queued'")
+            for name, order in (("heads", "CASE WHEN source='nextcloud' AND nextcloud_priority='new_upload' THEN 0 ELSE 1 END,"), ("fifo", "")):
+                self.db.execute(
+                    f"CREATE INDEX IF NOT EXISTS jobs_observer_public_{name} "
+                    f"ON jobs(source,{order}queued_at,id) WHERE state='queued' AND " + PUBLIC_JOB_PREDICATE)
+            # Enumerate model/profile lanes from compact index entries, then
+            # fetch only a forecast-sized prefix of each. No backlog payload
+            # scan; private rows cannot force public reads through a backlog.
+            for name, public in (("all", ""), ("public", " AND " + PUBLIC_JOB_PREDICATE)):
+                self.db.execute(
+                    f"CREATE INDEX IF NOT EXISTS jobs_model_heads_{name} ON jobs("
+                    f"source,profile,{QUEUED_MODEL_SQL},{SOURCE_PRIORITY_SQL},queued_at,id) "
+                    "WHERE state='queued'" + public)
             # Candidate selection/forecast must not visit queued payload rows.
             self.db.execute(
                 "CREATE INDEX IF NOT EXISTS jobs_queued_candidates "
@@ -608,7 +666,7 @@ class Broker:
         # again automatically: failure releases the scheduler while preserving
         # a durable request for an explicit, audited retry.
         now = self.clock()
-        with self.lock, self.db:
+        with self.lock, self._claim_transaction():
             expired = list(self.db.execute(
                 "SELECT id,source,state,attempt_count FROM jobs "
                 "WHERE state IN ('running','cancel_requested') "
@@ -684,7 +742,8 @@ class Broker:
                source_item_id: str | None = None,
                external_id: str | None = None,
                producer_storage: dict[str, Any] | None = None,
-               model: str | None = None, options: dict | None = None, weight=None) -> dict:
+               model: str | None = None, options: dict | None = None, weight=None,
+               nextcloud_priority: str | None = None) -> dict:
         if profile not in PROFILES:
             raise ValueError("unknown profile")
         if kind not in {"chat", "generate", "transcribe"}:
@@ -696,12 +755,16 @@ class Broker:
                 raise ValueError("ASR requires configured executor, dedicated profile and idempotency key")
             payload = validate_asr_payload(payload)
         source = source or profile
+        nextcloud_priority = self._nextcloud_priority(source, nextcloud_priority)
         if kind == "transcribe" and (model is not None or options is not None):
             raise ValueError("transcription uses its dedicated executor contract")
         if not isinstance(payload, dict):
             raise ValueError("payload must be an object")
         payload = deepcopy(payload)
         legacy_payload = deepcopy(payload)
+        if profile in syncopia_summary.MODELS:
+            # Fail closed on model/mode/budget before generic metadata fallback.
+            syncopia_summary.normalize_request(legacy_payload, profile, model, options)
         requested_model = model if model is not None else payload.get("model")
         if model is not None:
             payload["model"] = model
@@ -723,8 +786,8 @@ class Broker:
         if source == "local-voice" or profile in VOICE_PROFILE_NAMES:
             if source != "local-voice" or profile not in VOICE_PROFILE_NAMES or kind != "transcribe":
                 raise ValueError("voice requires local-voice source, voice profile and transcribe kind")
-            if profile == voice.voice_cpu.PROFILE and (not external_id or not source_item_id):
-                raise ValueError("CPU voice requires durable correlation IDs")
+            if profile in {voice.voice_cpu.PROFILE, voice.diarization.PROFILE} and (not external_id or not source_item_id):
+                raise ValueError("CPU/diarization voice requires durable correlation IDs")
             payload = voice.validate(payload, profile)
         if profile == syncopia_daily.PROFILE:
             if source != syncopia_daily.SOURCE or kind != "chat":
@@ -795,6 +858,10 @@ class Broker:
                 })
             except CompatibilityError as exc:
                 raise ValueError(str(exc)) from exc
+        if profile in syncopia_summary.MODELS:
+            payload = syncopia_summary.prepare(
+                profile, source, kind, legacy_payload, model, options,
+                external_id, source_item_id, producer_storage)
         if profile == "syncopia-memory-qwen38":
             if source != "syncopia-telegram-memory":
                 raise ValueError("Syncopia memory profile must use its dedicated source")
@@ -862,6 +929,14 @@ class Broker:
                             "job retention expired; recover the durable producer artifact"
                         )
                 if existing is not None:
+                    # Native summaries share the memory source, not its legacy
+                    # permissive correlation semantics. Protect both directions
+                    # of a collision with an old/default-model job.
+                    if profile in syncopia_summary.MODELS or existing["profile"] in syncopia_summary.MODELS:
+                        if (existing["profile"] != profile or existing["kind"] != kind
+                                or existing["source_item_id"] != source_item_id
+                                or content_evidence(payload) != (existing["input_hash"], existing["input_bytes"])):
+                            raise ValueError("summary v1 idempotency identity conflict")
                     existing_has_producer_storage = (
                         existing["producer_attempt_id"] is not None
                         or existing["input_storage_mode"] != "broker_temporary"
@@ -902,7 +977,13 @@ class Broker:
                             raise ValueError("idempotency key was used for another request")
                         if source in {"nextcloud", "pilot-mainpc", "local-voice", nightly_eval.SOURCE} and existing["source_item_id"] != source_item_id:
                             raise ValueError("source correlation item conflict")
+                        if source == "nextcloud":
+                            self._promote_nextcloud_locked(existing, nextcloud_priority)
                         return self.status(existing["id"])
+            if profile in syncopia_summary.MODELS:
+                # Existing exact receipts returned above. Only new admissions
+                # depend on live metadata; dispatch still revalidates it too.
+                syncopia_summary.persisted_contract(self.ollama, profile, payload)
             if source == nightly_eval.SOURCE:
                 entry = (self.source_policy.snapshot()["sources"].get(source)
                          if self.source_policy is not None else None)
@@ -948,14 +1029,15 @@ class Broker:
                 "INSERT INTO jobs(id,profile,kind,source,payload,state,created,"
                 "queued_at,source_item_id,external_id,input_storage_mode,input_ref,input_hash,"
                 "input_bytes,result_storage_mode,artifact_schema_version,producer_attempt_id,"
-                "ack_required,legacy_result_fallback) "
-                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                "ack_required,legacy_result_fallback,nextcloud_priority) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (job_id, profile, kind, source, json.dumps(payload), "queued", now,
                  now, source_item_id, external_id, storage_fields["input_storage_mode"],
                  storage_fields["input_ref"], storage_fields["input_hash"],
                  storage_fields["input_bytes"], storage_fields["result_storage_mode"],
                  storage_fields["artifact_schema_version"], storage_fields["producer_attempt_id"],
-                 storage_fields["ack_required"], storage_fields["legacy_result_fallback"]),
+                 storage_fields["ack_required"], storage_fields["legacy_result_fallback"],
+                 nextcloud_priority),
             )
             self.storage.record_admission(job_id, source, storage_fields, now)
             self._audit(
@@ -972,6 +1054,60 @@ class Broker:
             )
             self._refresh_health_cache_locked()
         return self.status(job_id)
+
+    @staticmethod
+    def _nextcloud_priority(source: str, value: str | None) -> str:
+        if value is None:
+            return "historical"
+        if source != "nextcloud" or not isinstance(value, str) or value not in {"historical", "new_upload"}:
+            raise ValueError("nextcloud_priority requires source nextcloud and historical or new_upload")
+        return value
+
+    @staticmethod
+    def nextcloud_capabilities() -> dict:
+        return {
+            "contract": "nextcloud-new-upload-v1", "source": "nextcloud",
+            "submit_field": "nextcloud_priority", "values": ["historical", "new_upload"],
+            "default": "historical", "scope": "within_source_weighted_turn",
+            "requires_source_policy_for_priority": True,
+            "non_preemptive": True, "queued_promotion_only": True,
+            "promotion_endpoint": "/v1/jobs/{id}/nextcloud-priority",
+            "idempotent_promotion": True, "replay_never_demotes": True,
+            "correlation_fields": ["source", "external_id", "source_item_id"],
+        }
+
+    def _promote_nextcloud_locked(self, row, requested: str) -> None:
+        # Caller holds the broker lock and transaction after identity checks.
+        # Repeat/lost-ACK requests cannot create work or reset queue age.
+        if (row["source"] == "nextcloud" and row["state"] == "queued"
+                and requested == "new_upload" and row["nextcloud_priority"] != "new_upload"):
+            self.db.execute(
+                "UPDATE jobs SET nextcloud_priority='new_upload' WHERE id=? AND state='queued'",
+                (row["id"],),
+            )
+            self._audit(
+                "nextcloud.priority_promoted", job_id=row["id"], source="nextcloud",
+                from_state="queued", to_state="queued", occurred=self.clock(),
+                reason="confirmed new upload; source-local queued promotion",
+            )
+
+    def promote_nextcloud(self, job_id: str, body: dict) -> dict | None:
+        """Monotonic queued-only metadata update with exact correlation guards."""
+        if (not isinstance(body, dict) or set(body) != {
+                "source", "external_id", "source_item_id", "nextcloud_priority"}
+                or body["source"] != "nextcloud" or body["nextcloud_priority"] != "new_upload"):
+            raise ValueError("promotion requires exact Nextcloud correlation and new_upload priority")
+        for name in ("external_id", "source_item_id"):
+            if self._correlation_value(name, body[name]) is None:
+                raise ValueError("promotion requires both correlation IDs")
+        with self.lock, self.db:
+            row = self.db.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
+            if row is None:
+                return None
+            if any(row[name] != body[name] for name in ("source", "external_id", "source_item_id")):
+                raise ValueError("Nextcloud promotion correlation conflict")
+            self._promote_nextcloud_locked(row, "new_upload")
+            return self.status(job_id)
 
     @staticmethod
     def _bulk_source(source: str) -> str:
@@ -1101,6 +1237,7 @@ class Broker:
         result = {name: job.get(name) for name in (
             "id", "source", "profile", "kind", "external_id", "source_item_id", "state",
             "created", "queued_at", "started", "finished", "input_hash", "input_bytes",
+            "nextcloud_priority",
         )}
         result["projection"] = "nextcloud-final-v1"
         if job.get("profile") == "nextcloud-eval-qwen":
@@ -1175,10 +1312,15 @@ class Broker:
     def _job(self, row):
         data = dict(row)
         data.pop("priority", None)  # inert historic column is never public
+        if data["source"] != "nextcloud":
+            data.pop("nextcloud_priority", None)
         for field in LEGACY_HIDDEN_STORAGE_FIELDS:
             data.pop(field, None)
         if data["source"] in {"pilot-mainpc", nightly_eval.SOURCE} or data["profile"] in {QWEN64_PROFILE, voice.voice_cpu.PROFILE}:
             # Exact durable client correlation survives terminal payload cleanup.
+            data["input_hash"] = row["input_hash"]
+            data["input_bytes"] = row["input_bytes"]
+        if data["profile"] in syncopia_summary.MODELS:
             data["input_hash"] = row["input_hash"]
             data["input_bytes"] = row["input_bytes"]
         data["payload"] = json.loads(data["payload"])
@@ -1344,6 +1486,8 @@ class Broker:
     @staticmethod
     def _observer_error(error: sqlite3.Error) -> dict[str, str]:
         """Return safe, actionable SQLite observer diagnostics."""
+        if isinstance(error, ForecastSnapshotChanged):
+            return {"reason": str(error), "reason_code": "scheduler_snapshot_changed"}
         sqlite_error = getattr(error, "sqlite_errorname", None)
         if not sqlite_error:
             message = str(error).lower()
@@ -1363,10 +1507,11 @@ class Broker:
             "sqlite_error": sqlite_error,
         }
 
-    def _observer_read(self, reader):
+    def _observer_read(self, reader, *, operation="observer"):
         """Run a bounded read without waiting for the dispatcher connection."""
         connection = None
-        deadline = time.monotonic() + OBSERVER_READ_DEADLINE_SECONDS
+        started = time.monotonic()
+        deadline = started + OBSERVER_READ_DEADLINE_SECONDS
         try:
             connection = sqlite3.connect(
                 self.database, timeout=OBSERVER_READ_DEADLINE_SECONDS,
@@ -1379,8 +1524,12 @@ class Broker:
             connection.set_progress_handler(
                 lambda: int(time.monotonic() >= deadline), 1_000,
             )
+            # A consistent, bounded WAL snapshot; finally closes even on interrupt.
+            connection.execute("BEGIN")
             return reader(connection), None
         except sqlite3.Error as error:
+            LOGGER.warning(json.dumps({"event": "observer.operation_failed",
+                "operation": operation, "elapsed_ms": round((time.monotonic()-started)*1000, 3)}, sort_keys=True))
             return None, self._observer_error(error)
         finally:
             if connection is not None:
@@ -1429,6 +1578,10 @@ class Broker:
         include_producer_storage: bool = True,
     ) -> dict[str, Any]:
         """Projection body; reads only, never writes."""
+        if policy is None and self.nextcloud_priority is not None:
+            policy = self.source_policy  # Same default as dispatch_once.
+        if policy is not None:
+            policy = ForecastPolicy(policy.snapshot())
         bounded = max(1, min(int(limit), 20))
         allowed = None
         if policy is not None:
@@ -1442,24 +1595,70 @@ class Broker:
         # Project that slot release; keep all other hard eligibility checks.
         candidates = self._candidates(
             allowed, db=db, release_running=running is not None,
-            limit_per_source=bounded,
+            limit_per_source=1 if policy is not None else bounded,
             include_producer_storage=include_producer_storage,
+            source_priority=policy is not None,
         )
         snapshot = self._scheduler_snapshot or {}
+        if snapshot.get("committed") is False:
+            raise ForecastSnapshotChanged("scheduler transaction rolled back; projection needs a fresh committed snapshot")
+        anchor = snapshot.get("audit_sequence")
+        if anchor is not None:
+            latest = db.execute("SELECT COALESCE(MAX(sequence),0) FROM audit_events").fetchone()[0]
+            active_ids = tuple((snapshot.get("active_time_batches") or {}).keys())
+            terminal_clause = ""
+            values = (anchor,)
+            if active_ids:
+                terminal_clause = (" OR (event_type IN ('job.completed','job.failed','job.cancelled',"
+                    "'lease.expired') AND job_id IN (" + ",".join("?" for _ in active_ids) + "))")
+                values += active_ids
+            # Range seek from the committed anchor. Admissions do not change
+            # scheduler accounting and must not make the forecast unavailable.
+            changed = db.execute(
+                "SELECT 1 FROM audit_events WHERE sequence>? AND "
+                "(event_type='scheduler.selected'" + terminal_clause + ") LIMIT 1", values).fetchone()
+            if latest < anchor or changed:
+                raise ForecastSnapshotChanged("scheduler snapshot changed during observer read; retry")
+        local_nextcloud = [dict(row) for row in candidates if row["source"] == "nextcloud"]
+        owner_info, observed_nextcloud = None, []
+        if self.nextcloud_priority is not None and local_nextcloud:
+            observed_nextcloud, owner_info = revalidate_owner_preview(
+                db, snapshot.get("nextcloud_forecast"),
+                self._policy_signature(policy) if policy else None,
+                now, include_producer_storage, QUEUED_MODEL_SQL, SOURCE_PRIORITY_SQL,
+                PUBLIC_JOB_PREDICATE)
+            # Never call hold(), read its mutable value, or lazily fetch ungated
+            # successors from the local queue in an observer transaction.
+            candidates = [row for row in candidates if row["source"] != "nextcloud"]
+            observed_nextcloud.sort(key=lambda row: (
+                0 if row["nextcloud_priority"] == "new_upload" else 1,
+                row["queued_at"] if row["queued_at"] is not None else row["created"], row["id"]))
+            seen = set()
+            for row in observed_nextcloud:
+                raw_lane = (row["profile"], row["target_model"])
+                if raw_lane not in seen:
+                    candidates.append(row)
+                    seen.add(raw_lane)
+            candidates.sort(key=lambda row: (
+                row["queued_at"] if row["queued_at"] is not None else row["created"], row["id"]))
         cycle = deepcopy(snapshot.get("time_cycle"))
         estimates = dict(snapshot.get("duration_estimates") or {})
         active_batches = snapshot.get("active_time_batches") or {}
+        batches = deepcopy(snapshot.get("model_batches") or {})
+        projected_now = now
         # The active lease will release before any projected selection.  Its
         # true duration is unknown until completion, so forecast uses the same
         # lane estimate it uses for all subsequent non-preemptive boundaries.
-        if policy is not None and running is not None and cycle:
+        if policy is not None and running is not None:
             for active in active_batches.values():
-                self._record_time_usage(
-                    cycle, tuple(active["lane"]),
-                    self._forecast_duration(tuple(active["lane"]), estimates),
-                )
+                lane = tuple(active["lane"])
+                elapsed = max(0.0, now - float(active["started"]))
+                duration = max(elapsed, self._forecast_duration(lane, estimates))
+                projected_now = now + duration - elapsed
+                self._record_time_usage(cycle, lane, duration, batches, projected_now)
         remaining = [dict(row) for row in candidates]
         selections: list[dict[str, Any]] = []
+        owner_tier_exhausted = False
         for _ in range(bounded):
             if not remaining:
                 break
@@ -1469,8 +1668,13 @@ class Broker:
                 eligible = [picked["source"]]
                 decision: dict[str, Any] = {}
             else:
+                projected_policy = policy
+                if owner_info and any(row["source"] == "nextcloud" for row in remaining):
+                    from .nextcloud_priority import EffectivePolicy
+                    projected_policy = EffectivePolicy(policy, owner_info["effective_weight"])
                 picked, cycle, decision = self._time_batch_pick(
-                    remaining, policy, now, cycle,
+                    remaining, projected_policy, projected_now, cycle, batches,
+                    active_batches={}, reference_cycle=snapshot.get("time_cycle") or {},
                 )
                 if picked is None:
                     break
@@ -1484,18 +1688,37 @@ class Broker:
                 "source": picked["source"],
                 "profile": picked["profile"],
                 "model": self._lane_key(picked)[1],
-                "weight": (policy.weight(picked["source"]) or 1.0) if policy else 1.0,
+                "weight": (projected_policy.weight(picked["source"]) or 1.0) if policy else 1.0,
                 "mode": mode,
                 "reason": reason,
                 "eligible_sources": eligible,
                 "wait_seconds": round(wait, 3),
             })
+            if picked["source"] == "nextcloud":
+                selections[-1]["nextcloud_priority"] = picked["nextcloud_priority"]
             remaining = [row for row in remaining if row["id"] != picked["id"]]
+            if len(selections) < bounded:
+                if owner_info and picked["source"] == "nextcloud":
+                    observed_nextcloud = [row for row in observed_nextcloud if row["id"] != picked["id"]]
+                    successor = next((row for row in observed_nextcloud
+                        if (row["profile"], row["target_model"]) ==
+                           (picked["profile"], picked["target_model"])), None)
+                    owner_tier_exhausted = not observed_nextcloud
+                elif policy is not None:
+                    successor = self._forecast_lane_successor(db, picked, include_producer_storage)
+                else:
+                    successor = None
+                if successor is not None:
+                    remaining.append(dict(successor))
+                    remaining.sort(key=lambda row: (
+                        row["queued_at"] if row["queued_at"] is not None else row["created"], row["id"]))
             if policy is not None:
-                self._record_time_usage(
-                    cycle, lane, self._forecast_duration(lane, estimates),
-                )
-        return {
+                duration = self._forecast_duration(lane, estimates)
+                projected_now += duration
+                self._record_time_usage(cycle, lane, duration, batches, projected_now)
+            if owner_tier_exhausted:
+                break  # The next owner tier/weight cannot be inferred from this read.
+        result = {
             "contingent": True,
             "contingency": (
                 "read-only time-batch projection; non-preemptive boundaries use recent "
@@ -1503,7 +1726,34 @@ class Broker:
             ),
             "current_model": (running["target_model"] or PROFILES[running["profile"]].model) if running else None,
             "next_selections": selections,
+            "dispatch_holds": [],
         }
+        if db.execute("SELECT paused FROM queue_control WHERE id=1").fetchone()[0]:
+            result["dispatch_holds"].append("Queue is paused; projection applies only after resume")
+        if db.execute("SELECT 1 FROM gpu_executor_fences LIMIT 1").fetchone():
+            result["dispatch_holds"].append(
+                "Executor fence exists; projection requires release or confirmed compatible reuse")
+        if owner_info is not None:
+            result["next_selections"] = []  # A scenario is NOT the actual global order.
+            result["owner_gate"] = owner_info
+            result["conditional_scenario"] = {
+                "basis": "last_owner_gate" if observed_nextcloud or any(
+                    r["source"] == "nextcloud" for r in selections) else "nextcloud_excluded",
+                "next_selections": selections,
+                "stop_reason": "owner_recheck_required" if owner_tier_exhausted else None,
+            }
+            result["unranked_candidates"] = [{
+                "job_id": r["id"], "source": r["source"], "profile": r["profile"],
+                "model": self._lane_key(r)[1], "nextcloud_priority": r["nextcloud_priority"],
+            } for r in local_nextcloud[:bounded]]
+            result["contingency"] = (
+                "Conditional scenario, not the actual dispatch order. Based on the last committed "
+                "owner-gate read when available; otherwise other sources only if Nextcloud is excluded. "
+                "Owner eligibility, tier and weight must be rechecked at dispatch. Local Nextcloud "
+                "lane heads below are unranked, not a fallback order. New jobs, owner changes and "
+                "non-preemptive execution durations can change the scenario; no wall-clock ETA."
+            )
+        return result
 
     def dashboard(
         self, policy: SourcePolicy | None = None, *,
@@ -1516,24 +1766,36 @@ class Broker:
             for name, entry in ((policy_snapshot or {}).get("sources") or {}).items()
         }
         now = self.clock()
-        snapshot, error = self._observer_read(
-            lambda db: {
-                **dashboard_snapshot(
+        def read_dashboard(db):
+            timings = {}
+            def stage(name, reader):
+                started = time.monotonic()
+                try:
+                    return reader()
+                finally:
+                    timings[name] = round((time.monotonic()-started)*1000, 3)
+            try:
+                data = stage("snapshot", lambda: dashboard_snapshot(
                     db, now=now, policy_snapshot=policy_snapshot,
-                    include_producer_storage=include_producer_storage,
-                ),
-                "queue_paused": bool(db.execute("SELECT paused FROM queue_control WHERE id=1").fetchone()[0]),
-                "forecast": self._forecast(
-                    db, policy, now, 10,
-                    include_producer_storage=include_producer_storage,
-                ),
-                "history": self._terminal_history(
-                    db, limit=10,
-                    include_producer_storage=include_producer_storage,
-                    source_weights=source_weights,
-                ),
-            }
-        )
+                    include_producer_storage=include_producer_storage))
+                data["queue_paused"] = bool(db.execute("SELECT paused FROM queue_control WHERE id=1").fetchone()[0])
+                try:
+                    data["forecast"] = stage("forecast", lambda: self._forecast(
+                        db, ForecastPolicy(policy_snapshot) if policy_snapshot is not None else None,
+                        now, 10, include_producer_storage=include_producer_storage))
+                except ForecastSnapshotChanged as error:
+                    # The queue snapshot is still live; only the projection
+                    # needs a retry. Do not discard otherwise valid counters.
+                    data["forecast"] = {"contingent": True, "unavailable": True,
+                                        "reason": str(error)}
+                data["history"] = stage("history", lambda: self._terminal_history(
+                    db, limit=10, include_producer_storage=include_producer_storage,
+                    source_weights=source_weights))
+                return data
+            finally:
+                LOGGER.info(json.dumps({"event": "observer.dashboard_timing",
+                    "public": not include_producer_storage, "stages_ms": timings}, sort_keys=True))
+        snapshot, error = self._observer_read(read_dashboard, operation="dashboard")
         if snapshot is not None:
             snapshot["observation"] = self._observation("live", now)
             self._dashboard_cache[include_producer_storage] = snapshot
@@ -1551,18 +1813,26 @@ class Broker:
     ) -> str:
         """Return a cheap validator without running dashboard observer queries."""
         policy_snapshot = policy.snapshot() if policy is not None else None
-        with self.lock:
-            revision = {
-                "database_changes": self.db.total_changes,
-                "include_producer_storage": include_producer_storage,
-                "instance": self._dashboard_instance,
-                "policy": policy_snapshot,
-                # Dashboard windows, delayed state, forecasts, timestamps and
-                # observer availability can change without a database write.
-                # Match the HTML refresh cadence so a cached response is never
-                # reused for more than one 30-second observation interval.
-                "time_epoch": int(self.clock() // DASHBOARD_VALIDATOR_INTERVAL_SECONDS),
-            }
+        # Never queue an HTTP validator behind a long dispatcher transaction.
+        # A busy writer gets an uncacheable unique revision, not a validator
+        # based on uncommitted total_changes and an older reader snapshot.
+        acquired = self.lock.acquire(blocking=False)
+        try:
+            changes = self.db.total_changes if acquired else uuid.uuid4().hex
+        finally:
+            if acquired:
+                self.lock.release()
+        revision = {
+            "database_changes": changes,
+            "include_producer_storage": include_producer_storage,
+            "instance": self._dashboard_instance,
+            "policy": policy_snapshot,
+            # Dashboard windows, delayed state, forecasts, timestamps and
+            # observer availability can change without a database write.
+            # Match the HTML refresh cadence so a cached response is never
+            # reused for more than one 30-second observation interval.
+            "time_epoch": int(self.clock() // DASHBOARD_VALIDATOR_INTERVAL_SECONDS),
+        }
         digest = hashlib.sha256(json.dumps(
             revision, sort_keys=True, separators=(",", ":"),
         ).encode("utf-8")).hexdigest()
@@ -1586,8 +1856,9 @@ class Broker:
             else "jobs_public_terminal_history"
         )
         rows = db.execute(
-            "SELECT id,source,profile,state,created,started,finished,attempt_count,retry_count "
-            f"FROM jobs INDEXED BY {history_index} "
+            "SELECT id,source,profile,state,created,started,finished,attempt_count,retry_count, "
+            + MODEL_IDENTITY_SQL + " "
+            + f"FROM jobs INDEXED BY {history_index} "
             "WHERE state IN ('completed','failed','cancelled') AND finished IS NOT NULL"
             + storage_clause + clause +
             " ORDER BY finished DESC,id DESC LIMIT ?",
@@ -1639,17 +1910,21 @@ class Broker:
         with self.lock:
             rows = self.db.execute(
                 "SELECT id AS job_id,source,profile,state,created,finished,"
-                "source_item_id,external_id FROM jobs WHERE "
+                "source_item_id,external_id,nextcloud_priority FROM jobs WHERE "
                 + " AND ".join(clauses)
                 + " ORDER BY created DESC,id DESC LIMIT ?",
                 (*values, bounded_limit),
             )
-            return [dict(row) for row in rows]
+            result = [dict(row) for row in rows]
+            for job in result:
+                if job["source"] != "nextcloud":
+                    job.pop("nextcloud_priority", None)
+            return result
 
     def _candidates(self, allowed_sources: frozenset[str] | None = None, db=None,
                     release_running: bool = False, limit_per_source: int | None = None,
-                    include_producer_storage: bool = True):
-        """Queued rows eligible now, ordered FIFO.
+                    include_producer_storage: bool = True, source_priority: bool = True):
+        """Eligible rows in global age order; source heads apply local priority.
 
         Per-source concurrency and min-interval backpressure are applied here
         exactly as before; this method returns the full ordered candidate list
@@ -1659,11 +1934,67 @@ class Broker:
         connection = db if db is not None else self.db
         if allowed_sources is not None and not allowed_sources:
             return []
+        if limit_per_source is not None and source_priority:
+            # A prefix per SOURCE cannot reveal a deep competing MODEL lane.
+            # Enumerate raw profile/model identities from the compact expression
+            # index, then seek N rows per raw lane (profiles sharing a model are
+            # merged by _source_heads). This suffices for N exact selections.
+            index = "jobs_model_heads_all" if include_producer_storage else "jobs_model_heads_public"
+            public = "" if include_producer_storage else " AND " + PUBLIC_JOB_PREDICATE
+            sources = sorted(allowed_sources) if allowed_sources is not None else [
+                row[0] for row in connection.execute(
+                    "SELECT DISTINCT source FROM jobs INDEXED BY jobs_state_source WHERE state='queued'")]
+            heads = []
+            for source in sources:
+                for identity in self._queued_model_identities(connection, index, public, source):
+                    heads.extend(connection.execute(
+                        "SELECT id,profile,source,created,queued_at,attempt_count,external_id,source_item_id,"
+                        f"nextcloud_priority,{QUEUED_MODEL_SQL} AS target_model "
+                        f"FROM jobs INDEXED BY {index} WHERE state='queued' AND source=? AND profile=? "
+                        f"AND {QUEUED_MODEL_SQL} IS ?" + public +
+                        f" ORDER BY {SOURCE_PRIORITY_SQL},queued_at,id LIMIT ?",
+                        (source, identity["profile"], identity["target_model"], limit_per_source)))
+            running = dict(connection.execute(
+                "SELECT source,count(*) FROM jobs WHERE state IN ('running','cancel_requested') GROUP BY source"))
+            schedules = dict(connection.execute("SELECT source,next_allowed FROM source_schedules"))
+            now = self.clock()
+            return sorted((row for row in heads
+                if (release_running or running.get(row['source'], 0) < PROFILES[row['profile']].max_concurrency)
+                and (schedules.get(row['source']) is None or schedules[row['source']] <= now)),
+                key=lambda row: (
+                    0 if row["source"] == "nextcloud" and row["nextcloud_priority"] == "new_upload" else 1,
+                    row["queued_at"] if row["queued_at"] is not None else row["created"], row["id"]))
+        if limit_per_source is not None:
+            # Without policy, retain the original bounded FIFO observer path.
+            sources = sorted(allowed_sources) if allowed_sources is not None else [
+                row[0] for row in connection.execute(
+                    "SELECT DISTINCT source FROM jobs INDEXED BY jobs_state_source WHERE state='queued'")]
+            priority = ("CASE WHEN source='nextcloud' AND nextcloud_priority='new_upload' "
+                        "THEN 0 ELSE 1 END,") if source_priority else ""
+            index = "jobs_observer_heads" if source_priority else "jobs_observer_fifo"
+            if not include_producer_storage:
+                index = index.replace("jobs_observer_", "jobs_observer_public_")
+            public = "" if include_producer_storage else " AND " + PUBLIC_JOB_PREDICATE
+            heads = []
+            for source in sources:
+                heads.extend(connection.execute(
+                    "SELECT id,profile,source,created,queued_at,attempt_count,external_id,source_item_id,"
+                    "nextcloud_priority,json_extract(payload,'$.model') AS target_model "
+                    f"FROM jobs INDEXED BY {index} WHERE state='queued' AND source=?" + public +
+                    " ORDER BY " + priority + "queued_at,id LIMIT ?", (source, limit_per_source)))
+            running = dict(connection.execute(
+                "SELECT source,count(*) FROM jobs WHERE state IN ('running','cancel_requested') GROUP BY source"))
+            schedules = dict(connection.execute("SELECT source,next_allowed FROM source_schedules"))
+            now = self.clock()
+            return sorted((row for row in heads
+                if (release_running or running.get(row['source'], 0) < PROFILES[row['profile']].max_concurrency)
+                and (schedules.get(row['source']) is None or schedules[row['source']] <= now)),
+                key=lambda row: (row['queued_at'], row['id']))
         # Scheduler selection never needs payload/result_json.  Keeping this
         # projection narrow for both observers and the real dispatcher avoids
         # materializing every queued request while sorting a large backlog.
         query = (
-            "SELECT id,profile,source,created,queued_at,attempt_count,json_extract(payload, '$.model') AS target_model "
+            "SELECT id,profile,source,created,queued_at,attempt_count,external_id,source_item_id,nextcloud_priority,json_extract(payload, '$.model') AS target_model "
             "FROM jobs INDEXED BY jobs_queued_candidates WHERE state='queued'"
         )
         values: tuple = ()
@@ -1673,17 +2004,7 @@ class Broker:
             values = tuple(sorted(allowed_sources))
         if not include_producer_storage:
             query += " AND " + PUBLIC_JOB_PREDICATE
-        if limit_per_source is not None:
-            query = (
-                "SELECT id,profile,source,created,queued_at,attempt_count,target_model FROM ("
-                "SELECT id,profile,source,created,queued_at,attempt_count,target_model,"
-                "row_number() OVER (PARTITION BY source ORDER BY queued_at,id) AS source_rank "
-                "FROM (" + query + ")"
-                ") WHERE source_rank<=? ORDER BY queued_at,id"
-            )
-            values += (limit_per_source,)
-        else:
-            query += " ORDER BY queued_at, id"
+        query += " ORDER BY queued_at, id"
         now = self.clock()
         running_by_source = dict(connection.execute(
             "SELECT source,count(*) FROM jobs "
@@ -1702,23 +2023,138 @@ class Broker:
         return candidates
 
     @staticmethod
+    def _forecast_lane_successor(connection, picked, include_producer_storage):
+        """Replenish only the raw lane just consumed, with one indexed seek.
+
+        Materializing N rows for EVERY profile/model/source overreads heavily
+        when the forecast can only select N total jobs. One head per raw lane
+        plus at most N-1 replenishments preserves the exact same selection set.
+        """
+        index = "jobs_model_heads_all" if include_producer_storage else "jobs_model_heads_public"
+        public = "" if include_producer_storage else " AND " + PUBLIC_JOB_PREDICATE
+        priority = 0 if picked["source"] == "nextcloud" and picked["nextcloud_priority"] == "new_upload" else 1
+        values = (picked["source"], picked["profile"], picked["target_model"])
+        if picked["queued_at"] is None:  # Legacy NULLs sort before non-NULLs.
+            after = (f" AND ({SOURCE_PRIORITY_SQL}>? OR ({SOURCE_PRIORITY_SQL}=? AND "
+                     "(queued_at IS NOT NULL OR (queued_at IS NULL AND id>?))))")
+            values += (priority, priority, picked["id"])
+        else:
+            after = f" AND ({SOURCE_PRIORITY_SQL},queued_at,id)>(?,?,?)"
+            values += (priority, picked["queued_at"], picked["id"])
+        return connection.execute(
+            "SELECT id,profile,source,created,queued_at,attempt_count,external_id,source_item_id,"
+            f"nextcloud_priority,{QUEUED_MODEL_SQL} AS target_model "
+            f"FROM jobs INDEXED BY {index} WHERE state='queued' AND source=? AND profile=? "
+            f"AND {QUEUED_MODEL_SQL} IS ?" + public + after +
+            f" ORDER BY {SOURCE_PRIORITY_SQL},queued_at,id LIMIT 1", values).fetchone()
+
+    @staticmethod
+    def _queued_model_identities(connection, index, public, source):
+        """Skip-seek distinct raw lanes without GROUP BY scanning the backlog.
+
+        Each seek touches only the next profile/model key in the expression
+        index. NULL model keys represent legacy profile defaults. LIMIT applies
+        before any queued payload is fetched, including on public-only reads.
+        """
+        prefix = f"FROM jobs INDEXED BY {index} WHERE state='queued' AND source=?" + public
+        profile, after_profile = None, ""
+        while True:
+            values = (source,) if profile is None else (source, profile)
+            row = connection.execute(
+                "SELECT profile " + prefix + after_profile + " ORDER BY profile LIMIT 1", values).fetchone()
+            if row is None:
+                return
+            profile = row["profile"]
+            after_model, values = "", (source, profile)
+            while True:
+                identity = connection.execute(
+                    f"SELECT profile,{QUEUED_MODEL_SQL} AS target_model " + prefix +
+                    " AND profile=?" + after_model + f" ORDER BY {QUEUED_MODEL_SQL} LIMIT 1",
+                    values).fetchone()
+                if identity is None:
+                    break
+                yield identity
+                model = identity["target_model"]
+                if model is None:
+                    after_model, values = f" AND {QUEUED_MODEL_SQL} IS NOT NULL", (source, profile)
+                else:
+                    after_model, values = f" AND {QUEUED_MODEL_SQL}>?", (source, profile, model)
+            after_profile = " AND profile>?"
+
+    @staticmethod
     def _lane_key(row) -> tuple[str, str]:
         return (str(row["source"]), (row["target_model"] if "target_model" in row.keys() else json.loads(row["payload"]).get("model")) or PROFILES[row["profile"]].model)
 
     @staticmethod
     def _source_heads(candidates) -> dict[tuple[str, str], Any]:
-        """Return exactly one FIFO-eligible job for each source/model lane.
+        """FIFO heads of all actual-model lanes, after source-local priority.
 
-        A source's oldest eligible row is its only dispatchable head.  This is
-        important when one source has jobs targeting different models: model
-        affinity must not let a younger job overtake that source's FIFO head.
+        Nextcloud's new-upload class is strict: historical lanes are invisible
+        while any eligible new upload remains. The external owner gate runs
+        before this routine on the dispatch path.
         """
-        heads_by_source: dict[str, Any] = {}
+        new_upload = any(row["source"] == "nextcloud"
+                         and row["nextcloud_priority"] == "new_upload" for row in candidates)
+        heads: dict[tuple[str, str], Any] = {}
         for row in candidates:
-            heads_by_source.setdefault(row["source"], row)
-        return {
-            Broker._lane_key(row): row for row in heads_by_source.values()
-        }
+            if (new_upload and row["source"] == "nextcloud"
+                    and row["nextcloud_priority"] != "new_upload"):
+                continue
+            heads.setdefault(Broker._lane_key(row), row)
+        return heads
+
+    def _restore_model_batches(self) -> None:
+        """Resume source-local turns from existing transactional claim evidence.
+
+        No new state table or queue rewrite. Only the latest selected event's
+        metadata and its attempt are fetched per backlogged source. Finding the
+        latest sequence uses a bounded source/sequence seek, not a history scan;
+        sequence (not wall clock) remains authoritative after a clock adjustment.
+        Source execution-time budgets still start afresh on process restart.
+        """
+        sources = self.db.execute(
+            "SELECT DISTINCT source FROM jobs INDEXED BY jobs_state_source "
+            "WHERE state IN ('queued','running','cancel_requested')").fetchall()
+        for (source,) in sources:
+            row = self.db.execute(
+                "SELECT metadata_json,job_id,attempt_no FROM audit_events "
+                "INDEXED BY audit_scheduler_turns WHERE source=? AND event_type='scheduler.selected' "
+                "ORDER BY sequence DESC LIMIT 1", (source,)).fetchone()
+            if row is None:
+                continue
+            try:
+                turn = json.loads(row["metadata_json"]).get("model_batch")
+                if not turn or turn.get("version") != 1:
+                    continue
+                # Internal persisted evidence, nevertheless refuse malformed state.
+                if (not isinstance(turn.get("model"), str)
+                        or not isinstance(turn.get("order"), list)
+                        or not all(isinstance(model, str) for model in turn["order"])
+                        or not isinstance(turn.get("waiting_since"), dict)
+                        or not all(isinstance(model, str) and isinstance(value, (int, float))
+                                   and math.isfinite(value)
+                                   for model, value in turn["waiting_since"].items())
+                        or not isinstance(turn.get("jobs"), int) or turn["jobs"] < 1
+                        or not isinstance(turn.get("seconds"), (int, float))
+                        or not math.isfinite(turn["seconds"]) or turn["seconds"] < 0):
+                    continue
+                attempt = self.db.execute(
+                    "SELECT started,finished FROM job_attempts WHERE job_id=? AND attempt_no=?",
+                    (row["job_id"], row["attempt_no"])).fetchone()
+                if attempt is not None and attempt["started"] is not None:
+                    # An unconfirmed attempt cannot buy a new model-time slice.
+                    finished = attempt["finished"]
+                    turn["seconds"] += (max(0.0, finished - attempt["started"])
+                                        if finished is not None else MODEL_BATCH_MAX_SECONDS)
+                    turn["waiting_since"][turn["model"]] = (
+                        finished if finished is not None else self.clock())
+                else:
+                    # Missing attempt evidence is not proof of zero runtime.
+                    turn["seconds"] += MODEL_BATCH_MAX_SECONDS
+                    turn["waiting_since"][turn["model"]] = self.clock()
+                self._model_batches[source] = turn
+            except (TypeError, ValueError, AttributeError):
+                continue
 
     @staticmethod
     def _policy_signature(policy: SourcePolicy) -> tuple[tuple[str, float], ...]:
@@ -1729,199 +2165,204 @@ class Broker:
             if entry.get("enabled", True)
         )
 
+    def _model_source_heads(self, candidates, batches, now):
+        """One rotating model head per source; rotation spends no source share."""
+        lanes = self._source_heads(candidates)
+        by_source: dict[str, list[tuple[str, str]]] = {}
+        for key in lanes:
+            by_source.setdefault(key[0], []).append(key)
+        available, reasons = {}, {}
+        for source, keys in by_source.items():
+            ready = {key[1] for key in keys}
+            turn = batches.setdefault(source, {
+                "version": 1, "model": None, "jobs": 0, "seconds": 0.0,
+                "order": [], "waiting_since": {},
+            })
+            # A finite FIFO of ready model turns, not oldest-job competition.
+            # New models join at the tail, so they cannot repeatedly overtake an
+            # already-waiting third model.
+            turn["order"] = list(dict.fromkeys(m for m in turn["order"] if m in ready))
+            turn["waiting_since"] = {
+                m: value for m, value in turn["waiting_since"].items() if m in ready}
+            for key in keys:  # candidates/heads are in FIFO order
+                model = key[1]
+                if model not in turn["order"]:
+                    # The active model is parked at the tail for its NEXT turn.
+                    # A newcomer joins after existing waiters, before that turn.
+                    if turn["model"] in turn["order"]:
+                        turn["order"].insert(turn["order"].index(turn["model"]), model)
+                    else:
+                        turn["order"].append(model)
+                head = lanes[key]
+                queued_at = head["queued_at"] if head["queued_at"] is not None else head["created"]
+                # First observation may follow a long attempt in another
+                # source. That waiting time is real, not a fresh wait budget.
+                turn["waiting_since"].setdefault(model, min(now, queued_at))
+            current = turn["model"]
+            others = [model for model in turn["order"] if model != current]
+            reason = "model affinity"
+            if current not in ready:
+                model, reason = turn["order"][0], "ready model turn"
+            elif others and turn["jobs"] >= MODEL_BATCH_MAX_JOBS:
+                model, reason = others[0], "model job limit"
+            elif others and turn["seconds"] >= MODEL_BATCH_MAX_SECONDS:
+                model, reason = others[0], "model execution-time limit"
+            elif others and any(now - turn["waiting_since"][m] >= MODEL_BATCH_MAX_WAIT_SECONDS
+                                for m in others):
+                model, reason = others[0], "competing model wait limit"
+            else:
+                model = current
+            available[source] = lanes[(source, model)]
+            reasons[source] = reason
+        return available, reasons
+
     @staticmethod
-    def _lane_order(lanes: dict[tuple[str, str], dict[str, Any]]) -> list[tuple[str, str]]:
-        """Order full model blocks, then source/model lanes within a block."""
-        model_totals: dict[str, float] = {}
-        model_oldest: dict[str, tuple[float, str]] = {}
-        for key, lane in lanes.items():
-            source, model = key
-            model_totals[model] = model_totals.get(model, 0.0) + 1.0 / lane["weight"]
-            candidate_key = (lane["queued_at"], source)
-            if model not in model_oldest or candidate_key < model_oldest[model]:
-                model_oldest[model] = candidate_key
-        models = sorted(
-            model_totals,
-            key=lambda model: (-model_totals[model], model_oldest[model], model),
-        )
-        order: list[tuple[str, str]] = []
-        for model in models:
-            order.extend(sorted(
-                (key for key in lanes if key[1] == model),
-                key=lambda key: (lanes[key]["weight"], lanes[key]["queued_at"], key[0]),
-            ))
-        return order
+    def _lane_order(available, sources) -> list[str]:
+        """Order model blocks with exactly one reciprocal-weight vote per source."""
+        totals: dict[str, float] = {}
+        oldest: dict[str, tuple[float, str]] = {}
+        for source, row in available.items():
+            model = Broker._lane_key(row)[1]
+            totals[model] = totals.get(model, 0.0) + 1.0 / sources[source]["weight"]
+            age = (sources[source]["queued_at"], source)
+            oldest[model] = min(age, oldest.get(model, age))
+        models = sorted(totals, key=lambda model: (-totals[model], oldest[model], model))
+        return [source for model in models for source in sorted(
+            (s for s in available if Broker._lane_key(available[s])[1] == model),
+            key=lambda s: (sources[s]["weight"], sources[s]["queued_at"], s))]
 
-    def _new_time_cycle(
-        self,
-        available: dict[tuple[str, str], Any],
-        policy: SourcePolicy,
-        now: float,
-        previous: dict[str, Any] | None = None,
-        *,
-        preserve_current: bool = False,
-    ) -> dict[str, Any]:
-        """Create/rebase a cycle from ready model/source FIFO heads.
-
-        Budgets are measured in actual claimed-job execution seconds.  When a
-        new lane becomes ready mid-cycle, only the *remaining* horizon is
-        divided again; execution already charged to a previous lane is never
-        erased.  That makes an empty lane work-conserving without allowing a
-        reactivated lane to wait forever.
-        """
+    def _new_time_cycle(self, available, policy, now, previous=None, *,
+                        preserve_current=False, active_batches=None, reference_cycle=None):
+        """Allocate remaining execution time to sources, never to model lanes."""
         previous = previous or {}
-        total_used = min(
-            SCHEDULING_HORIZON_SECONDS, float(previous.get("total_used", 0.0)),
-        )
+        total_used = max(0.0, float(previous.get("total_used", 0.0)))
         remaining = max(0.0, SCHEDULING_HORIZON_SECONDS - total_used)
-        weights = {
-            key: float(policy.weight(row["source"]) or 1.0)
-            for key, row in available.items()
-        }
-        weight_total = sum(1.0 / weight for weight in weights.values())
-        old_lanes = previous.get("lanes", {})
-        lanes: dict[tuple[str, str], dict[str, Any]] = {}
-        for key, row in available.items():
-            used = float(old_lanes.get(key, {}).get("used", 0.0))
-            lanes[key] = {
-                "source": key[0],
-                "model": key[1],
-                "weight": weights[key],
+        weights = {source: float(policy.weight(source) or 1.0) for source in available}
+        total_weight = sum(1.0 / weight for weight in weights.values())
+        old_sources = previous.get("sources", {})
+        sources = {}
+        for source, row in available.items():
+            used = float(old_sources.get(source, {}).get("used", 0.0))
+            budget = used + (remaining / weights[source] / total_weight if total_weight else 0.0)
+            if previous and remaining <= 1e-9:
+                # An overlong non-preemptive job must not reset the horizon
+                # before other ready sources receive their owed turn. A newly
+                # ready source gets one indivisible attempt in this case.
+                budget = max(budget, old_sources.get(source, {}).get("budget", used + 1e-6))
+            sources[source] = {
+                "weight": weights[source],
                 "queued_at": row["queued_at"] if row["queued_at"] is not None else row["created"],
                 "used": used,
-                "budget": used + (remaining / weights[key] / weight_total if weight_total else 0.0),
+                "budget": budget,
             }
-        # An in-flight lane can disappear from the ready queue before its
-        # attempt finishes. Retain its accounting record until completion.
-        for active in self._active_time_batches.values():
-            key = tuple(active["lane"])
-            if key not in lanes and key in old_lanes:
-                lanes[key] = dict(old_lanes[key], accounting_only=True)
-            elif key not in lanes and not previous:
-                # A fresh horizon must still charge attempts begun in the
-                # preceding horizon when they eventually complete.
-                old = (getattr(self, "_time_cycle", None) or {}).get("lanes", {}).get(key)
+        # Preserve accounting for independently completing attempts even when
+        # their source disappears from the ready queue. The single-slot
+        # dispatcher remains exclusive; this also preserves its future-safe
+        # completion accounting seam used by the occupancy regressions.
+        for active in (self._active_time_batches if active_batches is None else active_batches).values():
+            source = active["lane"][0]
+            if source not in sources and source in old_sources:
+                sources[source] = dict(old_sources[source], accounting_only=True)
+            elif source not in sources and not previous:
+                reference = (self._time_cycle or {}) if reference_cycle is None else reference_cycle
+                old = reference.get("sources", {}).get(source)
                 if old is not None:
-                    lanes[key] = dict(old, used=0.0, budget=0.0, accounting_only=True)
+                    sources[source] = dict(old, used=0.0, budget=0.0, accounting_only=True)
         current = previous.get("current") if preserve_current else None
-        if current not in lanes:
-            current = None
         return {
             "started_at": previous.get("started_at", now),
-            "signature": self._policy_signature(policy),
-            "total_used": total_used,
-            "lanes": lanes,
-            "order": self._lane_order(lanes),
-            "current": current,
+            "signature": self._policy_signature(policy), "total_used": total_used,
+            "sources": sources, "order": self._lane_order(available, sources),
+            "current": current if current in sources else None,
         }
 
     @staticmethod
     def _budget_remaining(lane: dict[str, Any]) -> bool:
-        # A tiny tolerance avoids treating a floating-point round-off as a
-        # distinct dispatchable time slice.
         return lane["used"] + 1e-9 < lane["budget"]
 
-    def _time_batch_pick(
-        self,
-        candidates,
-        policy: SourcePolicy,
-        now: float,
-        cycle: dict[str, Any] | None = None,
-    ) -> tuple[Any | None, dict[str, Any] | None, dict[str, Any]]:
-        """Select a source FIFO head using contiguous weighted time batches."""
-        available = self._source_heads(candidates)
+    def _time_batch_pick(self, candidates, policy: SourcePolicy, now: float,
+                         cycle=None, batches=None, *, active_batches=None, reference_cycle=None):
+        """Select a weighted source, then its bounded FIFO model turn."""
+        if batches is None:
+            batches = self._model_batches
+        available, reasons = self._model_source_heads(candidates, batches, now)
         if not available:
             return None, cycle, {}
         signature = self._policy_signature(policy)
-        existing_lanes = (cycle or {}).get("lanes", {})
-        new_lanes = {key for key in available
-                     if key not in existing_lanes or existing_lanes[key].get("accounting_only")}
+        existing = (cycle or {}).get("sources", {})
+        new_sources = {source for source in available
+                       if source not in existing or existing[source].get("accounting_only")}
         current = (cycle or {}).get("current")
-        # Admission is a non-preemptive boundary, not a redistribution of the
-        # leftover hour inside an unchanged model batch. A more important new
-        # lane joins immediately if compatible; otherwise finish exactly one
-        # queued turn of the current model before beginning its own batch.
-        lower_arrival = (
-            cycle is not None and current in cycle["lanes"]
-            and any(policy.weight(key[0]) < cycle["lanes"][current]["weight"]
-                    for key in new_lanes)
-        )
+        # Keep the established non-preemptive lower-weight admission boundary.
+        # A new model in an existing source is NOT a new budget or admission.
+        lower_arrival = (cycle is not None and current in existing
+                         and any(policy.weight(s) < existing[current]["weight"] for s in new_sources))
         if lower_arrival:
-            newcomers = [key for key in new_lanes
-                         if policy.weight(key[0]) < cycle["lanes"][current]["weight"]]
-            first = min(newcomers, key=lambda key: (
-                policy.weight(key[0]), available[key]["created"], key))
-            # An overlong active turn must not suppress same-model insertion.
-            previous = cycle if cycle["total_used"] < SCHEDULING_HORIZON_SECONDS else None
-            cycle = self._new_time_cycle(available, policy, now, previous)
+            first = min((s for s in new_sources if policy.weight(s) < existing[current]["weight"]),
+                        key=lambda s: (policy.weight(s), available[s]["created"], s))
+            current_model = batches[current]["model"]
+            cycle = self._new_time_cycle(available, policy, now, cycle, active_batches=active_batches, reference_cycle=reference_cycle)
             cycle["current"] = first
-            if first[1] != current[1] and current in available:
-                cycle["boundary_lane"] = current
-        elif cycle is None or cycle.get("total_used", 0.0) >= SCHEDULING_HORIZON_SECONDS:
-            cycle = self._new_time_cycle(available, policy, now)
+            if self._lane_key(available[first])[1] != current_model and current in available:
+                cycle["boundary_source"] = current
+        elif cycle is None:
+            cycle = self._new_time_cycle(available, policy, now, active_batches=active_batches, reference_cycle=reference_cycle)
         elif cycle.get("signature") != signature:
-            cycle = self._new_time_cycle(available, policy, now, cycle)
-        elif new_lanes:
-            cycle = self._new_time_cycle(
-                available, policy, now, cycle, preserve_current=True,
-            )
+            cycle = self._new_time_cycle(available, policy, now, cycle, active_batches=active_batches, reference_cycle=reference_cycle)
+        elif new_sources:
+            cycle = self._new_time_cycle(available, policy, now, cycle, preserve_current=True, active_batches=active_batches, reference_cycle=reference_cycle)
 
-        boundary = cycle.pop("boundary_lane", None)
-        # The admission boundary leaves the new lane current for the next pick.
-        selected_key = boundary if boundary in available else cycle.get("current")
+        boundary = cycle.pop("boundary_source", None)
+        selected_source = boundary if boundary in available else cycle.get("current")
         if boundary not in available and (
-            selected_key not in available
-            or selected_key not in cycle["lanes"]
-            or not self._budget_remaining(cycle["lanes"][selected_key])
+            selected_source not in available or selected_source not in cycle["sources"]
+            or not self._budget_remaining(cycle["sources"][selected_source])
         ):
-            selected_key = next(
-                (
-                    key for key in cycle["order"]
-                    if key in available and self._budget_remaining(cycle["lanes"][key])
-                ),
-                None,
-            )
-        if selected_key is None:
-            # All ready planned lanes exhausted their allocations, or planned
-            # lanes are empty.  Start the next horizon from what is ready so
-            # no GPU time is intentionally left idle.
-            cycle = self._new_time_cycle(available, policy, now)
-            selected_key = next(
-                key for key in cycle["order"] if key in available
-            )
-
+            selected_source = next((s for s in cycle["order"] if s in available
+                                    and self._budget_remaining(cycle["sources"][s])), None)
+        if selected_source is None:
+            cycle = self._new_time_cycle(available, policy, now, active_batches=active_batches, reference_cycle=reference_cycle)
+            selected_source = cycle["order"][0]
         if boundary not in available:
-            cycle["current"] = selected_key
-        selected = available[selected_key]
-        lane = cycle["lanes"][selected_key]
-        eligible_sources = sorted({row["source"] for row in available.values()})
+            cycle["current"] = selected_source
+        selected = available[selected_source]
+        model = self._lane_key(selected)[1]
+        turn = batches[selected_source]
+        if model != turn["model"]:
+            turn.update(model=model, jobs=0, seconds=0.0)
+            turn["order"].remove(model)
+            turn["order"].append(model)
+        turn["jobs"] += 1
+        turn["waiting_since"][model] = now
+        source_budget = cycle["sources"][selected_source]
         decision = {
             "mode": "time_batch",
-            "reason": "60-minute reciprocal-weight model batch; lower weight gets more time",
-            "eligible_sources": eligible_sources,
-            "active_weights": {
-                source: weight for source, weight in self._policy_signature(policy)
-            },
-            "selected_source": selected["source"],
-            "selected_model": selected_key[1],
+            "reason": "reciprocal source-time budget; " + reasons[selected_source],
+            "eligible_sources": sorted(available),
+            "active_weights": dict(self._policy_signature(policy)),
+            "selected_source": selected_source, "selected_model": model,
             "horizon_seconds": SCHEDULING_HORIZON_SECONDS,
-            "time_budget_seconds": round(lane["budget"], 6),
-            "time_used_seconds": round(lane["used"], 6),
+            "time_budget_seconds": round(source_budget["budget"], 6),
+            "time_used_seconds": round(source_budget["used"], 6),
+            "model_batch": deepcopy(turn),
+            "model_batch_limits": {"jobs": MODEL_BATCH_MAX_JOBS,
+                                   "execution_seconds": MODEL_BATCH_MAX_SECONDS,
+                                   "wait_seconds": MODEL_BATCH_MAX_WAIT_SECONDS},
         }
         return selected, cycle, decision
 
     @staticmethod
-    def _record_time_usage(
-        cycle: dict[str, Any] | None,
-        lane_key: tuple[str, str],
-        elapsed: float,
-    ) -> None:
-        if cycle is None or lane_key not in cycle.get("lanes", {}):
-            return
+    def _record_time_usage(cycle, lane_key, elapsed, batches=None, finished=None) -> None:
         charged = max(0.0, float(elapsed))
-        lane = cycle["lanes"][lane_key]
-        lane["used"] += charged
-        cycle["total_used"] += charged
+        source = lane_key[0]
+        if cycle is not None and source in cycle.get("sources", {}):
+            cycle["sources"][source]["used"] += charged
+            cycle["total_used"] += charged
+        turn = (batches or {}).get(source)
+        if turn is not None and turn["model"] == lane_key[1]:
+            turn["seconds"] += charged
+            if finished is not None:
+                turn["waiting_since"][lane_key[1]] = finished
 
     @staticmethod
     def _forecast_duration(
@@ -1930,9 +2371,16 @@ class Broker:
         return max(1.0, float(estimates.get(lane_key, FORECAST_DEFAULT_EXECUTION_SECONDS)))
 
     def _publish_scheduler_snapshot(self) -> None:
+        if getattr(self, "_forecast_publication_pending", False):
+            return  # Neither a post-selection cycle nor a completion is committed yet.
+        anchor = (self.db.execute("SELECT COALESCE(MAX(sequence),0) FROM audit_events").fetchone()[0]
+                  if hasattr(self, "db") else None)
         self._scheduler_snapshot = {
+            "committed": True, "audit_sequence": anchor,
+            "nextcloud_forecast": getattr(self, "_nextcloud_forecast_preview", None),
             "time_cycle": deepcopy(self._time_cycle),
             "duration_estimates": dict(self._duration_estimates),
+            "model_batches": deepcopy(self._model_batches),
             "active_time_batches": deepcopy(self._active_time_batches),
             "last": dict(self._last_scheduler_decision)
             if getattr(self, "_last_scheduler_decision", None) else None,
@@ -1945,23 +2393,81 @@ class Broker:
             return
         lane = tuple(active["lane"])
         elapsed = max(0.0, float(finished) - float(active["started"]))
-        self._record_time_usage(self._time_cycle, lane, elapsed)
+        self._record_time_usage(self._time_cycle, lane, elapsed, self._model_batches, finished)
         previous = self._duration_estimates.get(lane)
         self._duration_estimates[lane] = (
             elapsed if previous is None else ((previous + elapsed) / 2.0)
         )
         self._publish_scheduler_snapshot()
 
+    def _prepare_owner_forecast(self, candidates, signature, selected_id=None):
+        # Forecast evidence is optional. A malformed preview must not prevent
+        # an otherwise valid durable claim or alter the real owner decision.
+        try:
+            self._pending_forecast_preview = capture_owner_preview(
+                candidates, self.nextcloud_priority, signature, self.clock(), selected_id)
+        except (KeyError, TypeError, ValueError) as error:
+            self._pending_forecast_preview = {
+                "state": "capture_failed", "observed_at": self.clock(), "rows": ()}
+            LOGGER.warning(json.dumps({"event": "forecast.owner_preview_failed",
+                                       "error_type": type(error).__name__}, sort_keys=True))
+
+    @contextmanager
+    def _claim_transaction(self):
+        """Publish scheduler/owner evidence only after claim OR completion commits."""
+        previous = self._scheduler_snapshot
+        rollback_state = deepcopy((self._time_cycle, self._model_batches,
+            self._active_time_batches, self._duration_estimates,
+            getattr(self, "_last_scheduler_decision", None)))
+        self._pending_forecast_preview = None
+        self._forecast_publication_pending = True
+        try:
+            with self.db:
+                yield
+        except BaseException:
+            # SQLite rolled back: do not later republish phantom claims/time
+            # charges as committed, or spend a turn that never durably ran.
+            (self._time_cycle, self._model_batches, self._active_time_batches,
+             self._duration_estimates, self._last_scheduler_decision) = rollback_state
+            self._nextcloud_forecast_preview = {
+                "state": "transaction_failed", "observed_at": self.clock(), "rows": ()}
+            self._scheduler_snapshot = dict(previous or {}, committed=False,
+                nextcloud_forecast=self._nextcloud_forecast_preview)
+            raise
+        else:
+            if self._pending_forecast_preview is not None:
+                self._nextcloud_forecast_preview = self._pending_forecast_preview
+            self._forecast_publication_pending = False
+            try:
+                self._publish_scheduler_snapshot()
+            except Exception as error:
+                # Committed jobs must still execute if optional observation
+                # publication fails. Never roll back or repeat a real claim.
+                self._scheduler_snapshot = dict(previous or {}, committed=False)
+                LOGGER.warning(json.dumps({"event": "forecast.publication_failed",
+                                           "error_type": type(error).__name__}, sort_keys=True))
+        finally:
+            self._forecast_publication_pending = False
+            self._pending_forecast_preview = None
+
     def _next(self, allowed_sources: frozenset[str] | None = None, policy: SourcePolicy | None = None):
         # Without policy, retain the durable global FIFO compatibility path.
-        # With policy, dispatch source FIFO heads in contiguous target-model
-        # batches charged against a recurring 60-minute execution horizon.
+        # With policy, one time budget per source, then bounded actual-model
+        # turns, FIFO within each lane. Without policy global FIFO is unchanged.
         if policy is not None and allowed_sources is None:
             allowed_sources = policy.enabled_sources()
         candidates = self._candidates(allowed_sources)
+        base_signature = self._policy_signature(policy) if policy else None
+        if self.nextcloud_priority is not None:
+            from .nextcloud_priority import EffectivePolicy
+            candidates, weight = self.nextcloud_priority.candidates(candidates)
+            if policy is not None and weight is not None:
+                policy = EffectivePolicy(policy, weight)
         if not candidates:
+            if self.nextcloud_priority is not None:
+                self._prepare_owner_forecast([], base_signature)
             self._last_scheduler_decision = None
-            self._scheduler_snapshot = None
+            self._publish_scheduler_snapshot()
             return None
         if policy is None:
             selected = candidates[0]
@@ -1976,8 +2482,12 @@ class Broker:
             )
             if selected is None:
                 self._last_scheduler_decision = None
-                self._scheduler_snapshot = None
+                self._publish_scheduler_snapshot()
                 return None
+        if selected["source"] == "nextcloud":
+            decision["nextcloud_priority"] = selected["nextcloud_priority"]
+        if self.nextcloud_priority is not None:
+            self._prepare_owner_forecast(candidates, base_signature, selected["id"])
         self._last_scheduler_decision = dict(decision)
         self._publish_scheduler_snapshot()
         return selected
@@ -2053,6 +2563,8 @@ class Broker:
         return False
 
     def dispatch_once(self, allowed_sources: frozenset[str] | None = None, policy: SourcePolicy | None = None, drain_check: bool = False) -> bool:
+        if self.nextcloud_priority is not None and policy is None:
+            policy = self.source_policy
         with self.lock:
             if drain_check:
                 return bool(self.db.execute("SELECT 1 FROM jobs WHERE state IN ('running','cancel_requested') LIMIT 1").fetchone())
@@ -2133,7 +2645,8 @@ class Broker:
                 permitted = (allowed_sources if allowed_sources is not None else
                              policy.enabled_sources() if policy is not None else queued_sources)
                 allowed_sources = permitted - {ASR_PROFILE}
-        with self.lock, self.db:
+        from contextlib import nullcontext
+        with self.lock, (self.nextcloud_priority.hold(self.db) if self.nextcloud_priority is not None else nullcontext()), self._claim_transaction():
             if self.queue_paused():
                 return False
             if self.executor_fence() != fence:
@@ -2207,7 +2720,7 @@ class Broker:
         try:
             self._execute(execution_row)
         except Exception as exc:
-            with self.lock, self.db:
+            with self.lock, self._claim_transaction():
                 finished = self.clock()
                 error_summary = ("nightly execution failed; no raw executor detail retained"
                                  if row["source"] == nightly_eval.SOURCE else voice.safe_error_summary(exc) if execution_row["kind"] == "transcribe" else bounded_error_summary(exc))
@@ -2249,6 +2762,14 @@ class Broker:
             if (row["source"] != syncopia_daily.SOURCE or row["kind"] != "chat"
                     or syncopia_daily.normalize_request(payload) != payload):
                 raise ValueError("daily capacity persisted contract drift")
+        summary_evidence = None
+        if row["profile"] in syncopia_summary.MODELS:
+            payload = json.loads(row["payload"])
+            if row["source"] != syncopia_summary.SOURCE or row["kind"] != "chat":
+                raise ValueError("summary v1 persisted source/kind drift")
+            if content_evidence(payload) != (row["input_hash"], row["input_bytes"]):
+                raise ValueError("summary v1 persisted input identity drift")
+            summary_evidence = syncopia_summary.persisted_contract(self.ollama, row["profile"], payload)
         if profile.executor == "voice":
             if row["profile"] == voice.voice_cpu.PROFILE:
                 import base64
@@ -2313,6 +2834,8 @@ class Broker:
         request = {k: v for k, v in payload.items() if k not in {"model", "keep_alive"}}
         if nightly_evidence is not None:
             request.pop("native_thinking", None)
+        if summary_evidence is not None:
+            request.pop("summary_contract", None)
         request.update({"model": profile.model, "stream": False, "options": options,
                         "keep_alive": f"{profile.keep_alive_seconds}s"})
         request["_broker_timeout_seconds"] = profile.request_timeout_seconds
@@ -2332,11 +2855,14 @@ class Broker:
             result = nightly_eval.project_result(result, profile.model)
             result["execution_evidence"] = nightly_eval.project_evidence(
                 dict(nightly_evidence, runtime_context_length=context))
+        if summary_evidence is not None:
+            result = dict(result, execution_evidence=syncopia_summary.execution_evidence(
+                self.ollama, row["profile"], payload, result))
         self._finish_execution(row, result, reason)
 
     def _finish_execution(self, row, result, reason):
         result_json = json.dumps(result)
-        with self.lock, self.db:
+        with self.lock, self._claim_transaction():
             state = self.db.execute("SELECT state FROM jobs WHERE id=?", (row["id"],)).fetchone()[0]
             final = "cancelled" if state == "cancel_requested" else "completed"
             finished = self.clock()
@@ -2481,3 +3007,4 @@ class Dispatcher(threading.Thread):
             else:
                 self.broker.dispatch_once(allowed, policy)
             self.stop_event.wait(self.interval)
+

@@ -1,6 +1,9 @@
 "use strict";
 
 const byId = id => document.getElementById(id);
+// Bound network stalls too; serialization must not freeze forever on a lost response.
+const readOptions = () => ({cache: 'no-cache',
+  ...(typeof AbortSignal !== 'undefined' && AbortSignal.timeout ? {signal: AbortSignal.timeout(10000)} : {})});
 const display = value => value == null ? '—' : String(value);
 
 function cell(value, compact = false, sortValue = null) {
@@ -128,9 +131,9 @@ function renderDashboard(data) {
       cell(item.completed_last_hour), cell(item.completed_last_24_hours), bulkCell(item.source, states)]);
   }), 15);
   fillBody('active-body', data.active_jobs.map(item => row([
-    cell(item.id, true), cell(item.source), cell(item.weight), cell(item.state),
+    cell(item.id, true), cell(item.source), cell(item.model), cell(item.weight), cell(item.state),
     timestamp(cell(null), item.started), timestamp(cell(null), item.lease_until),
-    cell(item.attempt_count, true), cell(item.retry_count)])), 8);
+    cell(item.attempt_count, true), cell(item.retry_count)])), 9);
   const pause = byId('queue-pause');
   pause.dataset.paused = String(Boolean(data.queue_paused));
   pause.textContent = data.queue_paused ? 'Resume queue' : 'Pause queue';
@@ -142,15 +145,41 @@ function renderDashboard(data) {
     byId('forecast-live').hidden = Boolean(forecast.unavailable);
     byId('forecast-error').textContent = 'Forecast unavailable: ' + (forecast.reason || 'observer read failed') + '.';
     byId('current-model').textContent = display(forecast.current_model);
-    byId('contingency').textContent = (forecast.contingency || '') + '.';
-    fillBody('forecast-body', (forecast.next_selections || []).map(item => row([
+    byId('contingency').textContent = forecast.contingency || '';
+    const scenario = forecast.conditional_scenario;
+    const owner = forecast.owner_gate || {};
+    let basis = 'Read-only projection — not a promise of dispatch time or order';
+    if (scenario) {
+      basis = scenario.basis === 'last_owner_gate' ?
+        'Conditional scenario: based on last owner-gate read — not a live Nextcloud ranking' :
+        'Conditional scenario: other sources only if Nextcloud is excluded';
+      basis += '; owner observation: ' + display(owner.state);
+      if (owner.age_seconds != null) basis += ', age ' + duration(owner.age_seconds);
+      if (scenario.stop_reason) basis += '; stops at owner recheck boundary';
+    }
+    byId('forecast-basis').textContent = basis;
+    const holds = forecast.dispatch_holds || [];
+    byId('forecast-holds').textContent = holds.join('. ');
+    byId('forecast-holds').hidden = holds.length === 0;
+    const unranked = forecast.unranked_candidates || [];
+    byId('forecast-unranked').hidden = unranked.length === 0;
+    fillBody('forecast-unranked-body', unranked.map(item => row([
+      cell(item.job_id), cell(item.source), cell(item.profile), cell(item.model),
+      cell(item.nextcloud_priority)])), 5);
+    const selections = scenario ? scenario.next_selections : forecast.next_selections;
+    fillBody('forecast-body', (selections || []).map(item => row([
       cell(item.job_id), cell(item.source), cell(item.profile), cell(item.model), cell(item.weight),
-      cell(item.mode), cell(item.reason, true), cell(duration(item.wait_seconds), false, item.wait_seconds)])), 8, 'None queued');
+      cell(item.mode), cell(item.reason, true), cell(duration(item.wait_seconds), false, item.wait_seconds)])), 8,
+      scenario ? 'No ranked selections in this scenario — see unranked lane heads below' : 'No eligible selections in this snapshot');
   }
-  const history = data.history || [];
-  fillBody('history-body', history.map(historyRow), 9);
-  const last = history[history.length - 1];
-  byId('history-sentinel').dataset.cursor = last ? `${last.finished}:${last.id}` : '';
+  // Once paging begins, keep this historical snapshot stable until reload.
+  // Periodic queue refresh must not discard rows or invalidate an in-flight cursor.
+  if (!historyPaged) {
+    const history = data.history || [];
+    fillBody('history-body', history.map(historyRow), 9);
+    const last = history[history.length - 1];
+    byId('history-sentinel').dataset.cursor = last ? `${last.finished}:${last.id}` : '';
+  }
   bindTables();
   bindControls();
   setLive(true);
@@ -252,16 +281,27 @@ function bindControls() {
   }));
 }
 
+let historyObserver = null;
+function rearmHistory() {
+  const sentinel = byId('history-sentinel');
+  if (document.hidden || !historyObserver || !sentinel?.dataset.cursor) return;
+  // An intersection delivered during another read was intentionally skipped.
+  // Re-check it when the shared slot is free, without accumulating requests.
+  historyObserver.unobserve?.(sentinel);
+  historyObserver.observe(sentinel);
+}
+
 function observeHistory() {
   const sentinel = byId('history-sentinel'), body = byId('history-body');
-  let loading = false;
-  const ids = new Set([...body.children].map(tr => tr.dataset.historyId));
   if (!('IntersectionObserver' in window)) return;
-  new IntersectionObserver(async entries => {
-    if (loading || !entries[0].isIntersecting || !sentinel.dataset.cursor) return;
-    loading = true;
+  historyObserver = new IntersectionObserver(async entries => {
+    if (document.hidden || inFlight || !entries[0].isIntersecting || !sentinel.dataset.cursor) return;
+    inFlight = true;
+    historyPaged = true;
+    let succeeded = false;
+    const ids = new Set([...body.children].map(tr => tr.dataset.historyId));
     try {
-      const response = await fetch('/v1/history?limit=30&cursor=' + encodeURIComponent(sentinel.dataset.cursor));
+      const response = await fetch('/v1/history?limit=30&cursor=' + encodeURIComponent(sentinel.dataset.cursor), readOptions());
       const page = await response.json();
       if (!response.ok) throw new Error(page.error || 'history read failed');
       (page.items || []).forEach(item => {
@@ -272,17 +312,24 @@ function observeHistory() {
       });
       sentinel.dataset.cursor = page.next_cursor || '';
       setNotice('history-error', '');
+      succeeded = true;
     } catch (error) {
       setNotice('history-error', error.message || 'History unavailable');
-    } finally { loading = false; }
-  }).observe(sentinel);
+    } finally {
+      inFlight = false;
+      // A failed intersecting page must not become a tight network retry loop.
+      // A subsequent scroll or the next dashboard refresh can retry it.
+      if (succeeded) rearmHistory();
+    }
+  });
+  historyObserver.observe(sentinel);
 }
 
 async function loadDashboard() {
-  if (inFlight) return;
+  if (document.hidden || inFlight) return;
   inFlight = true;
   try {
-    const response = await fetch('/v1/dashboard', {cache: 'no-cache'});
+    const response = await fetch('/v1/dashboard', readOptions());
     const data = await response.json();
     if (!response.ok && data.observation?.state !== 'unavailable') throw new Error('dashboard read failed');
     const view = captureView();
@@ -295,12 +342,14 @@ async function loadDashboard() {
     setLive(false);
   } finally {
     inFlight = false;
+    rearmHistory();
   }
 }
 
 const REFRESH_INTERVAL_MS = 30000;
 let inFlight = false;
 let renderedOnce = false;
+let historyPaged = false;
 let refreshTimer = null;
 
 // Background refresh: fetch /v1/dashboard on a timer and patch the DOM only.

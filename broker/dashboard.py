@@ -32,8 +32,30 @@ def format_duration(seconds: float | None) -> str:
     return f"{hours:d}:{minutes:02d}:{sec:02d}"
 
 
+# Apply only to bounded windows; never return request/result bodies.
+MODEL_IDENTITY_SQL = """
+CASE WHEN json_valid(payload) THEN
+ CASE WHEN json_type(payload,'$.model')='text'
+ THEN json_extract(payload,'$.model') END END AS requested_model,
+CASE WHEN json_valid(result_json) THEN
+ CASE WHEN json_type(result_json,'$.model')='text'
+ THEN json_extract(result_json,'$.model') END END AS observed_model
+"""
+
+
+def model_identity(row: dict[str, Any]) -> dict[str, Any]:
+    """Backend identity wins; profile fallback is not evidence of execution."""
+    profile = PROFILES.get(row.get("profile"))
+    requested = row.get("requested_model") or (profile.model if profile else None)
+    observed = row.get("observed_model") or None
+    return dict(row, requested_model=requested, observed_model=observed,
+                model=observed or requested,
+                model_identity_source="observed" if observed else
+                "requested" if row.get("requested_model") else "profile_default")
+
+
 def history_display(row: dict[str, Any]) -> dict[str, Any]:
-    """Shared display values for dashboard JSON and paged history (no payload reads)."""
+    """Shared display values for dashboard JSON and paged history (scalar identity only)."""
     finished = row.get("finished")
     started = row.get("started")
     duration = (
@@ -41,10 +63,8 @@ def history_display(row: dict[str, Any]) -> dict[str, Any]:
         if row.get("state") == "completed" and started is not None
         and finished is not None and finished >= started else None
     )
-    profile = PROFILES.get(row.get("profile"))
     return dict(
-        row,
-        model=profile.model if profile else None,
+        model_identity(row),
         model_turn_seconds=duration,
         model_turn_display=format_duration(duration),
         finished_display=(
@@ -63,18 +83,17 @@ def snapshot(
     policy_sources = (policy_snapshot or {}).get("sources", {})
     policy_active = policy_snapshot is not None
     public_clause = "" if include_producer_storage else " AND " + PUBLIC_JOB_PREDICATE
+    observer_index = "jobs_observer_all" if include_producer_storage else "jobs_observer_public"
     schedules = dict(db.execute("SELECT source,next_allowed FROM source_schedules"))
-    # Do not discover sources by scanning all historical jobs.  `jobs` holds
-    # payloads and can be multiple GiB, so even an index-only global scan can
-    # exceed the observer deadline on a cold cache.  Policy/schedule sources
-    # are known directly; active unconfigured sources remain visible through
-    # a covering state/source index.
+    # Preserve historical-only sources, but scan narrow covering metadata
+    # instead of visiting payload-heavy table pages to test public visibility.
+    # This remains O(history rows), not a constant-cost source registry.
     source_names = set(policy_sources)
     source_names.update(schedules)
     source_names.update(
         row["source"]
         for row in db.execute(
-            "SELECT DISTINCT source FROM jobs INDEXED BY jobs_state_source "
+            f"SELECT DISTINCT source FROM jobs INDEXED BY {observer_index} "
             "WHERE state IN ('queued','running','cancel_requested','completed','failed','cancelled')" + public_clause
         )
     )
@@ -92,7 +111,7 @@ def snapshot(
             row["state"]: row["count"]
             for row in db.execute(
                 "SELECT state,count(*) AS count FROM jobs "
-                "INDEXED BY jobs_source_state WHERE source=?" + public_clause +
+                f"INDEXED BY {observer_index} WHERE source=?" + public_clause +
                 " GROUP BY state",
                 (source,),
             )
@@ -107,18 +126,18 @@ def snapshot(
             "SELECT "
             "coalesce(sum(occurred>=?),0) AS completed_1h,"
             "coalesce(sum(occurred>=?),0) AS completed_24h "
-            "FROM audit_events INDEXED BY audit_events_source_time "
+            "FROM audit_events INDEXED BY audit_observer_windows "
             "WHERE source=? AND occurred>=? AND event_type='job.completed'" +
             ("" if include_producer_storage else " AND producer_storage=0"),
             (now - 3_600, now - 86_400, source, now - 86_400),
         ).fetchone()
         retry = db.execute(
-            "SELECT count(*) FROM jobs INDEXED BY jobs_source_state_retry "
+            f"SELECT count(*) FROM jobs INDEXED BY {observer_index} "
             "WHERE source=? AND state='queued' AND retry_count>0" + public_clause,
             (source,),
         ).fetchone()[0]
         lease = db.execute(
-            "SELECT count(*) FROM jobs INDEXED BY jobs_source_state "
+            f"SELECT count(*) FROM jobs INDEXED BY {observer_index} "
             "WHERE source=? AND state IN ('running','cancel_requested') "
             "AND lease_until IS NOT NULL" + public_clause,
             (source,),
@@ -154,11 +173,12 @@ def snapshot(
 
     active_jobs = []
     for row in db.execute(
-        "SELECT id,source,state,created,started,lease_until,attempt_count,retry_count "
-        "FROM jobs WHERE state IN ('running','cancel_requested')" + public_clause +
+        "SELECT id,source,profile,state,created,started,lease_until,attempt_count,retry_count, "
+        + MODEL_IDENTITY_SQL + " "
+        + "FROM jobs WHERE state IN ('running','cancel_requested')" + public_clause +
         " ORDER BY started,created,id"
     ):
-        job = dict(row)
+        job = model_identity(dict(row))
         job["weight"] = source_weights.get(job["source"])
         active_jobs.append(job)
     return {

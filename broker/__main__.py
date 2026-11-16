@@ -7,6 +7,7 @@ from .adapters import OllamaHTTP, WakeOnLan
 from .http import serve
 from .local_config import load_local_config, mainpc_mac, ollama_url
 from .service import Broker, Dispatcher, SourcePolicy
+from .nextcloud_priority import NextcloudPriority
 
 
 def dispatch_enabled(value: str | None) -> bool:
@@ -131,6 +132,10 @@ def main() -> None:
             os.environ.get("BROKER_MIN_FREE_SPACE_BYTES"), 2 * 1024 * 1024 * 1024,
             "BROKER_MIN_FREE_SPACE_BYTES",
         ),
+        nextcloud_priority=(
+            NextcloudPriority.from_file(
+                os.environ['BROKER_NEXTCLOUD_PRIORITY_FILE'])
+            if os.environ.get('BROKER_NEXTCLOUD_PRIORITY_FILE') else None),
         source_policy=policy,
         asr_release_on_llm_demand=dispatch_enabled(os.environ.get('BROKER_ASR_RELEASE_ON_LLM_DEMAND','false')),
     )
@@ -172,3 +177,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+

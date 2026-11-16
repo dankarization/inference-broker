@@ -97,7 +97,9 @@ class DailyCapacityTests(unittest.TestCase):
         # The two OCR lanes added for the current MAIN-PC catalogue are additive,
         # like this daily profile, and are excluded so this stays a freeze on the
         # pre-existing set rather than a moving target.
-        added_profiles = {'openclaw-deepseek-ocr', 'openclaw-glm-ocr'}
+        from broker.syncopia_summary import MODELS as SUMMARY_MODELS
+        # Dedicated summaries are additive; retain the original catalogue hash.
+        added_profiles = {'openclaw-deepseek-ocr', 'openclaw-glm-ocr'} | set(SUMMARY_MODELS)
         old = {k: {field: value for field, value in asdict(v).items() if field not in added_fields}
                for k, v in PROFILES.items() if k != daily.PROFILE and k not in VOICE_PROFILE_NAMES
                and k != "stt-whisper" and not k.startswith("uncensored-eval-")

@@ -1,120 +1,113 @@
 # Inference broker queue
 
-Брокер принимает задания локального инференса в durable SQLite-очередь и
-последовательно передаёт их настроенным backend: Ollama, Wyoming, GigaAM и
-Whisper GPU. Источники используют общую очередь, source policy и один execution
-slot; профиль задания определяет backend и defaults лимитов; runtime overrides зависят от lane. Dashboard показывает
-состояние очереди и управляет dispatch/admission.
-
-## Как проходит задание
-
-```mermaid
-%%{init: {"flowchart": {"htmlLabels": false}}}%%
-flowchart LR
-    jobs["Источники заданий"] -->|HTTP| broker
-    subgraph HOST["Постоянный хост"]
-        broker["broker · SQLite WAL"]
-        ui["Dashboard"] -->|Pause / Resume| broker
-    end
-    subgraph MAINPC["MAIN-PC · GPU"]
-        ollama["Ollama"]
-        voice["GigaAM / Whisper GPU"]
-    end
-    broker -->|один slot| ollama
-    broker -->|тот же slot| voice
-    broker -->|тот же slot| wyoming["Wyoming"]
-    broker -.->|WOL| MAINPC
-```
-
-Очередь и leases хранятся на постоянном хосте, а не на MAIN-PC. Source policy
-задаёт admission, dispatch и weight; scheduler выбирает eligible source по
-обратной доле weight, затем FIFO внутри source и совместимые model batches.
-Без source policy действует глобальный FIFO. Подключённые voice jobs проходят
-тот же scheduler: [контракт voice backends](docs/VOICE-JOBS.md). Прямые вызовы
-backend в обход broker не входят в его очередь.
-
-**Pause queue** запрещает новые запуски для всех источников, но сохраняет приём
-заданий. Текущее задание завершается, затем broker выгружает GPU-модели;
-неудачная выгрузка повторяется без возобновления dispatch. Пауза сохраняется
-в SQLite после рестарта. **Resume queue** снова разрешает dispatch.
-Это отдельный контроль от per-source dispatch pause и admission block.
-
-## Dashboard
-
-Панель доступна на `/dashboard`: общие счётчики, Sources с весами и контролями,
-Active jobs, Forecast и History. Данные обновляются в фоне каждые 30 секунд без
-перезагрузки страницы. Подробности: [Dashboard](docs/DASHBOARD.md).
-
-Текущая панель, ширина viewport 1440 px:
-
-![Inference broker queue: Pause queue, Sources, Active jobs, Forecast и History при 1440 px](docs/images/dashboard-1440.png)
-
-Та же панель при 1920 px; таблицы используют доступную ширину с небольшими
-боковыми отступами:
-
-![Inference broker queue: dashboard при 1920 px](docs/images/dashboard-1920.png)
-
-
 [English](#english) · [Русский](#russian)
 
 <a id="english"></a>
 ## English
 
-A local admission and scheduling service for one Ollama GPU executor. It keeps jobs in a durable SQLite WAL queue, runs at most one inference job at a time, with server profile defaults and optional per-job runtime overrides. It does not replace Ollama or route cloud workloads.
-
-An optional [Whisper executor](docs/WHISPER_EXECUTOR.md) shares this GPU queue
-through a separately authenticated ASR API. It is disabled by default and requires
-the matching worker, private artifact storage, and explicit deployment configuration.
-
-<a id="architecture"></a>
-### Architecture
+A local admission and scheduling service with a durable SQLite WAL queue.
+Ollama and optional voice executors share one non-preemptive execution slot.
+The broker owns admission, leases, retry/cancellation records, source policy,
+GPU custody fences and operational views; it does not replace the backends.
 
 ```mermaid
 flowchart LR
-    C["Local producers"] --> A["HTTP admission API"]
-    A --> Q[("SQLite WAL<br/>jobs, attempts, audit")]
-    Q --> S["Dispatcher<br/>source policy + FIFO heads"]
-    P["Runtime source policy<br/>dispatch / admission / weight"] --> A
-    P --> S
-    S -->|"one lease at a time"| W["Wake-on-LAN + model readiness"]
-    W --> O["Ollama executor<br/>one GPU"]
-    O -->|"result / terminal state"| Q
-    Q --> V["Local dashboard + read-only APIs"]
+    P["Local producers"] --> A["HTTP admission"]
+    A --> Q[("SQLite WAL: jobs, attempts, audit")]
+    Q --> S["Source policy + bounded model turns"]
+    S -->|one shared slot| O["Ollama"]
+    S -->|same slot| V["Optional voice workers"]
+    Q --> D["Dashboard + read-only forecast"]
 ```
 
-The broker and SQLite queue live on an always-on host; the Ollama executor may sleep. Wake-on-LAN, model readiness, unload/load, and inference happen only when dispatch is enabled and an eligible job is selected. `GET /healthz` does not contact the executor.
+The queue stays on an always-on host; a configured executor may sleep.
+Wake-on-LAN, readiness checks and inference happen only when an eligible job
+is dispatched. `GET /healthz` does not contact the executor.
 
-With a runtime source policy, the scheduler takes the oldest eligible job from each source, groups ready source/model lanes into contiguous model-aware batches, and allocates a recurring 60-minute execution-time horizon in **inverse proportion** to their positive weights. Jobs are non-preemptive, so a final job may exceed its lane's budget. A source that becomes ready mid-cycle receives a share of the remaining horizon. Without a policy, eligible jobs use global FIFO.
+### Scheduling and controls
 
-### Local start (admission only)
+With a source policy, the recurring 60-minute **execution-time** horizon is
+allocated in inverse proportion to positive weights:
+`share(source) = (1 / weight) / sum(1 / weight)`.
+A smaller numeric weight means more time, not less. Each source gets one
+aggregate budget, regardless of how many models it uses. New ready sources
+share the remaining horizon. Without a policy, eligible jobs use global FIFO.
 
-Python 3.11+ is required. Copy `config/local.example.json` to `config/local.json` in this checkout, set `ollama_url` to the executor's reachable HTTP origin and `mainpc_mac` to its Wake-on-LAN MAC, then restrict the file to the owner. The broker reads this untracked file at startup, even in admission-only mode. No wake or Ollama request is made while dispatch is disabled. There is no localhost fallback for the executor.
+Within a source, jobs for the same actual model share a FIFO lane across
+compatible profiles. Competing model turns rotate at the next claim boundary
+after 10 attempts, 300 charged seconds, or a 600-second competitor wait,
+or when the current lane becomes ineligible. Running jobs are never interrupted;
+these are rotation triggers, **not** per-job latency guarantees.
+See [source/model scheduling](docs/SOURCE-MODEL-BATCHING.md).
 
-```bash
+**Pause queue** persists in SQLite, keeps admission open and stops new dispatch.
+A running job finishes naturally; model unload failures are retried without
+resuming dispatch. **Resume queue** re-enables dispatch. Per-source
+`enabled=false` pauses dispatch; `admission_allowed=false` blocks new admission.
+Neither control preempts running work.
+
+### Dashboard and forecast
+
+`/dashboard` shows Sources, Active jobs, Forecast and paged History. It refreshes
+in the background every 30 seconds, suppresses hidden-tab refreshes and
+serializes concurrent reads. Read-only observers use bounded WAL snapshots;
+timeout or unavailable data is reported honestly, not as fabricated zeroes.
+Model columns distinguish requested, observed and profile-default identity.
+
+Forecast normally returns up to 10 selections (maximum 20). When Nextcloud's
+external owner gate participates, a local queue snapshot cannot prove the live
+global order. The API instead labels a **conditional scenario** based on the
+last committed owner observation, or excludes Nextcloud explicitly. It stops
+when a fresh owner check is needed and lists local unranked candidates separately.
+Pause/fence holds and observation age remain visible; a scenario is neither a
+lease nor an ETA promise. See [forecast](docs/FORECAST.md) and
+[dashboard](docs/DASHBOARD.md).
+
+Illustrative dashboard layout (older screenshot; labels may differ from current code):
+
+![Inference broker dashboard layout](docs/images/dashboard-1440.png)
+
+### Local start: admission only
+
+Python 3.11+; the core broker and unit tests use the standard library. Configure
+your own executor URL and Wake-on-LAN MAC in an **untracked**, owner-only file.
+There is no implicit localhost executor fallback.
+
+```sh
 cp config/local.example.json config/local.json
-# Edit config/local.json for your executor before starting.
+# Edit the executor URL and MAC before starting.
 chmod 600 config/local.json
 BROKER_LOCAL_CONFIG=./config/local.json BROKER_DISPATCH_ENABLED=false BROKER_DB=./broker.sqlite3 python3 -m broker
 ```
 
-In another terminal:
+From another terminal: `curl --fail http://127.0.0.1:8088/healthz`.
+The default bind is `127.0.0.1:8088`. Legacy job/control APIs are **not a public
+authentication boundary**: keep them on a trusted local interface. Opt-in
+producer-storage and ASR APIs have their own token contracts; they do not
+secure the whole HTTP server.
 
-```bash
-curl --fail http://127.0.0.1:8088/healthz
+`BROKER_DISPATCH_ENABLED=true` enables dispatch. Without a source policy,
+`BROKER_DISPATCH_SOURCES` must explicitly allow sources. With
+`BROKER_SOURCES_POLICY`, only enabled policy sources dispatch. For example:
+
+```json
+{"version":1,"sources":{"interactive":{"enabled":true,"admission_allowed":true,"weight":2},"cron":{"enabled":true,"admission_allowed":true,"weight":1}}}
 ```
 
-The API binds to `127.0.0.1:8088` by default. Keep it on a trusted local interface: legacy job APIs are not a public authentication boundary. The supplied systemd units are templates: create owner-only `~/.config/ollama-inference-broker/broker.env` (and `report.env` if using the report timer) for other deployment settings before installing them. For deployment, place the same JSON at `~/.config/ollama-inference-broker/local.json` with owner-only permissions: both broker and reporter read this stable path by default, independently of their release directories. `BROKER_LOCAL_CONFIG` selects another file for development. `OLLAMA_URL` and `MAINPC_MAC` override its broker values, and `BROKER_OLLAMA_URL` overrides its reporter URL. Set `WOL_BROADCAST` separately if needed. Dispatch is disabled in the broker template until explicitly enabled.
+This is a synthetic policy, not a production configuration.
 
-### Installing the systemd templates
+### systemd templates
 
-Both units set `WorkingDirectory=%h/.local/share/ollama-inference-broker`. Put a checkout at **that exact path** before enabling them; copying only the unit files will fail with systemd `CHDIR`. For example, on a fresh host:
+The units in `systemd/` require a checkout at
+`~/.local/share/ollama-inference-broker` and private configuration outside it.
+Installing unit files alone fails with systemd `CHDIR`.
 
-```bash
+```sh
 mkdir -p "$HOME/.local/share" "$HOME/.config/ollama-inference-broker" "$HOME/.config/systemd/user"
-git clone https://github.com/dankarization/ollama-inference-broker.git "$HOME/.local/share/ollama-inference-broker"
+git clone https://github.com/dankarization/inference-broker.git "$HOME/.local/share/ollama-inference-broker"
 cd "$HOME/.local/share/ollama-inference-broker"
 cp config/local.example.json "$HOME/.config/ollama-inference-broker/local.json"
-# Edit the executor URL and MAC in local.json, then restrict it to the owner.
+# Edit the executor URL and MAC, then keep all local configuration private.
 chmod 600 "$HOME/.config/ollama-inference-broker/local.json"
 touch "$HOME/.config/ollama-inference-broker/broker.env"
 chmod 600 "$HOME/.config/ollama-inference-broker/broker.env"
@@ -122,115 +115,102 @@ cp systemd/ollama-inference-broker*.service systemd/ollama-inference-broker-repo
 systemctl --user daemon-reload
 ```
 
-The report timer is optional. Before enabling it, copy `config/report.env.example` to `~/.config/ollama-inference-broker/report.env`, replace the chat and thread placeholders, and `chmod 600` the file. `OPENCLAW_CONFIG_PATH` defaults to `~/.openclaw/openclaw.json`; it must point to an existing OpenClaw JSON with `channels.telegram.accounts.<account>.botToken` (or `token`). `BROKER_REPORT_TELEGRAM_ACCOUNT` defaults to `default`. The report unit reads `broker.env` before `report.env`, so it uses the broker's `BROKER_SOURCES_POLICY` path to display scheduler weights; set the optional `BROKER_SOURCES_POLICY` in `report.env` only if the reporter needs a different path. The example uses the shared `local.json` for the Ollama health URL; `BROKER_OLLAMA_URL` is an optional reporter-only override. Never put the bot token in `report.env` or Git.
+The broker template leaves dispatch disabled. Both broker and reporter read
+`~/.config/ollama-inference-broker/local.json`; `BROKER_LOCAL_CONFIG` overrides
+that path. `OLLAMA_URL` and `MAINPC_MAC` override broker values;
+`BROKER_OLLAMA_URL` overrides the reporter URL. Set `WOL_BROADCAST` if needed.
 
-### Key contracts
+The report timer is optional: copy `config/report.env.example` to the private
+configuration directory as `report.env`, replace placeholders and use mode 0600.
+`OPENCLAW_CONFIG_PATH` selects an existing OpenClaw JSON containing the Telegram
+account token; `BROKER_REPORT_TELEGRAM_ACCOUNT` defaults to `default`.
+The report unit reads `broker.env` before `report.env` and shares the broker's
+`BROKER_SOURCES_POLICY` unless overridden. Never put tokens or live data in Git.
 
-Complete caller reference, override scope and errors: [HTTP API (Russian)](docs/API.md).
+A lossless dispatcher drain uses `systemctl --user reload ollama-inference-broker.service`,
+which signals only MainPID. Do not use `systemctl --user kill -s SIGUSR1`:
+it can signal an active inference child too. Deployment, restart, migrations
+and live control changes are separate operator actions, not effects of a Git update.
 
-- The opt-in OpenClaw native chat route waits on the same durable queue and returns an Ollama-compatible response; it does not change legacy admission-only endpoints. See [OpenClaw route](docs/OPENCLAW_ROUTE.md) for its wire contract and rollout boundary.
+### API and optional contracts
 
-- `POST /v1/jobs` durably admits a server-owned profile and returns HTTP 202. `GET /v1/jobs/{id}` and `POST /v1/jobs/{id}/cancel` expose the job lifecycle.
-- `/api/chat` and `/api/generate` are admission-compatible endpoints, **not** direct Ollama streaming proxies. A streaming request returns an admission frame, not immediate model output.
-- `GET /dashboard`, `GET /v1/dashboard`, `GET /v1/forecast`, `GET /v1/analytics`, and `GET /v1/audit-events` expose local operational views. Forecast is read-only and contingent, with 10 selections by default (maximum 20). Observer failure is reported as stale or unavailable, not as invented zeroes.
-- `BROKER_DISPATCH_ENABLED=true` starts the dispatcher. Without `BROKER_SOURCES_POLICY`, an explicit `BROKER_DISPATCH_SOURCES` allowlist is required. With a policy, enabled sources form the dispatch allowlist.
-- A policy source's `enabled=false` pauses new dispatch leases; `admission_allowed=false` rejects new jobs with HTTP 403 before insertion. The source controls API supports dispatch pause/resume, admission allow/block, weight changes, and confirmed bulk cancellation of queued or retry of failed jobs. Existing running work is not preempted.
-- Producer-owned storage is opt-in per source and admission. Its status, receipt, and mutation APIs require an owner-only bearer token; legacy jobs keep their previous contract. Compaction requires explicit guards and a matching durable ACK. See [producer storage](docs/PRODUCER_STORAGE.md) and [analytics](docs/ANALYTICS.md).
+- [HTTP API](docs/API.md): `POST /v1/jobs` returns durable HTTP 202 admission;
+  status/cancel endpoints expose lifecycle. `/api/chat` and `/api/generate`
+  are admission-compatible endpoints, **not** direct streaming proxies.
+- [OpenClaw native route](docs/OPENCLAW_ROUTE.md): opt-in queued synchronous
+  chat with an Ollama-compatible final response, separate from legacy admission.
+- [Nextcloud](docs/NEXTCLOUD.md): source-local new-upload priority, queued-only
+  idempotent promotion and an optional restricted external owner gate. The gate
+  needs separately installed `psycopg` and an external PostgreSQL contract; core
+  startup without `BROKER_NEXTCLOUD_PRIORITY_FILE` does not require either.
+- [Native summaries](docs/syncopia-summary-native-v1.md): two opt-in, digest-pinned
+  Gemma/Bolt profiles with explicit budgets and Boolean `think=false`.
+  Legacy memory/daily/nightly contracts remain separate.
+- [Voice jobs](docs/VOICE-JOBS.md), [Whisper ASR](docs/WHISPER_EXECUTOR.md),
+  [CPU segments](docs/VOICE-CPU-SEGMENTS.md) and
+  [diarization wire contract](docs/DIARIZATION.md): optional executors need
+  matching workers, explicit private configuration and existing GPU custody.
+- [Producer storage](docs/PRODUCER_STORAGE.md) and [analytics](docs/ANALYTICS.md):
+  opt-in owner-token APIs, durable receipts and guarded compaction.
 
-### Queue job runtime overrides
-
-`POST /v1/jobs` accepts optional `model`, `options` and new-source `weight`.
-Lane validation and override precedence are documented in [HTTP API](docs/API.md).
-
-An illustrative **non-production** policy:
-
-```json
-{
-  "version": 1,
-  "sources": {
-    "interactive": {"enabled": true, "admission_allowed": true, "weight": 2},
-    "cron": {"enabled": true, "admission_allowed": true, "weight": 1}
-  }
-}
-```
-
-Only configured, eligible sources dispatch when a policy is active. Configure the executor address and secrets outside this example. For a lossless dispatcher drain, use `systemctl --user reload ollama-inference-broker.service`: the unit signals only the broker MainPID. Do not use `systemctl --user kill -s SIGUSR1 ollama-inference-broker.service`, which can signal an active inference child process.
+**Release boundary:** this tree includes broker-side diarization admission and
+validation, not a bundled diarization worker or proof of model quality/E2E
+readiness. Later acoustic OGG/MP3/FLAC protocol extensions and atomic local-voice
+hold work from separate feature branches are not included in this sync. Do not
+infer availability from a branch name or opt-in profile alone. See
+[ROADMAP](ROADMAP.md) for additional historical boundaries; private deployment
+receipts, production configuration and working data are intentionally not shipped.
 
 ### Validation
 
-```bash
-python3 -m unittest discover -s tests -v
+```sh
+PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests -v
+node tests/dashboard_dom.cjs
+# Optional real-browser test: uses existing Chromium and Python websockets.
+PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=. python3 tests/browser_dashboard.py
 ```
 
-Tests use fakes for the executor and Wake-on-LAN; they do not start live inference. See [ROADMAP.md](ROADMAP.md) for rollout boundaries.
+Tests use synthetic data and fake inference/WOL; no live backend is required.
+Three cross-project ASR contract tests skip unless `STT_SOURCE_ROOT` points to a
+compatible worker checkout. The browser test is optional, not a core dependency.
 
 ---
 
 <a id="russian"></a>
 ## Русский
 
-Локальный сервис приёма и планирования заданий для одного GPU-исполнителя Ollama. Задания сохраняются в SQLite WAL, одновременно исполняется не более одного задания, а серверные defaults модели и лимитов могут переопределяться заданием в поддерживаемых lanes. Брокер не заменяет Ollama и не маршрутизирует облачные нагрузки.
+Локальный брокер хранит задания в SQLite WAL и последовательно исполняет их
+через Ollama либо дополнительные voice workers. Общие очередь, leases,
+ограждения GPU и source policy сохраняются; наличие профиля не устанавливает
+worker и не доказывает готовность его модели.
 
-[Схема архитектуры](#architecture) показывает путь от HTTP API через устойчивую очередь и диспетчер к пробуждаемому GPU-исполнителю. Брокер и очередь работают на постоянно включённом хосте. WOL, проверка готовности и инференс происходят только после включения dispatch и выбора допустимого задания. `GET /healthz` не обращается к исполнителю.
+С policy каждый source получает **один** бюджет времени исполнения обратно
+пропорционально весу: меньший положительный вес означает большую долю.
+Количество моделей внутри source не умножает эту долю. Совместимые профили
+одной фактической модели образуют FIFO lane; конкурирующие модели сменяют
+друг друга на границе claim после 10 попыток, 300 секунд текущего turn либо
+600 секунд ожидания конкурента. Текущее задание не прерывается; это не SLA.
+Без policy действует глобальный FIFO.
 
-С runtime policy планировщик берёт старейшее допустимое задание каждого source, собирает непрерывные группы по целевой модели и делит повторяющийся 60-минутный бюджет **времени исполнения** прямо пропорционально положительным весам. Задания не прерываются на границе бюджета; вновь доступный source получает долю оставшегося времени. Без policy действует глобальный FIFO.
+**Pause queue** сохраняется после рестарта, запрещает новые запуски, но не
+приём; текущая работа завершается естественно. **Resume queue** возобновляет
+запуски. Admission block и dispatch pause конкретного source независимы.
 
-### Локальный запуск без dispatch
+Dashboard показывает запрошенную и наблюдаемую модель, обновляется в фоне и
+подгружает History страницами. Forecast — условная проекция, не очередь leases:
+при участии внешнего Nextcloud owner gate отдельно показаны сценарий,
+давность наблюдения, неранжированные кандидаты и необходимость нового gate read.
+При паузе сценарий применим только после resume; точный ETA не обещается.
 
-Нужен Python 3.11+. Скопируйте `config/local.example.json` в `config/local.json` этого checkout, укажите в `ollama_url` доступный HTTP-адрес исполнителя, а в `mainpc_mac` — его Wake-on-LAN MAC, затем ограничьте доступ к файлу. Брокер читает этот неотслеживаемый файл при запуске, даже без dispatch. Пока dispatch выключен, WOL и запросов Ollama нет. Для исполнителя нет fallback на localhost.
+Для локального запуска используйте [admission-only пример](#local-start-admission-only),
+а для units — [systemd templates](#systemd-templates). Нужен Python 3.11+;
+адреса исполнителей, MAC и токены задаются только в приватной конфигурации.
+Legacy HTTP API нельзя выставлять в недоверенную сеть. Обновление Git не
+развёртывает код, не перезапускает сервис и не меняет live controls.
 
-```bash
-cp config/local.example.json config/local.json
-# Перед запуском задайте параметры исполнителя в config/local.json.
-chmod 600 config/local.json
-BROKER_LOCAL_CONFIG=./config/local.json BROKER_DISPATCH_ENABLED=false BROKER_DB=./broker.sqlite3 python3 -m broker
-```
-
-В другом терминале:
-
-```bash
-curl --fail http://127.0.0.1:8088/healthz
-```
-
-По умолчанию API слушает `127.0.0.1:8088`. Не открывайте legacy API недоверенной сети: он не является публичной границей аутентификации. Приложенные systemd units — шаблоны: до установки создайте доступный только владельцу `~/.config/ollama-inference-broker/broker.env` (и `report.env` для таймера отчёта) для остальных настроек развёртывания. Для развёртывания поместите тот же JSON в `~/.config/ollama-inference-broker/local.json` с правами только для владельца: брокер и отчёт читают этот стабильный путь независимо от каталогов релизов. `BROKER_LOCAL_CONFIG` позволяет указать другой файл при разработке. `OLLAMA_URL` и `MAINPC_MAC` переопределяют значения брокера, `BROKER_OLLAMA_URL` — адрес для отчёта. При необходимости задайте `WOL_BROADCAST` отдельно. В шаблоне брокера dispatch отключён до явного включения.
-
-### Установка шаблонов systemd
-
-Оба unit-файла задают `WorkingDirectory=%h/.local/share/ollama-inference-broker`. До включения unit поместите checkout **именно по этому пути**: установка только unit-файлов завершится ошибкой systemd `CHDIR`. На новом хосте выполните команды из раздела [Installing the systemd templates](#installing-the-systemd-templates): они создают checkout, локальный JSON, обязательный `broker.env` и устанавливают unit-файлы, но не запускают dispatch.
-
-Таймер отчёта необязателен. До его включения скопируйте `config/report.env.example` в `~/.config/ollama-inference-broker/report.env`, замените chat/thread placeholders и установите права `0600`. `OPENCLAW_CONFIG_PATH` по умолчанию равен `~/.openclaw/openclaw.json` и должен указывать на существующий OpenClaw JSON с `channels.telegram.accounts.<account>.botToken` (либо `token`). `BROKER_REPORT_TELEGRAM_ACCOUNT` по умолчанию — `default`. Unit отчёта читает `broker.env` перед `report.env`, поэтому берёт из него путь `BROKER_SOURCES_POLICY` для отображения весов; укажите необязательный `BROKER_SOURCES_POLICY` в `report.env` только если отчёту нужен другой путь. Адрес Ollama для проверки здоровья берётся из общего `local.json`; `BROKER_OLLAMA_URL` позволяет переопределить его только для отчёта. Не записывайте токен бота в `report.env` или Git.
-
-### Основные контракты
-
-Формы запросов, область overrides, endpoints и ошибки: [HTTP API](docs/API.md).
-
-- Дополнительный OpenClaw native chat route ждёт результат в той же устойчивой очереди и возвращает Ollama-совместимый ответ; старые admission-only endpoints не меняются. См. [маршрут OpenClaw](docs/OPENCLAW_ROUTE.md) и границы его rollout.
-
-- `POST /v1/jobs` сохраняет задание с серверным профилем и возвращает HTTP 202. `GET /v1/jobs/{id}` и `POST /v1/jobs/{id}/cancel` показывают и изменяют состояние задания.
-- `/api/chat` и `/api/generate` принимают задания, но не являются прямыми streaming-прокси Ollama. При `stream=true` возвращается кадр подтверждения приёма, а не немедленный результат модели.
-- `GET /dashboard`, `GET /v1/dashboard`, `GET /v1/forecast`, `GET /v1/analytics` и `GET /v1/audit-events` дают локальную наблюдаемость. Forecast не изменяет очередь и зависит от будущих событий: по умолчанию 10 выборов, максимум 20. Ошибка чтения отображается как stale/unavailable, а не как вымышленные нули.
-- `BROKER_DISPATCH_ENABLED=true` запускает диспетчер. Без `BROKER_SOURCES_POLICY` обязателен явный `BROKER_DISPATCH_SOURCES`. При наличии policy allowlist задают включённые sources.
-- `enabled=false` останавливает новые leases источника; `admission_allowed=false` отклоняет новые задания с HTTP 403 до записи. API управления позволяет ставить dispatch на паузу, запрещать приём, менять вес и с подтверждением отменять queued либо повторять failed задания. Текущее исполнение не прерывается.
-- Хранение результатов у producer включается отдельно для source и задания. API состояния, receipts и mutations требуют owner-only bearer token; контракт старых jobs сохраняется. Compaction требует явных защитных флагов и подтверждённого ACK. См. [хранение producer](docs/PRODUCER_STORAGE.md) и [аналитику](docs/ANALYTICS.md).
-
-Пример policy **не для production**:
-
-```json
-{
-  "version": 1,
-  "sources": {
-    "interactive": {"enabled": true, "admission_allowed": true, "weight": 2},
-    "cron": {"enabled": true, "admission_allowed": true, "weight": 1}
-  }
-}
-```
-
-С policy исполняются только настроенные и допустимые sources. Адрес исполнителя и секреты задаются отдельно. Для остановки новых claims без потери текущего задания используйте `systemctl --user reload ollama-inference-broker.service`: unit посылает сигнал только broker MainPID. Не используйте `systemctl --user kill -s SIGUSR1 ollama-inference-broker.service`, чтобы не сигнализировать дочернему процессу активного инференса.
-
-### Проверка
-
-```bash
-python3 -m unittest discover -s tests -v
-```
-
-Тесты используют заглушки Ollama и Wake-on-LAN и не запускают реальный инференс. Границы rollout описаны в [ROADMAP.md](ROADMAP.md).
+Подробные контракты и команды проверки — в английском разделе выше.
+Broker-side diarization уже присутствует в этом дереве; worker поставляется
+отдельно. Неизданные расширения акустического протокола и atomic local-voice
+hold из других веток намеренно не добавлены. Скриншот иллюстративный, не
+свидетельство текущего production. Публикуемые исходники не включают private
+rollout proofs, рабочие payload или live-конфигурацию.

@@ -237,11 +237,21 @@ def serve(broker, host="127.0.0.1", port=8088, policy=None, storage_token=None, 
                     result = broker.submit(body["profile"], body["kind"], body.get("payload", {}),
                                            body.get("source"), body.get("source_item_id"),
                                            body.get("external_id"), body.get("producer_storage"),
-                                           model=body.get("model"), options=body.get("options"), weight=body.get("weight"))
+                                           model=body.get("model"), options=body.get("options"), weight=body.get("weight"),
+                                           nextcloud_priority=body.get("nextcloud_priority"))
                     self._json(202, broker.nextcloud_projection(result) if projection else result)
                 except SourceAdmissionBlocked as error: self._admission_blocked(error)
                 except SourceQueueFull as error: self._json(429, {"error": str(error)})
                 except (KeyError, TypeError, ValueError, StorageContractError) as e: self._json(400, {"error": str(e)})
+            elif path.startswith("/v1/jobs/") and path.endswith("/nextcloud-priority"):
+                job_id = path.split("/")[3]
+                if broker.producer_storage_job(job_id) and not self._storage_authorized():
+                    return
+                try:
+                    result = broker.promote_nextcloud(job_id, body)
+                    self._json(200 if result else 404, result or {"error": "not found"})
+                except ValueError as error:
+                    self._json(400, {"error": str(error)})
             elif path.startswith("/v1/jobs/") and path.endswith("/input-received"):
                 if not self._storage_authorized():
                     return
@@ -576,12 +586,18 @@ def serve(broker, host="127.0.0.1", port=8088, policy=None, storage_token=None, 
             elif path == "/v1/nightly-eval/contract":
                 from .nightly_eval import contract
                 self._json(200, contract())
+            elif path == "/v1/nextcloud/capabilities":
+                self._json(200, broker.nextcloud_capabilities())
             elif path == "/v1/voice/capabilities":
                 from . import voice_cpu
                 try:
                     self._json(200, voice_cpu.capabilities())
                 except ValueError:
                     self._json(503, {"error": "CPU voice capability unavailable"})
+            elif path == "/v1/nextcloud/priority":
+                gate = broker.nextcloud_priority
+                self._json(200, gate.contract() if gate is not None else
+                           dict(schema="nextcloud-priority-55852-v2", enabled=False))
             elif path == "/healthz": self._json(200, broker.health())
             elif path == "/v1/metrics": self._json(200, broker.metrics())
             elif path == "/v1/storage/health": self._json(200, broker.storage_health())
@@ -681,3 +697,4 @@ def serve(broker, host="127.0.0.1", port=8088, policy=None, storage_token=None, 
             else: self._json(404, {"error":"not found"})
         def log_message(self, *_): pass
     return ThreadingHTTPServer((host, port), Handler)
+

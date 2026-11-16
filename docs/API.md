@@ -262,3 +262,21 @@ curl --fail-with-body -H 'Content-Type: application/json' \
   http://127.0.0.1:8088/v1/jobs
 curl --fail-with-body http://127.0.0.1:8088/v1/jobs/JOB_ID
 ```
+
+
+## Дополнительные контракты очереди
+
+- [Source/model turns](SOURCE-MODEL-BATCHING.md): один reciprocal-time budget
+  на source, ограниченные turns фактических моделей, non-preemptive исполнение.
+- [Forecast](FORECAST.md): при внешнем Nextcloud owner gate глобальный
+  `next_selections` не выдаёт условный сценарий за фактический порядок.
+  `conditional_scenario`, `owner_gate`, `unranked_candidates` и `dispatch_holds`
+  надо интерпретировать совместно.
+- [Nextcloud priority](NEXTCLOUD.md): поле `nextcloud_priority` при admission,
+  queued-only promotion, `GET /v1/nextcloud/capabilities` и
+  `GET /v1/nextcloud/priority`. Это не глобальный caller-controlled priority.
+- [Native summaries](syncopia-summary-native-v1.md): два выделенных профиля
+  требуют Boolean `think=false`, точную модель и явные бюджеты; generic runtime
+  overrides не обходят их более строгий контракт.
+- [Diarization](DIARIZATION.md): broker-side optional профиль не устанавливает
+  отдельный worker и не гарантирует доступность инференса.
