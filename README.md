@@ -38,6 +38,9 @@ compatible profiles. Competing model turns rotate at the next claim boundary
 after 10 attempts, 300 charged seconds, or a 600-second competitor wait,
 or when the current lane becomes ineligible. Running jobs are never interrupted;
 these are rotation triggers, **not** per-job latency guarantees.
+At a model-turn boundary, an eligible, equal-weight source with unspent budget
+may continue the same model, reducing switches without borrowing another
+source's share or bypassing the owner gate.
 See [source/model scheduling](docs/SOURCE-MODEL-BATCHING.md).
 
 **Pause queue** persists in SQLite, keeps admission open and stops new dispatch.
@@ -54,11 +57,14 @@ serializes concurrent reads. Read-only observers use bounded WAL snapshots;
 timeout or unavailable data is reported honestly, not as fabricated zeroes.
 Model columns distinguish requested, observed and profile-default identity.
 
-Forecast normally returns up to 10 selections (maximum 20). When Nextcloud's
+Forecast uses one conditional scenario for all sources, normally up to 10
+selections (maximum 20). When Nextcloud's
 external owner gate participates, a local queue snapshot cannot prove the live
 global order. The API instead labels a **conditional scenario** based on the
 last committed owner observation, or excludes Nextcloud explicitly. It stops
-when a fresh owner check is needed and lists local unranked candidates separately.
+when a fresh owner check is needed and lists local unranked candidates separately;
+those candidates are not guaranteed eligible. Source-interval boundaries also
+stop the scenario for a fresh eligibility check.
 Pause/fence holds and observation age remain visible; a scenario is neither a
 lease nor an ETA promise. See [forecast](docs/FORECAST.md) and
 [dashboard](docs/DASHBOARD.md).
@@ -190,6 +196,8 @@ worker и не доказывает готовность его модели.
 одной фактической модели образуют FIFO lane; конкурирующие модели сменяют
 друг друга на границе claim после 10 попыток, 300 секунд текущего turn либо
 600 секунд ожидания конкурента. Текущее задание не прерывается; это не SLA.
+На границе model turn другой source с тем же весом и остатком собственного
+бюджета может продолжить ту же модель, не обходя eligibility и owner gate.
 Без policy действует глобальный FIFO.
 
 **Pause queue** сохраняется после рестарта, запрещает новые запуски, но не
@@ -197,9 +205,12 @@ worker и не доказывает готовность его модели.
 запуски. Admission block и dispatch pause конкретного source независимы.
 
 Dashboard показывает запрошенную и наблюдаемую модель, обновляется в фоне и
-подгружает History страницами. Forecast — условная проекция, не очередь leases:
+подгружает History страницами. Forecast — единый условный сценарий всех source,
+не очередь leases:
 при участии внешнего Nextcloud owner gate отдельно показаны сценарий,
 давность наблюдения, неранжированные кандидаты и необходимость нового gate read.
+Неранжированный кандидат не считается допущенным к выполнению. На границе
+интервала source сценарий останавливается до следующей проверки eligibility.
 При паузе сценарий применим только после resume; точный ETA не обещается.
 
 Для локального запуска используйте [admission-only пример](#local-start-admission-only),

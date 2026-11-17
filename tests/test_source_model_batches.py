@@ -130,6 +130,92 @@ class SourceModelBatchTests(unittest.TestCase):
         self.assertEqual([d["selected_model"] for _, d in actual[:10]], [MODELS[0]] * 10)
         self.assertEqual(self.b._time_cycle["sources"].keys(), {SOURCE})
 
+    def test_equal_weight_cross_source_model_blocks_and_forecast_parity(self):
+        self.p = self.policy({SOURCE: {"weight": 3}, "peer": {"weight": 3}})
+        ids = {}
+        for source in (SOURCE, "peer"):
+            for model in MODELS:
+                ids[source, model] = [self.submit(model, source,
+                    profile="cron" if i % 2 else "interactive") for i in range(20)]
+        actual = self.assert_forecast_matches(20) + self.step(100)
+        models = [d["selected_model"] for _, d in actual]
+        self.assertEqual(self.runs(models)[0], [MODELS[0], 20])
+        # Waiting/time boundaries may force later turns sooner than 10 claims.
+        self.assertLessEqual(len(self.runs(models)), 12)
+        self.assertEqual(len({job for job, _ in actual}), 120)
+        for (source, model), expected in ids.items():
+            selected = [j for j, d in actual
+                        if d["selected_source"] == source and d["selected_model"] == model]
+            self.assertEqual(selected, expected)
+        self.assertEqual(sum(1 for _, d in actual if d["selected_source"] == SOURCE), 60)
+
+    def test_cross_source_affinity_cannot_override_unequal_weight_or_exhausted_budget(self):
+        self.p = self.policy({SOURCE: {"weight": 3}, "peer": {"weight": 4}})
+        self.enqueue(20, MODELS[:2], SOURCE)
+        self.enqueue(20, MODELS[:2], "peer")
+        first = self.step(11)
+        self.assertEqual([d["selected_source"] for _, d in first], [SOURCE] * 11)
+        self.assertEqual(first[-1][1]["selected_model"], MODELS[1])
+
+    def test_equal_weight_model_affinity_never_extends_source_local_turn(self):
+        self.p = self.policy({SOURCE: {"weight": 3}, "peer": {"weight": 3}})
+        self.enqueue(25, MODELS[:2], SOURCE)
+        self.enqueue(25, MODELS[:2], "peer")
+        actual = self.step(42)
+        for source in (SOURCE, "peer"):
+            local = [d["selected_model"] for _, d in actual if d["selected_source"] == source]
+            self.assertTrue(all(count <= 10 for _, count in self.runs(local)))
+        self.assertEqual(self.runs([d["selected_model"] for _, d in actual])[:2],
+                         [[MODELS[0], 20], [MODELS[1], 20]])
+
+    def test_all_sources_share_one_conditional_scenario_legacy_alias(self):
+        jobs = self.enqueue(2, MODELS[:2])
+        data = self.b.forecast(self.p)
+        self.assertEqual(data["conditional_scenario"]["basis"], "all_eligible_sources")
+        self.assertEqual(data["conditional_scenario"]["next_selections"], data["next_selections"])
+        self.assertEqual({r["job_id"] for r in data["next_selections"]}, set(jobs))
+
+    def test_forecast_stops_before_delayed_source_can_join(self):
+        self.p = self.policy({SOURCE: {"weight": 3}, "peer": {"weight": 3}})
+        self.enqueue(5, (MODELS[0],))
+        self.submit(MODELS[1], "peer")
+        with self.b.db:
+            self.b.db.execute("INSERT INTO source_schedules(source,next_allowed) VALUES(?,?)",
+                              ("peer", self.clock() + 5))
+        self.b._duration_estimates[(SOURCE, MODELS[0])] = 20
+        self.b._publish_scheduler_snapshot()
+        forecast = self.b.forecast(self.p)
+        self.assertEqual(len(forecast["next_selections"]), 1)
+        self.assertEqual(forecast["conditional_scenario"]["stop_reason"],
+                         "source_schedule_recheck_required")
+        self.assertTrue(self.b.dispatch_once(policy=self.p))
+        self.assertEqual(self.b._last_scheduler_decision["selected_source"], SOURCE)
+
+    def test_delayed_source_ready_before_running_job_finishes_stops_at_start(self):
+        self.p = self.policy({SOURCE: {"weight": 3}, "peer": {"weight": 3}})
+        self.enqueue(2, (MODELS[0],))
+        self.submit(MODELS[1], "peer")
+        with self.b.db:
+            self.b.db.execute("INSERT INTO source_schedules(source,next_allowed) VALUES(?,?)",
+                              ("peer", self.clock() + 5))
+            self.b.db.execute("UPDATE jobs SET state='running' WHERE id=(SELECT id FROM jobs WHERE source=? LIMIT 1)",
+                              (SOURCE,))
+        self.b._active_time_batches["running"] = {"lane": (SOURCE, MODELS[0]), "started": self.clock()}
+        self.b._duration_estimates[(SOURCE, MODELS[0])] = 20
+        self.b._publish_scheduler_snapshot()
+        data = self.b.forecast(self.p)
+        self.assertEqual(data["next_selections"], [])
+        self.assertEqual(data["conditional_scenario"]["stop_reason"],
+                         "source_schedule_recheck_required")
+
+    def test_forecast_refuses_truncated_raw_lanes(self):
+        from unittest.mock import patch
+        self.enqueue(2, MODELS)
+        with patch("broker.service.FORECAST_MAX_RAW_LANES", 2):
+            forecast = self.b.forecast(self.p)
+        self.assertTrue(forecast["unavailable"])
+        self.assertNotIn("next_selections", forecast)
+
     def test_time_limit_switches_earlier_and_never_preempts_long_job(self):
         self.ollama.execution_seconds = 80
         self.enqueue()

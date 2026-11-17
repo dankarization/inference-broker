@@ -63,6 +63,7 @@ from .storage import (
 
 LOGGER = logging.getLogger("ollama_inference_broker.audit")
 OBSERVER_READ_DEADLINE_SECONDS = 0.75
+FORECAST_MAX_RAW_LANES = 512
 SCHEDULING_HORIZON_SECONDS = 60 * 60
 FORECAST_DEFAULT_EXECUTION_SECONDS = 300.0
 # Source-local model turns; never preempt an attempt already holding the slot.
@@ -1631,7 +1632,7 @@ class Broker:
             # successors from the local queue in an observer transaction.
             candidates = [row for row in candidates if row["source"] != "nextcloud"]
             observed_nextcloud.sort(key=lambda row: (
-                0 if row["nextcloud_priority"] == "new_upload" else 1,
+                0 if policy is not None and row["nextcloud_priority"] == "new_upload" else 1,
                 row["queued_at"] if row["queued_at"] is not None else row["created"], row["id"]))
             seen = set()
             for row in observed_nextcloud:
@@ -1659,7 +1660,19 @@ class Broker:
         remaining = [dict(row) for row in candidates]
         selections: list[dict[str, Any]] = []
         owner_tier_exhausted = False
+        schedule_boundary = False
+        # A currently delayed source can become eligible during projected
+        # execution. It was excluded by _candidates; never predict past its
+        # first possible arrival without rebuilding the eligible set.
+        delayed = db.execute(
+            "SELECT MIN(s.next_allowed) FROM source_schedules s "
+            "WHERE s.next_allowed>? AND EXISTS(SELECT 1 FROM jobs j "
+            "WHERE j.source=s.source AND j.state='queued')", (now,)).fetchone()[0]
+        if delayed is not None and projected_now >= delayed:
+            schedule_boundary = True
         for _ in range(bounded):
+            if schedule_boundary:
+                break
             if not remaining:
                 break
             if policy is None:
@@ -1700,9 +1713,20 @@ class Broker:
             if len(selections) < bounded:
                 if owner_info and picked["source"] == "nextcloud":
                     observed_nextcloud = [row for row in observed_nextcloud if row["id"] != picked["id"]]
-                    successor = next((row for row in observed_nextcloud
-                        if (row["profile"], row["target_model"]) ==
-                           (picked["profile"], picked["target_model"])), None)
+                    if policy is None:
+                        # _next uses global FIFO without a policy, not one
+                        # head per model lane. The committed preview is bounded
+                        # and already owner-filtered; never seek local successors.
+                        remaining = [row for row in remaining if row["source"] != "nextcloud"]
+                        remaining.extend(dict(row) for row in observed_nextcloud)
+                        remaining.sort(key=lambda row: (
+                            row["queued_at"] if row["queued_at"] is not None else row["created"],
+                            row["id"]))
+                        successor = None
+                    else:
+                        successor = next((row for row in observed_nextcloud
+                            if (row["profile"], row["target_model"]) ==
+                               (picked["profile"], picked["target_model"])), None)
                     owner_tier_exhausted = not observed_nextcloud
                 elif policy is not None:
                     successor = self._forecast_lane_successor(db, picked, include_producer_storage)
@@ -1716,6 +1740,10 @@ class Broker:
                 duration = self._forecast_duration(lane, estimates)
                 projected_now += duration
                 self._record_time_usage(cycle, lane, duration, batches, projected_now)
+            if (PROFILES[picked["profile"]].min_interval_seconds
+                    or (delayed is not None and projected_now >= delayed)):
+                schedule_boundary = True
+                break  # Source eligibility must be recomputed at this boundary.
             if owner_tier_exhausted:
                 break  # The next owner tier/weight cannot be inferred from this read.
         result = {
@@ -1733,6 +1761,12 @@ class Broker:
         if db.execute("SELECT 1 FROM gpu_executor_fences LIMIT 1").fetchone():
             result["dispatch_holds"].append(
                 "Executor fence exists; projection requires release or confirmed compatible reuse")
+        if schedule_boundary:
+            result["dispatch_holds"].append(
+                "Projection stops at a source interval boundary; eligibility must be recomputed")
+        if not include_producer_storage:
+            result["contingency"] += (
+                "; public-only hypothetical excludes private jobs and cannot prove global order")
         if owner_info is not None:
             result["next_selections"] = []  # A scenario is NOT the actual global order.
             result["owner_gate"] = owner_info
@@ -1740,12 +1774,14 @@ class Broker:
                 "basis": "last_owner_gate" if observed_nextcloud or any(
                     r["source"] == "nextcloud" for r in selections) else "nextcloud_excluded",
                 "next_selections": selections,
-                "stop_reason": "owner_recheck_required" if owner_tier_exhausted else None,
+                "stop_reason": ("owner_recheck_required" if owner_tier_exhausted else
+                                "source_schedule_recheck_required" if schedule_boundary else None),
             }
+            ranked_ids = {r["job_id"] for r in selections}
             result["unranked_candidates"] = [{
                 "job_id": r["id"], "source": r["source"], "profile": r["profile"],
                 "model": self._lane_key(r)[1], "nextcloud_priority": r["nextcloud_priority"],
-            } for r in local_nextcloud[:bounded]]
+            } for r in local_nextcloud if r["id"] not in ranked_ids][:bounded]
             result["contingency"] = (
                 "Conditional scenario, not the actual dispatch order. Based on the last committed "
                 "owner-gate read when available; otherwise other sources only if Nextcloud is excluded. "
@@ -1753,6 +1789,17 @@ class Broker:
                 "lane heads below are unranked, not a fallback order. New jobs, owner changes and "
                 "non-preemptive execution durations can change the scenario; no wall-clock ETA."
             )
+            if not include_producer_storage:
+                result["contingency"] += (
+                    " Public-only hypothetical excludes private jobs and cannot prove global order.")
+        else:
+            # One canonical scenario for all sources.  Keep the legacy field
+            # as an identical conditional alias for existing API consumers.
+            result["conditional_scenario"] = {
+                "basis": "all_eligible_sources",
+                "next_selections": selections,
+                "stop_reason": "source_schedule_recheck_required" if schedule_boundary else None,
+            }
         return result
 
     def dashboard(
@@ -1947,6 +1994,9 @@ class Broker:
             heads = []
             for source in sources:
                 for identity in self._queued_model_identities(connection, index, public, source):
+                    if len(heads) >= FORECAST_MAX_RAW_LANES:
+                        # A partial competitor set must never appear ranked.
+                        raise ForecastSnapshotChanged("forecast raw lane limit exceeded")
                     heads.extend(connection.execute(
                         "SELECT id,profile,source,created,queued_at,attempt_count,external_id,source_item_id,"
                         f"nextcloud_priority,{QUEUED_MODEL_SQL} AS target_model "
@@ -2323,6 +2373,22 @@ class Broker:
         if selected_source is None:
             cycle = self._new_time_cycle(available, policy, now, active_batches=active_batches, reference_cycle=reference_cycle)
             selected_source = cycle["order"][0]
+        # At a source-local model-turn boundary, finish the same actual-model
+        # block across equal-weight sources before changing models.  Source
+        # budgets remain the authority: never borrow another source's share or
+        # override a lower-weight admission boundary.  Only consider the heads
+        # already exposed by each source's finite model-turn rotation.
+        if boundary not in available and selected_source == current and current in batches:
+            old_model = batches[current].get("model")
+            if old_model and self._lane_key(available[current])[1] != old_model:
+                weight = cycle["sources"][current]["weight"]
+                affinity = [s for s in cycle["order"]
+                    if s != current and s in available and s in cycle["sources"]
+                    and cycle["sources"][s]["weight"] == weight
+                    and self._budget_remaining(cycle["sources"][s])
+                    and self._lane_key(available[s])[1] == old_model]
+                if affinity:
+                    selected_source = affinity[0]
         if boundary not in available:
             cycle["current"] = selected_source
         selected = available[selected_source]

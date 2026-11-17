@@ -30,6 +30,12 @@ source must not reset the horizon and starve its peer. Ready-source changes and
 policy reloads rebase remaining time without erasing charged execution.
 Nextcloud new-upload priority is source-local and precedes historical lanes.
 
+At a source-local model-turn boundary, another source of the same effective
+weight may continue the just-served model if its eligible head matches and its
+own time budget is not exhausted. This avoids unnecessary switches without
+extending source-local turns, multiplying shares or bypassing eligibility.
+Lower-weight arrivals retain their existing non-preemptive boundary behavior.
+
 These bounds do not establish a wall-clock per-job SLA: attempts are
 non-preemptive, other sources have their own shares, and gates can withhold a
 lane indefinitely. For a fixed finite set of M continuously eligible models,

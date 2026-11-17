@@ -141,6 +141,17 @@ class OwnerGateForecastTests(unittest.TestCase):
         self.assertEqual(rows, [])
         self.assertTrue(data["unranked_candidates"])
 
+    def test_actual_owner_shape_incomplete_scope_floor_one_blocks_tier_two(self):
+        self.prepare()
+        queued = [self.nc(tier=2) for _ in range(8)]
+        self.gate.fixture.update(floor=1, scope_complete=False)
+        peer = self.submit(MODELS[1], "peer")
+        self.assertEqual(self.step()[0][0], peer)
+        data, rows = self.projected()
+        self.assertFalse(any(r["job_id"] in queued for r in rows))
+        self.assertEqual(data["owner_gate"]["state"], "observed_tier_exhausted")
+        self.assertTrue(all(self.b.status(job)["state"] == "queued" for job in queued))
+
     def test_stale_snapshot_has_age_without_timestamp_refresh_or_network(self):
         self.prepare()
         self.nc()
@@ -383,8 +394,39 @@ class OwnerGateForecastTests(unittest.TestCase):
         self.gate.value = None
         self.b._publish_scheduler_snapshot()
         data = self.b.forecast()
-        self.assertEqual([r["job_id"] for r in data["conditional_scenario"]["next_selections"]],
+        self.assertEqual([r["job_id"] for r in data["conditional_scenario"]["next_selections"]][:2],
                          jobs)
+
+    def test_no_policy_fifo_does_not_promote_new_upload(self):
+        self.prepare()
+        historical = self.nc(priority="historical")
+        newer = self.nc(priority="new_upload")
+        self.gate.value = self.gate.fixture
+        self.b._nextcloud_forecast_preview = capture_owner_preview(
+            self.b._candidates(), self.gate, None, self.clock(), None)
+        self.gate.value = None
+        self.b._publish_scheduler_snapshot()
+        rows = self.b.forecast()["conditional_scenario"]["next_selections"]
+        self.assertEqual([row["job_id"] for row in rows], [historical, newer])
+
+    def test_scenario_and_unranked_are_disjoint_and_all_sources_share_one_list(self):
+        self.prepare()
+        self.p = self.policy({"nextcloud": {"weight": 7}, "peer": {"weight": 1}})
+        self.nc()
+        for _ in range(5):
+            self.nc()
+        self.step()
+        self.submit(MODELS[1], "peer")
+        data, rows = self.projected()
+        self.assertFalse({r["job_id"] for r in rows} &
+                         {r["job_id"] for r in data["unranked_candidates"]})
+        self.assertEqual({r["source"] for r in rows}, {"nextcloud", "peer"})
+
+    def test_public_contingency_mentions_private_competitors(self):
+        self.prepare()
+        self.nc()
+        data, _ = self.projected(public=True)
+        self.assertIn("excludes private jobs", data["contingency"])
 
     def test_claim_rollback_then_noop_cannot_spend_a_model_turn_or_source_budget(self):
         self.prepare()

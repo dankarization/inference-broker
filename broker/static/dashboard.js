@@ -150,12 +150,17 @@ function renderDashboard(data) {
     const owner = forecast.owner_gate || {};
     let basis = 'Read-only projection — not a promise of dispatch time or order';
     if (scenario) {
-      basis = scenario.basis === 'last_owner_gate' ?
-        'Conditional scenario: based on last owner-gate read — not a live Nextcloud ranking' :
-        'Conditional scenario: other sources only if Nextcloud is excluded';
-      basis += '; owner observation: ' + display(owner.state);
+      if (scenario.basis === 'last_owner_gate') {
+        basis = 'Conditional scenario: based on last owner-gate read — not a live Nextcloud ranking';
+      } else if (scenario.basis === 'nextcloud_excluded') {
+        basis = 'Conditional scenario: other sources only if Nextcloud is excluded';
+      } else {
+        basis = 'Conditional scenario: all currently eligible sources';
+      }
+      if (owner.state) basis += '; owner observation: ' + display(owner.state);
       if (owner.age_seconds != null) basis += ', age ' + duration(owner.age_seconds);
-      if (scenario.stop_reason) basis += '; stops at owner recheck boundary';
+      if (scenario.stop_reason === 'owner_recheck_required') basis += '; stops at owner recheck boundary';
+      if (scenario.stop_reason === 'source_schedule_recheck_required') basis += '; stops at source schedule boundary';
     }
     byId('forecast-basis').textContent = basis;
     const holds = forecast.dispatch_holds || [];
@@ -170,7 +175,8 @@ function renderDashboard(data) {
     fillBody('forecast-body', (selections || []).map(item => row([
       cell(item.job_id), cell(item.source), cell(item.profile), cell(item.model), cell(item.weight),
       cell(item.mode), cell(item.reason, true), cell(duration(item.wait_seconds), false, item.wait_seconds)])), 8,
-      scenario ? 'No ranked selections in this scenario — see unranked lane heads below' : 'No eligible selections in this snapshot');
+      unranked.length ? 'No ranked selections in this scenario — see unranked lane heads below' :
+        'No eligible selections in this snapshot');
   }
   // Once paging begins, keep this historical snapshot stable until reload.
   // Periodic queue refresh must not discard rows or invalidate an in-flight cursor.

@@ -9,7 +9,10 @@ deadline and no dispatcher mutex, network/owner query or inference.
 
 Without an eligible Nextcloud lane controlled by the external owner gate,
 `next_selections` retains its existing bounded (default 10, maximum 20) contract.
-The same selector works on private model-turn/time-budget copies with estimated
+The canonical `conditional_scenario.next_selections` contains one projection
+for all eligible sources. In the ordinary case the legacy `next_selections`
+is an identical conditional compatibility alias; it is not a guarantee. The
+same selector works on private model-turn/time-budget copies with estimated
 non-preemptive execution times. Cycle reconstruction now uses only that snapshot,
 not live dispatcher accounting. Scheduler state is published after claim/completion
 commit and anchored to the existing audit sequence. An older WAL reader paired
@@ -19,6 +22,12 @@ do not invalidate scheduler accounting. Rollback restores all private cycle,
 model-turn, active-attempt and duration state before any later publication.
 Later admissions, cancellations, retries, source
 schedules/policy and executor readiness can change the actual selections.
+If a source is delayed or a selected profile imposes a source interval, the
+projection stops before the first interval-dependent selection and reports
+`source_schedule_recheck_required`; it does not guess newly eligible work.
+Public-only projections exclude private jobs and are explicitly hypothetical,
+not a global order. At most 512 distinct raw lanes are inspected; exceeding
+that cap returns unavailable rather than silently omitting competitors.
 
 `dispatch_holds` reports observed global pause and executor fences without
 claiming their future release. A paused forecast applies **only after resume**.
@@ -67,7 +76,8 @@ When a Nextcloud candidate exists:
   job identity or aggregate overflow prevents an owner-ranked scenario.
 - `unranked_candidates` shows up to the requested limit of current local
   Nextcloud raw-lane heads. This is a **non-exhaustive unranked preview**, not
-  fallback FIFO or proof those jobs can dispatch. It may overlap the scenario.
+  fallback FIFO or proof those jobs can dispatch. Already scenario-ranked IDs
+  are excluded; the preview is still non-exhaustive.
 
 The API and dashboard always expose these conditions together with the rows.
 The contingency paragraph is visible (it was previously hidden). UI renders

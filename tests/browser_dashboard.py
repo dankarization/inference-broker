@@ -88,7 +88,9 @@ async def run():
                 assert await evaluate("!document.querySelector('#forecast-live').hidden")
                 assert await evaluate("document.querySelector('#forecast-basis').textContent.includes('not a live Nextcloud ranking')")
                 assert await evaluate("document.querySelector('#forecast-body').rows.length") == 10
-                assert await evaluate("!document.querySelector('#forecast-unranked').hidden")
+                # The one local head is already in the conditional scenario;
+                # do not duplicate it in the non-exhaustive unranked preview.
+                assert await evaluate("document.querySelector('#forecast-unranked').hidden")
                 assert await evaluate("document.querySelector('#contingency').offsetParent !== null")
                 proof = os.environ.get("BROKER_BROWSER_PROOF_DIR")
                 for width in (390, 1440):

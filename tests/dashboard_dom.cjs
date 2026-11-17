@@ -222,6 +222,18 @@ const durationCases = JSON.parse(
   assert.match(unknownOwner.id('forecast-body').rows[0].cells[0].textContent, /No ranked selections/);
   assert.equal(unknownOwner.id('forecast-unranked').hidden, false);
 
+  const allSources = await boot({...fixture, forecast: {
+    next_selections: fixture.forecast.next_selections,
+    conditional_scenario: {basis: 'all_eligible_sources',
+      next_selections: fixture.forecast.next_selections,
+      stop_reason: 'source_schedule_recheck_required'},
+    dispatch_holds: ['Projection stops at a source interval boundary']
+  }});
+  assert.match(allSources.id('forecast-basis').textContent, /all currently eligible sources/);
+  assert.match(allSources.id('forecast-basis').textContent, /source schedule boundary/);
+  assert.doesNotMatch(allSources.id('forecast-basis').textContent, /Nextcloud is excluded/);
+  assert.equal(allSources.id('forecast-body').rows[0].cells[0].textContent, 'next');
+
   const initial = id('history-body').rows[0].cells.map(td => td.textContent);
   assert.deepEqual(initial, ['job-<one>', 'source', '3', 'interactive', 'test-model',
     'completed', '00:12', '28/10/2026, 17:52:17', '2']);
