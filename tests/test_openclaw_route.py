@@ -574,6 +574,7 @@ class NativeWaitBudgetTests(unittest.TestCase):
                 self.assertEqual(openclaw_wait_seconds(profile), 7500)
             elif name in VOICE_PROFILE_NAMES or name in {
                 "nextcloud-eval-qwen-64k-v1",
+                "syncopia-summary-gemma12-v1", "syncopia-summary-bolt-e4b-v1",
                 "telegram-nightly-qwen38-v1", "telegram-nightly-gemma12-v1",
                 "telegram-nightly-gemma26-v1", "telegram-nightly-nemotron-nano-v1",
             }:

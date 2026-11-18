@@ -160,6 +160,9 @@ class DashboardTests(unittest.TestCase):
         self.assertLess(html.index('id="queue-pause"'), html.index('<main'))
         # Wide tables scroll in their own box instead of stretching the page.
         self.assertEqual(html.count('<div class="table-scroll">'), 4)
+        self.assertNotIn('id="forecast-unranked"', html)
+        self.assertIn('id="forecast-basis"', html)
+        self.assertNotIn('class="note" hidden><small id="contingency"', html)
         for name in ('sources-table', 'active-table', 'forecast-table', 'history-table'):
             self.assertIn(f'<div class="table-scroll"><table id="{name}">', html)
         self.assertIn('mm:ss', (Path(__file__).resolve().parents[1] / 'broker/static/dashboard.js').read_text(encoding='utf-8'))

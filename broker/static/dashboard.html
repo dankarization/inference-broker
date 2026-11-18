@@ -61,6 +61,7 @@
 <thead><tr>
 <th data-sort-key="id"><button type="button" class="sort-btn">ID<span class="sort-mark" aria-hidden="true">↕</span></button></th>
 <th data-sort-key="source"><button type="button" class="sort-btn">Source<span class="sort-mark" aria-hidden="true">↕</span></button></th>
+<th data-sort-key="model"><button type="button" class="sort-btn">Model<span class="sort-mark" aria-hidden="true">↕</span></button></th>
 <th data-sort-key="weight"><button type="button" class="sort-btn">Weight<span class="sort-mark" aria-hidden="true">↕</span></button></th>
 <th data-sort-key="state"><button type="button" class="sort-btn">State<span class="sort-mark" aria-hidden="true">↕</span></button></th>
 <th data-sort-key="started"><button type="button" class="sort-btn">Started<span class="sort-mark" aria-hidden="true">↕</span></button></th>
@@ -76,6 +77,8 @@
 <p id="forecast-error" class="error" hidden></p>
 <div id="forecast-live">
 <p class="note">Current model: <b id="current-model"></b></p>
+<p id="forecast-basis" class="note"></p>
+<p id="forecast-holds" class="note" hidden></p>
 <div class="table-scroll"><table id="forecast-table">
 <thead><tr>
 <th data-sort-key="job"><button type="button" class="sort-btn">Job<span class="sort-mark" aria-hidden="true">↕</span></button></th>
@@ -89,7 +92,7 @@
 </tr></thead>
 <tbody id="forecast-body"></tbody>
 </table></div>
-<p class="note" hidden><small id="contingency"></small></p>
+<p class="note"><small id="contingency"></small></p>
 </div>
 </section>
 

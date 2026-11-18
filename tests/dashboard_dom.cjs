@@ -107,7 +107,7 @@ const fixture = {
   sources: [source('weight-10', 10), source('unknown', null), source('weight-1-b', 1),
     source('weight-2', 2), source('weight-1-a', 1)],
   active_jobs: [{id: '<script>job</script>', source: 'source', weight: 3, state: 'running',
-    started: 1787992200, lease_until: null, attempt_count: 1, retry_count: 0}],
+    model: 'generic:override', started: 1787992200, lease_until: null, attempt_count: 1, retry_count: 0}],
   overall: {states: {completed: 0}, completed_last_hour: 0, completed_last_24_hours: 0},
   history: [history('job-<one>')],
   forecast: {current_model: 'model', contingency: '<contingent>', next_selections: [
@@ -116,17 +116,17 @@ const fixture = {
   ]}
 };
 
-async function boot(data, unavailableShell = false, fail = false) {
+async function boot(data, unavailableShell = false, fail = false, noObserver = false) {
   const document = parseHTML(fs.readFileSync(path.join(root, 'broker/static',
     unavailableShell ? 'dashboard-unavailable.html' : 'dashboard.html'), 'utf8'));
-  const requests = [], observerCallbacks = [], timers = [];
+  const requests = [], observerCallbacks = [], timers = [], observations = [];
   const context = vm.createContext({
     document, Intl, Date, console, Set, Map,
     location: {reload() { context.reloaded = true; }},
     confirm: () => true,
     IntersectionObserver: class {
       constructor(callback) { observerCallbacks.push(callback); }
-      observe() {}
+      observe() { observations.push(true); }
     },
     setInterval: (callback, ms) => {
       const timer = {id: timers.length + 1, callback, ms, active: true};
@@ -140,11 +140,12 @@ async function boot(data, unavailableShell = false, fail = false) {
     }
   });
   context.window = context;
+  if (noObserver) delete context.IntersectionObserver;
   context.scrollTo = (x, y) => { context.scrollX = x; context.scrollY = y; };
   vm.runInContext(fs.readFileSync(path.join(root, 'broker/table_sort.js'), 'utf8'), context);
   vm.runInContext(fs.readFileSync(path.join(root, 'broker/static/dashboard.js'), 'utf8'), context);
   await vm.runInContext('dashboardReady', context);
-  return {context, document, requests, observerCallbacks, timers,
+  return {context, document, requests, observerCallbacks, timers, observations,
     active: () => timers.filter(timer => timer.active),
     flush: async (turns = 8) => { for (let i = 0; i < turns; i++) await new Promise(resolve => setImmediate(resolve)); },
     id: id => document.getElementById(id)};
@@ -180,12 +181,48 @@ const durationCases = JSON.parse(
   assert.equal(document.querySelector('.weight-form').elements.weight.options.length, 10);
   assert.equal(id('active-body').rows[0].cells[0].textContent, '<script>job</script>');
   assert.equal(id('active-body').rows[0].cells[0].children.length, 0);
-  assert.equal(id('active-body').rows[0].cells[4].textContent, '2026-08-29 12:30:00 UTC+04:00 (Asia/Tbilisi)');
-  assert.equal(id('active-body').rows[0].cells[4].title, '2026-08-29T08:30:00Z (epoch 1787992200)');
-  assert.equal(id('active-body').rows[0].cells[5].textContent, '—');
+  assert.equal(id('active-body').rows[0].cells[2].textContent, 'generic:override');
+  assert.equal(id('active-body').rows[0].cells[5].textContent, '2026-08-29 12:30:00 UTC+04:00 (Asia/Tbilisi)');
+  assert.equal(id('active-body').rows[0].cells[5].title, '2026-08-29T08:30:00Z (epoch 1787992200)');
+  assert.equal(id('active-body').rows[0].cells[6].textContent, '—');
   assert.equal(id('forecast-body').rows[0].cells[2].textContent, 'interactive');
   assert.equal(id('forecast-body').rows[0].cells[7].textContent, '02:30');
   assert.equal(id('forecast-body').rows[0].cells[7].getAttribute('data-sort-value'), '150.2');
+  assert.equal(id('contingency').parentElement.hidden, false);
+  assert.equal(id('contingency').textContent, '<contingent>');
+  const conditional = await boot({...fixture, forecast: {
+    current_model: 'current', next_selections: [], contingency: '<explicit uncertainty>',
+    conditional_scenario: {basis: 'all_eligible_sources',
+      next_selections: fixture.forecast.next_selections,
+      stop_reason: 'source_schedule_recheck_required'},
+    dispatch_holds: ['Queue is paused', 'Executor fence exists']
+  }});
+  assert.equal(conditional.id('forecast-live').hidden, false);
+  assert.equal(conditional.id('forecast-error').hidden, true);
+  assert.match(conditional.id('forecast-basis').textContent, /all currently eligible sources/);
+  assert.match(conditional.id('forecast-basis').textContent, /source schedule boundary/);
+  assert.match(conditional.id('forecast-holds').textContent, /Queue is paused/);
+  assert.equal(conditional.id('forecast-holds').hidden, false);
+  assert.equal(conditional.id('forecast-body').rows[0].cells[0].textContent, 'next');
+  assert.equal(conditional.id('contingency').textContent, '<explicit uncertainty>');
+
+  const emptyForecast = await boot({...fixture, forecast: {
+    next_selections: [], conditional_scenario: {basis: 'all_eligible_sources', next_selections: []}
+  }});
+  assert.match(emptyForecast.id('forecast-body').rows[0].cells[0].textContent, /No eligible selections/);
+
+  const allSources = await boot({...fixture, forecast: {
+    next_selections: fixture.forecast.next_selections,
+    conditional_scenario: {basis: 'all_eligible_sources',
+      next_selections: fixture.forecast.next_selections,
+      stop_reason: 'source_schedule_recheck_required'},
+    dispatch_holds: ['Projection stops at a source interval boundary']
+  }});
+  assert.match(allSources.id('forecast-basis').textContent, /all currently eligible sources/);
+  assert.match(allSources.id('forecast-basis').textContent, /source schedule boundary/);
+  assert.doesNotMatch(allSources.id('forecast-basis').textContent, /Nextcloud is excluded/);
+  assert.equal(allSources.id('forecast-body').rows[0].cells[0].textContent, 'next');
+
   const initial = id('history-body').rows[0].cells.map(td => td.textContent);
   assert.deepEqual(initial, ['job-<one>', 'source', '3', 'interactive', 'test-model',
     'completed', '00:12', '28/10/2026, 17:52:17', '2']);
@@ -258,8 +295,10 @@ const durationCases = JSON.parse(
   assert.equal(context.reloaded, undefined);
 
   // Appended history shares the initial renderer, de-duplicates and recovers after failure.
+  const beforeFailedPage = page.observations.length;
   context.fetch = async () => { throw new Error('history offline'); };
   await page.observerCallbacks[0]([{isIntersecting: true}]);
+  assert.equal(page.observations.length, beforeFailedPage, 'failed history must not rearm a tight retry loop');
   assert.match(id('history-error').textContent, /history offline/);
   assert.equal(id('history-error').hidden, false);
   context.fetch = async () => ({ok: true, json: async () => ({
@@ -272,6 +311,40 @@ const durationCases = JSON.parse(
   assert.equal(id('history-sentinel').dataset.cursor, '');
   assert.equal(id('history-error').textContent, '');
   assert.equal(id('history-error').hidden, true);
+
+  // Hidden/overlapping reads cannot issue a second network request.
+  const guarded = await boot(fixture);
+  let finishRead, reads = 0;
+  guarded.context.fetch = () => {
+    reads++;
+    return new Promise(resolve => { finishRead = resolve; });
+  };
+  guarded.document.hidden = true;
+  await guarded.context.loadDashboard();
+  await guarded.observerCallbacks[0]([{isIntersecting: true}]);
+  assert.equal(reads, 0);
+  guarded.document.hidden = false;
+  const pendingRead = guarded.context.loadDashboard();
+  await guarded.context.loadDashboard();
+  await guarded.observerCallbacks[0]([{isIntersecting: true}]);
+  assert.equal(reads, 1);
+  finishRead({ok: true, json: async () => fixture});
+  await pendingRead;
+  let finishPage;
+  guarded.context.fetch = () => {
+    reads++;
+    return new Promise(resolve => { finishPage = resolve; });
+  };
+  const pendingPage = guarded.observerCallbacks[0]([{isIntersecting: true}]);
+  await guarded.observerCallbacks[0]([{isIntersecting: true}]);
+  await guarded.context.loadDashboard();
+  assert.equal(reads, 2);
+  finishPage({ok: true, json: async () => ({items: [history('older')], next_cursor: 'old:cursor'})});
+  await pendingPage;
+  guarded.context.fetch = async () => ({ok: true, json: async () => fixture});
+  await guarded.context.loadDashboard();
+  assert.equal(guarded.id('history-body').rows.length, 2);
+  assert.equal(guarded.id('history-sentinel').dataset.cursor, 'old:cursor');
 
   // Policy controls retain serialized latest-desired writes and failure recovery.
   const weightForm = document.querySelector('.weight-form'), select = weightForm.elements.weight;
@@ -324,6 +397,9 @@ const durationCases = JSON.parse(
   const offline = await boot(fixture, false, true);
   assert.equal(offline.id('dashboard-live').hidden, true);
   assert.match(offline.id('dashboard-error').textContent, /offline/);
+  const legacy = await boot(fixture, false, false, true);
+  assert.equal(legacy.id('dashboard-error').hidden, true);
+  assert.equal(legacy.observerCallbacks.length, 0);
   const recovered = await boot(fixture, true);
   assert.equal(recovered.context.reloaded, true);
   assert.equal(recovered.active().length, 0);

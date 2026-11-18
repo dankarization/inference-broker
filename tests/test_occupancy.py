@@ -68,12 +68,12 @@ class OccupancyTest(unittest.TestCase):
         broker = Broker.__new__(Broker)
         broker._active_time_batches = {}
         available = {
-            ('local-voice', 'voice-model'): {'source': 'local-voice', 'queued_at': 1, 'created': 1},
-            ('llm-source', 'llm-model'): {'source': 'llm-source', 'queued_at': 1, 'created': 1},
+            'local-voice': {'source': 'local-voice', 'target_model': 'voice-model', 'queued_at': 1, 'created': 1},
+            'llm-source': {'source': 'llm-source', 'target_model': 'llm-model', 'queued_at': 1, 'created': 1},
         }
         cycle = broker._new_time_cycle(available, Policy(), 1)
-        voice = cycle['lanes'][('local-voice', 'voice-model')]['budget']
-        llm = cycle['lanes'][('llm-source', 'llm-model')]['budget']
+        voice = cycle['sources']['local-voice']['budget']
+        llm = cycle['sources']['llm-source']['budget']
         self.assertAlmostEqual(voice, SCHEDULING_HORIZON_SECONDS / 3)
         self.assertAlmostEqual(llm, 2 * voice)
 
@@ -85,13 +85,14 @@ class OccupancyTest(unittest.TestCase):
             'b': {'lane': b, 'started': 12},
         }
         broker._duration_estimates = {}
-        broker._time_cycle = {'lanes': {a: {'used': 0}, b: {'used': 0}}, 'total_used': 0}
+        broker._time_cycle = {'sources': {a[0]: {'used': 0}, b[0]: {'used': 0}}, 'total_used': 0}
+        broker._model_batches = {}
         broker._last_scheduler_decision = None
         broker._complete_time_batch('b', 17)
-        self.assertEqual(broker._time_cycle['lanes'][b]['used'], 5)
+        self.assertEqual(broker._time_cycle['sources'][b[0]]['used'], 5)
         self.assertIn('a', broker._active_time_batches)
         broker._complete_time_batch('a', 20)
-        self.assertEqual(broker._time_cycle['lanes'][a]['used'], 10)
+        self.assertEqual(broker._time_cycle['sources'][a[0]]['used'], 10)
         self.assertEqual(broker._time_cycle['total_used'], 15)
         self.assertFalse(broker._active_time_batches)
 
@@ -106,17 +107,18 @@ class OccupancyTest(unittest.TestCase):
         broker = Broker.__new__(Broker)
         broker._active_time_batches = {}
         a, b = ('local-voice', 'voice'), ('llm-source', 'llm')
-        rows = {a: {'source': a[0], 'queued_at': 1, 'created': 1},
-                b: {'source': b[0], 'queued_at': 1, 'created': 1}}
+        rows = {a[0]: {'source': a[0], 'target_model': a[1], 'queued_at': 1, 'created': 1},
+                b[0]: {'source': b[0], 'target_model': b[1], 'queued_at': 1, 'created': 1}}
         cycle = broker._new_time_cycle(rows, Policy(), 1)
         broker._active_time_batches['a'] = {'lane': a, 'started': 1}
-        cycle = broker._new_time_cycle({b: rows[b]}, Policy(), 2, cycle)
-        self.assertIn(a, cycle['lanes'])
+        cycle = broker._new_time_cycle({b[0]: rows[b[0]]}, Policy(), 2, cycle)
+        self.assertIn(a[0], cycle['sources'])
         broker._time_cycle = cycle
         broker._duration_estimates = {}
+        broker._model_batches = {}
         broker._last_scheduler_decision = None
         broker._complete_time_batch('a', 11)
-        self.assertEqual(cycle['lanes'][a]['used'], 10)
+        self.assertEqual(cycle['sources'][a[0]]['used'], 10)
 
     def test_inflight_lane_survives_fresh_horizon(self):
         class Policy:
@@ -129,18 +131,18 @@ class OccupancyTest(unittest.TestCase):
         broker = Broker.__new__(Broker)
         a, b = ('local-voice', 'voice'), ('llm-source', 'llm')
         broker._active_time_batches = {'a': {'lane': a, 'started': 1}}
-        broker._time_cycle = {'lanes': {a: {'used': 100, 'budget': 100,
-                                                  'source': a[0], 'model': a[1],
+        broker._time_cycle = {'sources': {a[0]: {'used': 100, 'budget': 100,
                                                   'weight': 2, 'queued_at': 1}}}
-        rows = {b: {'source': b[0], 'queued_at': 1, 'created': 1}}
+        rows = {b[0]: {'source': b[0], 'target_model': b[1], 'queued_at': 1, 'created': 1}}
         cycle = broker._new_time_cycle(rows, Policy(), 2)
-        self.assertEqual(cycle['lanes'][a]['used'], 0)
-        self.assertTrue(cycle['lanes'][a]['accounting_only'])
+        self.assertEqual(cycle['sources'][a[0]]['used'], 0)
+        self.assertTrue(cycle['sources'][a[0]]['accounting_only'])
         broker._time_cycle = cycle
         broker._duration_estimates = {}
+        broker._model_batches = {}
         broker._last_scheduler_decision = None
         broker._complete_time_batch('a', 11)
-        self.assertEqual(cycle['lanes'][a]['used'], 10)
+        self.assertEqual(cycle['sources'][a[0]]['used'], 10)
 
 
 if __name__ == '__main__':

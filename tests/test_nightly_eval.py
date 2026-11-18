@@ -173,7 +173,9 @@ class NightlyTests(unittest.TestCase):
         from broker.profiles import OPENCLAW_LEGACY_PROFILE_NAMES
         added_fields = {'default_context', 'executor', 'occupancy_class', 'occupancy_cohort',
                         'occupancy_max_jobs', 'occupancy_peak_vram_bytes', 'occupancy_evidence'}
-        added_profiles = {'openclaw-deepseek-ocr', 'openclaw-glm-ocr'}
+        from broker.syncopia_summary import MODELS as SUMMARY_MODELS
+        # Dedicated summaries are additive; retain the original catalogue hash.
+        added_profiles = {'openclaw-deepseek-ocr', 'openclaw-glm-ocr'} | set(SUMMARY_MODELS)
         old = {k: {field: value for field, value in asdict(v).items() if field not in added_fields}
                for k, v in PROFILES.items()
                if k not in NIGHTLY_PROFILE_NAMES and k != DAILY_PROFILE and k not in VOICE_PROFILE_NAMES

@@ -28,6 +28,10 @@
   tighten padding/type and hide the least actionable columns (`lease`, `retry`,
   `delayed`, forecast `reason`, history `attempts`). The wide-screen layout is
   unchanged.
+- Forecast shows one conditional scenario produced by the broker scheduler,
+  with dispatch holds, source schedule boundaries and explicit uncertainty.
+  A public view excludes private jobs and cannot prove the global order.
+  [Forecast contract and limitations](FORECAST.md).
 - The three-click table sorting cycle, source dispatch/admission controls, bulk
   confirmations and history scrolling are retained. No dispatcher, scheduler, policy
   or storage semantics are changed.
@@ -103,3 +107,31 @@ A real-browser check (headless Chromium over CDP, no npm dependency) is not part
 of the suite; `scripts/dashboard_browser_fixture.py` starts the real HTTP routes
 over a temporary seeded queue for interactive or scripted layout checks, and
 accepts `--assets-dir` to serve a previous revision for a before/after measure.
+
+### Operational model identity
+
+History and Active jobs expose scalar model identity, not payloads or result
+bodies. `requested_model` is the job override (otherwise the profile default);
+`observed_model` is the backend result's top-level string `model`, when retained.
+The display `model` prefers observed identity, then requested identity.
+`model_identity_source` distinguishes `observed`, `requested`, and
+`profile_default`. Forecast remains a prediction of the requested target, so a
+backend that reports a different canonical model can legitimately differ from
+history. Source and profile remain independent job metadata.
+
+Legacy or storage-compacted jobs with no surviving identity fall back to the
+profile default; this does **not** prove which model executed. Malformed or
+non-string historical identity is ignored. No schema changes or backfills are
+required. History scalar extraction is limited to the selected page (maximum
+30 rows), retaining indexed keyset pagination and public-storage filtering;
+large retained JSON values still incur parsing cost within that bounded page.
+
+## Bounded observation
+
+Counters use covering metadata indexes; history is paged and reads model
+identity scalars only. Observers use separate read-only WAL snapshots and do
+not wait for the dispatch lock. Hidden tabs suppress refreshes; concurrent
+refreshes are serialized and history pagination survives a background update.
+Historical source discovery still scans metadata; initial index building is
+not a read-only operation and should be rehearsed separately before rollout.
+Private deployment manifests and benchmark payloads are not documentation fixtures.

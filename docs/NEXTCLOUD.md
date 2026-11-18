@@ -42,3 +42,37 @@ Producer-owned clients elsewhere retain their existing protocols unchanged.
 
 Tests: `python3 -m unittest discover -s tests -p test_nextcloud.py -v`.
 Synthetic fixtures only; this does not activate a production source or run media.
+
+## Source-local new-upload priority
+
+`POST /v1/jobs` accepts `nextcloud_priority: "new_upload"` or `"historical"`
+only for source `nextcloud`; omission defaults to historical. With source
+policy, confirmed new uploads precede historical model lanes within that
+source's weighted turn, without preempting active jobs or other sources.
+Without policy, scheduling remains global FIFO.
+
+`POST /v1/jobs/{id}/nextcloud-priority` requires exactly `source`, `external_id`,
+`source_item_id` and `nextcloud_priority: "new_upload"`. All correlation fields
+must match the existing job. Promotion is queued-only, monotonic and idempotent:
+it does not create work, reset queue age or demote on historical replay.
+Producer-storage jobs retain their owner-token requirement. Legacy endpoints
+still require a trusted local network, not public exposure.
+`GET /v1/nextcloud/capabilities` describes this contract.
+
+## Retired external priority contract
+
+The broker queue is the sole scheduler. The former external owner-priority
+integration no longer reads a PostgreSQL aggregate, filters candidates or
+changes source weights. `BROKER_NEXTCLOUD_PRIORITY_FILE`, if left in an older
+unit environment, is ignored; remove it only through an authorized operator
+configuration change. `GET /v1/nextcloud/priority` remains available and
+returns `{"schema":"nextcloud-priority-55852-v2","enabled":false}`.
+Existing source-local new-upload promotion remains part of queue scheduling.
+See [forecast](FORECAST.md) for projection limitations.
+
+Correlation matching is not authentication. Inline jobs can be admitted or
+promoted by callers on the trusted broker interface, just like the legacy job
+controls. If other clients on that interface are untrusted, isolate the server
+behind an appropriate authentication boundary; do not treat a file ID or
+correlation key as a source credential. This sync does not introduce a new
+source-auth protocol or change existing producer credentials.

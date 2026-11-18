@@ -13,6 +13,8 @@ import wave
 from contextlib import nullcontext
 from . import voice_gpu
 from . import voice_cpu, voice_contour
+from . import diarization_contract as diarization
+import hashlib
 
 MAX_AUDIO_BYTES = 8 * 1024 * 1024
 # Bounded whole-source contour only (2h 24kbit/s Opus < 22 MiB).
@@ -24,6 +26,7 @@ WHISPER_LANGUAGES = frozenset('af am ar as az ba be bg bn bo br bs ca cs cy da d
 # Fixed server-owned lanes: no caller endpoints or sibling fallback.
 # Require reported model identity, not merely a configured port label.
 _HTTP_WORKERS = {
+    diarization.PROFILE: ('DIARIZATION', '', diarization.MODEL),
     'voice-gigaam-v1': ('GIGAAM', '', 'gigaam-v3-e2e-rnnt'),
     'voice-whisper-gpu-v1': ('WHISPER_GPU', '', 'whisper-medium-int8-mainpc-cuda'),
     'voice-whisper-gpu-large-v3-v1': ('WHISPER_LARGE', '', 'whisper-large-v3-mainpc-cuda'),
@@ -35,11 +38,13 @@ def validate(payload, profile, *, _contour_transport=False):
         payload = voice_contour.validate(payload)
         validate({k:payload[k] for k in ("audio_base64","filename")}, 'voice-gigaam-v1', _contour_transport=True)
         return payload
-    allowed = {"audio_base64", "filename", "response_format"} if profile == voice_cpu.PROFILE else {"audio_base64", "filename", "language"}
+    allowed = ({"audio_base64", "filename", "diarization"} if profile == diarization.PROFILE
+               else {"audio_base64", "filename", "response_format"} if profile == voice_cpu.PROFILE
+               else {"audio_base64", "filename", "language"})
     if not isinstance(payload, dict) or set(payload) - allowed:
         raise ValueError("voice payload requires only audio_base64 and filename")
     encoded, filename = payload.get("audio_base64"), payload.get("filename")
-    limit = MAX_CONTOUR_AUDIO_BYTES if _contour_transport else MAX_AUDIO_BYTES
+    limit = diarization.MAX_AUDIO_BYTES if profile == diarization.PROFILE else MAX_CONTOUR_AUDIO_BYTES if _contour_transport else MAX_AUDIO_BYTES
     if not isinstance(encoded, str) or len(encoded) > ((limit + 2) // 3) * 4:
         raise ValueError("voice audio exceeds limit or is not base64")
     try:
@@ -50,6 +55,11 @@ def validate(payload, profile, *, _contour_transport=False):
         raise ValueError(f"voice audio must be nonempty and at most {limit} bytes")
     if not isinstance(filename, str) or not filename or len(filename) > 128 or any(c not in 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-' for c in filename):
         raise ValueError("invalid filename")
+    if profile == diarization.PROFILE:
+        if (payload.get("diarization") != diarization.OPTIONS or filename != 'audio.flac'
+                or not audio.startswith(b'fLaC')):
+            raise ValueError("diarization requires pinned options and whole-input FLAC")
+        return {"audio_base64": encoded, "filename": filename, "diarization": dict(diarization.OPTIONS)}
     if profile == voice_cpu.PROFILE:
         voice_cpu.configuration()
         if payload.get("response_format") != "segments-v1" or filename != "audio.flac" or not audio.startswith(b'fLaC'):
@@ -81,6 +91,15 @@ def safe_error_summary(error):
     return 'ASR execution failed (' + type(error).__name__ + ')'
 
 
+def open_worker(profile, request, timeout):
+    if profile != diarization.PROFILE:
+        return urllib.request.urlopen(request, timeout=timeout)
+    class NoRedirect(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, req, fp, code, msg, headers, newurl):
+            return None
+    return urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect()).open(request, timeout=timeout)
+
+
 def execute(profile, payload, timeout, *, _contour_transport=False):
     validate(payload, profile, _contour_transport=_contour_transport)
     if profile==voice_contour.PROFILE:
@@ -107,6 +126,8 @@ def execute(profile, payload, timeout, *, _contour_transport=False):
             raise voice_contour.BackendRejected('worker does not support explicit language')
         query='?'+urllib.parse.urlencode({'language':payload['language']})
     guard = voice_gpu.CURRENT.get()
+    if profile == diarization.PROFILE and guard is None:
+        raise RuntimeError('diarization requires the durable queue GPU guard')
     with guard.claim(profile,timeout) if guard else nullcontext(None) as claim:
         request = urllib.request.Request(url + '/v1/transcribe' + query, data=audio, method='POST', headers={
             'Authorization': 'Bearer ' + token, 'Content-Type': 'application/octet-stream',
@@ -116,7 +137,7 @@ def execute(profile, payload, timeout, *, _contour_transport=False):
         try:
             transport_timeout=claim.remaining() if claim else timeout
             if claim:claim.upload_started=True
-            with urllib.request.urlopen(request, timeout=transport_timeout) as response:
+            with open_worker(profile, request, transport_timeout) as response:
                 raw = response.read(2 * 1024 * 1024 + 1)
                 if len(raw) > 2 * 1024 * 1024:
                     raise voice_contour.BackendRejected('voice worker response exceeds bound')
@@ -139,6 +160,8 @@ def execute(profile, payload, timeout, *, _contour_transport=False):
             finally:
                 exc.close()
             raise voice_contour.BackendRejected(code) from None
+    if profile == diarization.PROFILE:
+        return diarization.validate_result(result, hashlib.sha256(audio).hexdigest())
     if not isinstance(result, dict) or not isinstance(result.get('text'), str):
         raise voice_contour.BackendRejected('voice worker returned invalid result')
     if required_model is not None and result.get('model') != required_model:

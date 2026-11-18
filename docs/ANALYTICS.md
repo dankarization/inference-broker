@@ -3,7 +3,8 @@
 Этот слой нужен для сравнения scheduler algorithms на исторических данных. Он
 не меняет действующий выбор: без runtime policy остаётся global FIFO,
 с policy — model-aware scheduler с 60-минутными weighted time batches,
-FIFO head внутри source и non-preemptive границами batch.
+ограниченные actual-model turns внутри source, FIFO внутри совместимой model lane
+и non-preemptive границами batch. [Подробный контракт](SOURCE-MODEL-BATCHING.md).
 
 ## Что сохраняется
 
@@ -84,8 +85,9 @@ producer-storage job, весь mutation требует storage bearer token и �
 Scheduler window сохраняет actual selection count/share и mode. Для
 `time_batch` fairness нельзя выводить из числа jobs: scheduler context каждого
 `scheduler.selected` содержит `horizon_seconds`, `time_budget_seconds` и
-накопленное время lane на момент выбора. Цель — доля **execution time**,
-пропорциональная `1 / Weight` среди ready lanes. Поэтому при постоянно
+накопленное время source на момент выбора, а также `model_batch` и лимиты turn.
+Цель — доля **execution time**, пропорциональная `1 / Weight` среди ready sources;
+дополнительные модели source не создают дополнительные доли. Поэтому при постоянно
 заполненных weights `1` и `7` один 3600-секундный horizon имеет targets
 3150s и 450s; последний non-preemptive job может дать документированный
 overrun. Disabled, пустые и rate-limited sources не делают GPU idle и не
@@ -97,13 +99,15 @@ overrun. Disabled, пустые и rate-limited sources не делают GPU id
 одинаковом replay workload безопасно сравниваются:
 
 - time-batch scheduler — текущий baseline: 60-минутная обратная доля времени,
-  model affinity и FIFO внутри source;
+  bounded model affinity внутри source и FIFO внутри model lane;
 - deficit round robin — лучше учитывает разную стоимость job, если появится
   надёжная оценка cost;
 - weighted fair queue — полезен при нескольких непрерывно загруженных sources,
   но требует виртуального времени/cost.
 
-Waiting time не повышает долю source; aging/promotion в текущей policy отсутствует.
+Waiting time не повышает долю source. Ожидание конкурирующей model lane от 600s
+может раньше завершить локальный model turn, не создавая дополнительной source
+доли. Это claim-boundary trigger, не SLA и не прерывание running job.
 
 Основные критерии: p95 wait/e2e по source, throughput, success/retry/requeue,
 starvation (максимальный wait), actual-vs-expected share и смены модели. Нельзя
@@ -126,9 +130,10 @@ starvation (максимальный wait), actual-vs-expected share и смен
 идентификаторы HTML-экранируются и ограничены тремя компактными значениями.
 
 В отчёте отображается effective **weight** каждого source: это единственный
-операторский scheduling-параметр. Runtime policy использует weights для
-weighted round-robin между sources, а внутри выбранного source сохраняется
-FIFO. Unit отчёта читает `broker.env` перед `report.env`, поэтому использует
+операторский scheduling-параметр. Runtime policy выделяет sources доли
+execution time пропорционально `1 / weight`; model turns внутри source не
+создают новых долей, FIFO сохраняется внутри совместимой model lane.
+Unit отчёта читает `broker.env` перед `report.env`, поэтому использует
 тот же `BROKER_SOURCES_POLICY`, что и broker; `report.env` может переопределить
 путь, если это необходимо.
 
