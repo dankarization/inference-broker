@@ -31,11 +31,12 @@ OWNER_PREVIEW_PER_LANE = 20
 OWNER_OBSERVATION_STALE_SECONDS = 60.0
 
 
-def capture_owner_preview(candidates, gate, signature, now, selected_id):
+def capture_owner_preview(candidates, gate, signature, now, selected_id, *, db=None,
+                          public_predicate=None):
     """Capture the *filtered minimum owner tier*, not local FIFO heads."""
     preview = {"observed_at": now, "signature": signature, "rows": (),
                "state": "unavailable" if gate.value is None else "observed"}
-    counts, rows = {}, []
+    counts, public_counts, rows, public_rows = {}, {}, [], []
     for candidate in candidates:
         if candidate["source"] != "nextcloud" or candidate["id"] == selected_id:
             continue
@@ -44,15 +45,28 @@ def capture_owner_preview(candidates, gate, signature, now, selected_id):
         # hidden behind twenty older historical rows of the same raw lane.
         key = (row["profile"], row["target_model"], row["nextcloud_priority"])
         counts[key] = counts.get(key, 0) + 1
-        if counts[key] > OWNER_PREVIEW_PER_LANE:
-            continue
-        if len(rows) >= MAX_OWNER_PREVIEW_ROWS:
-            return dict(preview, state="preview_limit")  # Never rank a truncated lane set.
-        rows.append(row)
+        if counts[key] <= OWNER_PREVIEW_PER_LANE:
+            if len(rows) >= MAX_OWNER_PREVIEW_ROWS:
+                return dict(preview, state="preview_limit")  # Never rank a truncated lane set.
+            rows.append(row)
+        # Capture public evidence independently *before* per-lane truncation.
+        # Visibility is read from the same broker transaction, without adding
+        # payload/storage identities to the captured row. Candidates were
+        # already filtered by the authoritative owner gate.
+        if db is not None and public_predicate is not None:
+            if public_counts.get(key, 0) < OWNER_PREVIEW_PER_LANE and db.execute(
+                    "SELECT 1 FROM jobs WHERE id=? AND " + public_predicate,
+                    (row["id"],)).fetchone():
+                if len(public_rows) >= MAX_OWNER_PREVIEW_ROWS:
+                    return dict(preview, state="preview_limit")
+                public_rows.append(row)
+                public_counts[key] = public_counts.get(key, 0) + 1
     if rows:
         tier = gate.value["jobs"][rows[0]["external_id"]]
         preview.update(weight=7 if tier == 1 else 10)
     preview["rows"] = tuple(rows)
+    if db is not None and public_predicate is not None:
+        preview["public_rows"] = tuple(public_rows)
     return preview
 
 
@@ -68,7 +82,11 @@ def revalidate_owner_preview(db, preview, signature, now, include_private,
     if signature != preview["signature"] or now < preview["observed_at"]:
         return [], dict(info, state="policy_or_clock_changed")
     rows = []
-    for row in preview["rows"]:
+    # Older observations have no independently captured public preview.
+    # Their visible prefix is only partial; never assert tier exhaustion.
+    public_complete = "public_rows" in preview
+    captured = preview["rows"] if include_private else preview.get("public_rows", preview["rows"])
+    for row in captured:
         priority = 0 if row["nextcloud_priority"] == "new_upload" else 1
         values = (row["profile"], row["target_model"], priority, row["queued_at"], row["id"],
                   row["attempt_count"], row["external_id"], row["source_item_id"],
@@ -86,7 +104,11 @@ def revalidate_owner_preview(db, preview, signature, now, include_private,
                 " AND " + public_predicate, values).fetchone() is None:
             continue
         rows.append(dict(row))
+    if not include_private and not public_complete and preview["rows"]:
+        return [], dict(info, state="public_preview_unavailable")
     if not rows:
+        if not include_private and captured:
+            return [], dict(info, state="public_preview_changed")
         return [], dict(info, state="observed_tier_exhausted")
     if info["age_seconds"] > OWNER_OBSERVATION_STALE_SECONDS:
         info["state"] = "stale"

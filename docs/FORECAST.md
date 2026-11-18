@@ -49,9 +49,10 @@ No new table, persisted state, migration or owner-protocol change is needed.
 Optional evidence capture/publication errors cannot prevent a committed job
 from executing; the forecast is invalidated rather than repeating the claim.
 
-The preview keeps at most 20 rows per raw profile/model/local-priority class and
-512 rows in total. If the aggregate cap is exceeded, no truncated lane set is
-ranked. The observer revalidates each complete expression-index key, queued
+The preview keeps independently bounded all-job and public-job views: at most
+20 rows per raw profile/model/local-priority class and 512 rows in each view.
+Private rows cannot consume a public lane's quota. If either aggregate cap is
+exceeded, no truncated lane set is ranked. The observer revalidates each complete expression-index key, queued
 state, attempt, external/item identity and priority. Public reads also use the
 public partial index; private job identifiers, payloads, owner credentials and
 aggregate details never enter the response. New admissions are never silently
@@ -72,6 +73,10 @@ When a Nextcloud candidate exists:
   explicitly `stale`, still only a hypothetical last-read scenario, never live
   authority. Timestamps are not refreshed by completions/unrelated publications.
   No observation exists after process restart until a real gate read occurs.
+- A legacy observation without an independently captured public view is
+  `public_preview_unavailable` rather than proof of an empty eligible tier.
+- If previously captured public rows all become private, the observer reports
+  `public_preview_changed` rather than claiming that the tier is exhausted.
 - Gate failure, failed claim transaction, changed policy/clock, changed captured
   job identity or aggregate overflow prevents an owner-ranked scenario.
 - `unranked_candidates` shows up to the requested limit of current local

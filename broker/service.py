@@ -2471,7 +2471,8 @@ class Broker:
         # an otherwise valid durable claim or alter the real owner decision.
         try:
             self._pending_forecast_preview = capture_owner_preview(
-                candidates, self.nextcloud_priority, signature, self.clock(), selected_id)
+                candidates, self.nextcloud_priority, signature, self.clock(), selected_id,
+                db=self.db, public_predicate=PUBLIC_JOB_PREDICATE)
         except (KeyError, TypeError, ValueError) as error:
             self._pending_forecast_preview = {
                 "state": "capture_failed", "observed_at": self.clock(), "rows": ()}

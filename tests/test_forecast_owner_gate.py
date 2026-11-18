@@ -208,6 +208,124 @@ class OwnerGateForecastTests(unittest.TestCase):
         self.assertNotIn(secret, json.dumps(data))
         self.assertNotIn("secret-owner", json.dumps(data))
 
+    def test_private_prefix_cannot_hide_owner_eligible_public_lane(self):
+        self.prepare()
+        private = [self.nc(tier=1, private=True) for _ in range(25)]
+        visible = [self.nc(tier=1) for _ in range(6)]
+        excluded = self.nc(tier=3)
+        self.assertEqual(self.step()[0][0], private[0])
+        preview = self.b._nextcloud_forecast_preview
+        self.assertEqual(len(preview["rows"]), 20)
+        self.assertEqual([r["id"] for r in preview["public_rows"]], visible)
+        data, rows = self.projected(public=True)
+        self.assertEqual(data["owner_gate"]["state"], "observed")
+        self.assertEqual([r["job_id"] for r in rows], visible)
+        self.assertEqual(data["conditional_scenario"]["basis"], "last_owner_gate")
+        self.assertNotIn(excluded, json.dumps(rows))
+        self.assertTrue(all(job not in json.dumps(data) for job in private))
+        self.assertNotIn("secret-owner", json.dumps(data))
+
+    def test_public_preview_respects_visibility_mutation_and_owner_invalidation(self):
+        self.prepare()
+        for _ in range(22):
+            self.nc(tier=1, private=True)
+        visible = self.nc(tier=1)
+        self.nc(tier=1)
+        self.step()
+        with self.b.db:
+            self.b.db.execute("UPDATE jobs SET producer_attempt_id='new-private' WHERE id=?", (visible,))
+        data, rows = self.projected(public=True)
+        self.assertNotIn(visible, json.dumps(data))
+        self.assertEqual(len(rows), 1)
+        self.gate.fixture = None
+        self.assertFalse(self.b.dispatch_once(policy=self.p))
+        data, rows = self.projected(public=True)
+        self.assertEqual(data["owner_gate"]["state"], "unavailable")
+        self.assertEqual(rows, [])
+
+    def test_public_preview_visibility_loss_does_not_claim_tier_exhausted(self):
+        self.prepare()
+        for _ in range(22):
+            self.nc(tier=1, private=True)
+        visible = self.nc(tier=1)
+        self.nc(tier=3)
+        self.step()
+        with self.b.db:
+            self.b.db.execute("UPDATE jobs SET producer_attempt_id='new-private' WHERE id=?", (visible,))
+        data, rows = self.projected(public=True)
+        self.assertEqual(data["owner_gate"]["state"], "public_preview_changed")
+        self.assertEqual(rows, [])
+        self.assertNotIn(visible, json.dumps(data))
+
+    def test_legacy_private_only_preview_does_not_claim_tier_exhausted(self):
+        self.prepare()
+        self.nc(tier=1, private=True)
+        self.nc(tier=1, private=True)
+        visible = self.nc(tier=1)
+        self.gate.value = self.gate.fixture
+        self.b._nextcloud_forecast_preview = capture_owner_preview(
+            self.b._candidates(self.p.enabled_sources())[:2], self.gate,
+            self.b._policy_signature(self.p), self.clock(), None)
+        self.gate.value = None
+        self.b._publish_scheduler_snapshot()
+        data, rows = self.projected(public=True)
+        self.assertEqual(data["owner_gate"]["state"], "public_preview_unavailable")
+        self.assertEqual(rows, [])
+        self.assertEqual(data["unranked_candidates"][0]["job_id"], visible)
+
+    def test_public_preview_all_private_reports_no_visible_observed_rows(self):
+        self.prepare()
+        for _ in range(22):
+            self.nc(tier=1, private=True)
+        self.nc(tier=3)  # Visible, but not in the selected tier.
+        self.step()
+        data, rows = self.projected(public=True)
+        self.assertEqual(data["owner_gate"]["state"], "observed_tier_exhausted")
+        self.assertEqual(rows, [])
+
+    def test_public_preview_bounds_each_lane_even_with_private_prefix(self):
+        self.prepare()
+        for _ in range(22):
+            self.nc(tier=1, private=True)
+        visible = [self.nc(tier=1) for _ in range(25)]
+        self.step()
+        preview = self.b._nextcloud_forecast_preview
+        self.assertEqual(len(preview["public_rows"]), 20)
+        data, rows = self.projected(public=True)
+        self.assertEqual([r["job_id"] for r in rows], visible[:20])
+        self.assertEqual(data["owner_gate"]["state"], "observed")
+
+    def test_legacy_partly_visible_preview_does_not_rank_incomplete_competitors(self):
+        self.prepare()
+        private = self.nc(MODELS[0], tier=1, private=True)
+        visible = self.nc(MODELS[1], tier=1)
+        self.gate.value = self.gate.fixture
+        self.b._nextcloud_forecast_preview = capture_owner_preview(
+            self.b._candidates(self.p.enabled_sources()), self.gate,
+            self.b._policy_signature(self.p), self.clock(), None)
+        self.gate.value = None
+        self.b._publish_scheduler_snapshot()
+        data, rows = self.projected(public=True)
+        self.assertEqual(data["owner_gate"]["state"], "public_preview_unavailable")
+        self.assertEqual(rows, [])
+        self.assertNotIn(private, json.dumps(data))
+        self.assertIn(visible, json.dumps(data))
+
+    def test_public_preview_total_limit_fails_closed(self):
+        self.prepare()
+        rows = []
+        for i in range(4):
+            job = self.nc(model=MODELS[i % 3], tier=1)
+            row = dict(next(r for r in self.b._candidates() if r["id"] == job))
+            row["target_model"] = str(i)  # Synthetic distinct lanes for the bound.
+            rows.append(row)
+        self.gate.value = self.gate.fixture
+        with patch("broker.forecast.MAX_OWNER_PREVIEW_ROWS", 2):
+            preview = capture_owner_preview(rows, self.gate, (), 1000, None,
+                db=self.b.db, public_predicate="producer_attempt_id IS NULL")
+        self.assertEqual(preview["state"], "preview_limit")
+        self.assertEqual(preview["rows"], ())
+
     def test_observer_is_readonly_payload_free_and_does_not_lock_or_call_owner(self):
         self.prepare()
         self.nc()
