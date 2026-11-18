@@ -515,6 +515,28 @@ class OwnerGateForecastTests(unittest.TestCase):
         marker = self.b.db.execute("SELECT metadata_json FROM audit_events WHERE sequence=0").fetchone()[0]
         self.assertEqual(json.loads(marker), {"invalid": True})
 
+    def test_deeply_nested_tracker_never_aborts_forecast_claim_or_restart(self):
+        from broker.service import Broker
+        self.prepare()
+        first = self.nc(tier=1)
+        self.nc(tier=1)
+        self.nc(tier=1)
+        self.step()
+        with self.b.db:
+            self.b.db.execute("UPDATE audit_events SET metadata_json=? WHERE sequence=0",
+                              ("[" * 5000 + "]" * 5000,))
+        gated = Broker(self.path, self.ollama, fixtures.FakeWol(self.calls),
+                       clock=self.clock, source_policy=self.p, nextcloud_priority=self.gate)
+        self.addCleanup(gated.db.close)
+        self.assertFalse(gated._forecast_tracker_ready)
+        for public in (False, True):
+            data, rows = self.projected(public=public)
+            self.assertEqual(rows, [])
+            self.assertIn(data["owner_gate"]["state"],
+                          ("queue_changed", "public_preview_changed", "public_preview_unavailable"))
+        self.assertTrue(self.b.dispatch_once(policy=self.p))
+        self.assertEqual(self.b.status(first)["state"], "completed")
+
     def test_failed_tracker_initialization_is_nonfatal_and_fail_closed(self):
         self.prepare()
         self.nc(tier=1)

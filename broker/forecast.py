@@ -40,7 +40,13 @@ def visibility_revision(db):
                      "WHERE sequence=0 AND event_type=? AND producer_storage=1", (VISIBILITY_EVENT,)).fetchone()
     if row is None:
         return None
-    value = json.loads(row[0])
+    raw = row[0]
+    if not isinstance(raw, str) or len(raw) > 128:
+        return None
+    try:
+        value = json.loads(raw)
+    except (ValueError, TypeError, RecursionError):
+        return None
     revision = value.get("revision") if isinstance(value, dict) else None
     return revision if type(revision) is int and revision >= 0 else None
 
