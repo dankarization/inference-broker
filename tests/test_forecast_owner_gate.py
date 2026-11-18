@@ -117,6 +117,46 @@ class QueueForecastTests(unittest.TestCase):
         self.assertEqual(other.status(upload)["state"], "completed")
         self.assertEqual(other.status(peer)["state"], "queued")
 
+    def test_normal_constructor_uses_source_policy_by_default(self):
+        from broker.service import Broker
+        policy = self.policy({"nextcloud": {"weight": 7},
+                              "peer": {"weight": 1, "enabled": False}})
+        other = Broker(self.path, self.ollama, fixtures.FakeWol(self.calls),
+                       clock=self.clock, source_policy=policy)
+        self.addCleanup(other.db.close)
+        historical = self.nc()
+        upload = self.nc(priority="new_upload")
+        peer = self.submit(MODELS[0], "peer")
+        forecast = other.forecast()
+        self.assertEqual([r["job_id"] for r in forecast["next_selections"]], [upload, historical])
+        self.assertEqual(other.dashboard()["forecast"], forecast)
+        self.assertTrue(other.dispatch_once())
+        self.assertEqual(other.status(upload)["state"], "completed")
+        self.assertEqual(other.status(peer)["state"], "queued")
+
+    def test_public_forecast_does_not_adopt_private_model_turns_or_budget(self):
+        self.prepare()
+        private = self.nc(MODELS[1], private=True)
+        visible = [self.nc(MODELS[0]), self.nc(MODELS[1])]
+        before, rows = self.projected(public=True)
+        self.assertEqual([r["job_id"] for r in rows], visible)
+        self.assertEqual(self.step()[0][0], private)
+        after, rows = self.projected(public=True)
+        self.assertEqual([r["job_id"] for r in rows], visible)
+        self.assertEqual([r["model"] for r in before["next_selections"]],
+                         [r["model"] for r in after["next_selections"]])
+        self.assertIn("fresh scheduler accounting", after["contingency"])
+        full, _ = self.projected()
+        self.assertEqual(full["next_selections"][0]["job_id"], visible[1])
+
+    def test_public_projection_does_not_depend_on_global_snapshot_validity(self):
+        self.prepare()
+        visible = self.nc()
+        self.b._scheduler_snapshot = {"committed": False}
+        public, rows = self.projected(public=True)
+        self.assertEqual([row["job_id"] for row in rows], [visible])
+        self.assertTrue(self.b.forecast(self.p)["unavailable"])
+
     def test_public_forecast_ignores_private_running_for_concurrency(self):
         self.prepare()
         private = self.nc(private=True)

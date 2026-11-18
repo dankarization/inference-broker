@@ -23,8 +23,10 @@ allow compatible reuse; its presence alone does not prove global unavailability.
 
 Unauthenticated HTTP and dashboard projections exclude producer-private jobs
 and explicitly say so. They are hypothetical without those competitors, not a
-prediction of global dispatch. Separate public partial indexes prevent a deep
-private backlog from consuming the public preview. Authenticated storage users
+prediction of global dispatch. To avoid leaking private activity through shared
+model turns, source budgets or execution estimates, they simulate fresh scheduler
+accounting, not the live global accounting. Separate public partial indexes
+prevent a deep private backlog from consuming the public preview. Authenticated storage users
 may request the all-job view. Payloads and credentials are never forecast data.
 
 ## Snapshot consistency and limits
@@ -34,8 +36,8 @@ dispatcher mutex. It discovers at most 512 raw model lanes, seeks one head per
 lane and at most one indexed successor per projected selection. An incomplete
 competitor set or a database error yields unavailable, not a partial ranking.
 
-Scheduler accounting is copied only after claim/completion commit and anchored
-to the audit sequence. An older WAL snapshot paired with newer accounting, or
+The all-job scheduler accounting is copied only after claim/completion commit
+and anchored to the audit sequence. An older WAL snapshot paired with newer accounting, or
 vice versa, invalidates only forecast, not otherwise valid dashboard counters.
 Admissions alone do not invalidate accounting. Rollback restores cycle, turn,
 active-attempt and duration state; optional publication failure never repeats

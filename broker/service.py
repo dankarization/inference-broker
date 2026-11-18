@@ -306,9 +306,7 @@ class Broker:
                  min_free_space_bytes=DEFAULT_MIN_FREE_SPACE_BYTES,
                  source_policy: SourcePolicy | None = None, whisper_executor=None,
                  asr_release_on_llm_demand=False, nextcloud_priority=None):
-        # Preserve the legacy implicit-policy contract without retaining or
-        # consulting the retired external priority object.
-        self._legacy_priority_policy = nextcloud_priority is not None
+        # The retired external-priority argument is intentionally ignored.
         self.ollama, self.wol, self.clock, self.lease_seconds = ollama, wol, clock, lease_seconds
         self.whisper_executor = whisper_executor
         self._asr_ready_after = 0.0
@@ -1576,7 +1574,7 @@ class Broker:
         include_producer_storage: bool = True,
     ) -> dict[str, Any]:
         """Projection body; reads only, never writes."""
-        if policy is None and self._legacy_priority_policy:
+        if policy is None:
             policy = self.source_policy
         if policy is not None:
             policy = ForecastPolicy(policy.snapshot())
@@ -1598,9 +1596,9 @@ class Broker:
             source_priority=policy is not None,
         )
         snapshot = self._scheduler_snapshot or {}
-        if snapshot.get("committed") is False:
+        if include_producer_storage and snapshot.get("committed") is False:
             raise ForecastSnapshotChanged("scheduler transaction rolled back; projection needs a fresh committed snapshot")
-        anchor = snapshot.get("audit_sequence")
+        anchor = snapshot.get("audit_sequence") if include_producer_storage else None
         if anchor is not None:
             latest = db.execute("SELECT COALESCE(MAX(sequence),0) FROM audit_events").fetchone()[0]
             active_ids = tuple((snapshot.get("active_time_batches") or {}).keys())
@@ -1617,10 +1615,13 @@ class Broker:
                 "(event_type='scheduler.selected'" + terminal_clause + ") LIMIT 1", values).fetchone()
             if latest < anchor or changed:
                 raise ForecastSnapshotChanged("scheduler snapshot changed during observer read; retry")
-        cycle = deepcopy(snapshot.get("time_cycle"))
-        estimates = dict(snapshot.get("duration_estimates") or {})
-        active_batches = snapshot.get("active_time_batches") or {}
-        batches = deepcopy(snapshot.get("model_batches") or {})
+        # Public ranking must not reveal hidden activity through global
+        # model turns, budgets, duration estimates or active attempts.
+        # Simulate fresh accounting instead of subtracting interleaved charges.
+        cycle = deepcopy(snapshot.get("time_cycle")) if include_producer_storage else None
+        estimates = dict(snapshot.get("duration_estimates") or {}) if include_producer_storage else {}
+        active_batches = (snapshot.get("active_time_batches") or {}) if include_producer_storage else {}
+        batches = deepcopy(snapshot.get("model_batches") or {}) if include_producer_storage else {}
         projected_now = now
         # The active lease will release before any projected selection.  Its
         # true duration is unknown until completion, so forecast uses the same
@@ -1661,7 +1662,8 @@ class Broker:
                 projected_policy = policy
                 picked, cycle, decision = self._time_batch_pick(
                     remaining, projected_policy, projected_now, cycle, batches,
-                    active_batches={}, reference_cycle=snapshot.get("time_cycle") or {},
+                    active_batches={}, reference_cycle=(snapshot.get("time_cycle") or {})
+                    if include_producer_storage else {},
                 )
                 if picked is None:
                     break
@@ -1721,7 +1723,8 @@ class Broker:
                 "Projection stops at a source interval boundary; eligibility must be recomputed")
         if not include_producer_storage:
             result["contingency"] += (
-                "; public-only hypothetical excludes private jobs and cannot prove global order")
+                "; public-only hypothetical excludes private jobs and starts fresh scheduler "
+                "accounting; it cannot prove global order")
         # One canonical scenario for all sources; the legacy field is the
         # same conditional projection, never a guaranteed dispatch order.
         result["conditional_scenario"] = {
@@ -1736,6 +1739,8 @@ class Broker:
         include_producer_storage: bool = True,
     ) -> dict:
         """Payload-free live queue data for the local operational dashboard."""
+        if policy is None:
+            policy = self.source_policy
         policy_snapshot = policy.snapshot() if policy is not None else None
         source_weights = {
             name: entry.get("weight")
@@ -1788,6 +1793,8 @@ class Broker:
         include_producer_storage: bool = True,
     ) -> str:
         """Return a cheap validator without running dashboard observer queries."""
+        if policy is None:
+            policy = self.source_policy
         policy_snapshot = policy.snapshot() if policy is not None else None
         # Never queue an HTTP validator behind a long dispatcher transaction.
         # A busy writer gets an uncacheable unique revision, not a validator
@@ -2529,7 +2536,7 @@ class Broker:
         return False
 
     def dispatch_once(self, allowed_sources: frozenset[str] | None = None, policy: SourcePolicy | None = None, drain_check: bool = False) -> bool:
-        if policy is None and self._legacy_priority_policy:
+        if policy is None:
             policy = self.source_policy
         with self.lock:
             if drain_check:

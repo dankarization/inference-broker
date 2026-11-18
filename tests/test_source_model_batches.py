@@ -579,7 +579,8 @@ class SourceModelBatchTests(unittest.TestCase):
         self.assertTrue(any("jobs_model_heads_public" in s for s in statements))
         forecast = self.b.forecast(self.p, 20, include_producer_storage=False)
         self.assertEqual([r["model"] for r in forecast["next_selections"]],
-                         [MODELS[0]] * 10 + [MODELS[1]] * 10)
+                         list(MODELS[:2]) * 10)
+        self.assertIn("fresh scheduler accounting", forecast["contingency"])
         self.assertNotIn(hidden, json.dumps(forecast))
 
 
