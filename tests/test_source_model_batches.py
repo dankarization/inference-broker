@@ -208,6 +208,37 @@ class SourceModelBatchTests(unittest.TestCase):
         self.assertEqual(data["conditional_scenario"]["stop_reason"],
                          "source_schedule_recheck_required")
 
+    def test_fifo_forecast_stops_when_delayed_source_becomes_ready(self):
+        delayed = self.submit(MODELS[1], "peer")
+        first, second = self.enqueue(2, (MODELS[0],), SOURCE)
+        with self.b.db:
+            self.b.db.execute("INSERT INTO source_schedules(source,next_allowed) VALUES(?,?)",
+                              ("peer", self.clock() + 5))
+        self.b._duration_estimates[(SOURCE, MODELS[0])] = 20
+        self.b._publish_scheduler_snapshot()
+        forecast = self.b.forecast()
+        self.assertEqual([row["job_id"] for row in forecast["next_selections"]], [first])
+        self.assertEqual(forecast["conditional_scenario"]["stop_reason"],
+                         "source_schedule_recheck_required")
+        self.assertTrue(self.b.dispatch_once())
+        self.assertTrue(self.b.dispatch_once())
+        self.assertEqual(self.b.status(delayed)["state"], "completed")
+        self.assertEqual(self.b.status(second)["state"], "queued")
+
+    def test_fifo_forecast_fails_closed_with_running_job_and_delayed_source(self):
+        running = self.submit(MODELS[0], SOURCE)
+        self.submit(MODELS[1], "peer")
+        self.enqueue(2, (MODELS[0],), SOURCE)
+        with self.b.db:
+            self.b.db.execute("INSERT INTO source_schedules(source,next_allowed) VALUES(?,?)",
+                              ("peer", self.clock() + 5))
+            self.b.db.execute("UPDATE jobs SET state='running' WHERE id=?", (running,))
+        self.b._publish_scheduler_snapshot()
+        forecast = self.b.forecast()
+        self.assertEqual(forecast["next_selections"], [])
+        self.assertEqual(forecast["conditional_scenario"]["stop_reason"],
+                         "source_schedule_recheck_required")
+
     def test_forecast_refuses_truncated_raw_lanes(self):
         from unittest.mock import patch
         self.enqueue(2, MODELS)

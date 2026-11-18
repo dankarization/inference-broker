@@ -48,7 +48,10 @@ def visibility_revision(db):
     except (ValueError, TypeError, RecursionError):
         return None
     revision = value.get("revision") if isinstance(value, dict) else None
-    return revision if type(revision) is int and revision >= 0 else None
+    if (type(revision) is not int or revision < 0 or
+            raw != '{"revision":' + str(revision) + '}'):
+        return None
+    return revision
 
 
 def capture_owner_preview(candidates, gate, signature, now, selected_id, *,

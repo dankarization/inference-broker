@@ -618,6 +618,7 @@ class Broker:
                     "CASE WHEN json_type(metadata_json,'$.revision')='integer' "
                     "AND json_extract(metadata_json,'$.revision')>=0 "
                     "AND json_extract(metadata_json,'$.revision')<9223372036854775807 "
+                    "AND metadata_json=json_object('revision',json_extract(metadata_json,'$.revision')) "
                     "THEN json_object('revision',json_extract(metadata_json,'$.revision')+1) "
                     "ELSE '{\"invalid\":true}' END ELSE '{\"invalid\":true}' END "
                     "WHERE sequence=0 AND event_type='forecast.visibility_revision'; END")
@@ -1703,13 +1704,14 @@ class Broker:
         # The active lease will release before any projected selection.  Its
         # true duration is unknown until completion, so forecast uses the same
         # lane estimate it uses for all subsequent non-preemptive boundaries.
-        if policy is not None and running is not None:
+        if running is not None and active_batches:
             for active in active_batches.values():
                 lane = tuple(active["lane"])
                 elapsed = max(0.0, now - float(active["started"]))
                 duration = max(elapsed, self._forecast_duration(lane, estimates))
                 projected_now = now + duration - elapsed
-                self._record_time_usage(cycle, lane, duration, batches, projected_now)
+                if policy is not None:
+                    self._record_time_usage(cycle, lane, duration, batches, projected_now)
         remaining = [dict(row) for row in candidates]
         selections: list[dict[str, Any]] = []
         owner_tier_exhausted = False
@@ -1721,7 +1723,8 @@ class Broker:
             "SELECT MIN(s.next_allowed) FROM source_schedules s "
             "WHERE s.next_allowed>? AND EXISTS(SELECT 1 FROM jobs j "
             "WHERE j.source=s.source AND j.state='queued')", (now,)).fetchone()[0]
-        if delayed is not None and projected_now >= delayed:
+        if delayed is not None and (projected_now >= delayed or
+                (running is not None and not active_batches)):
             schedule_boundary = True
         for _ in range(bounded):
             if schedule_boundary:
@@ -1789,9 +1792,9 @@ class Broker:
                     remaining.append(dict(successor))
                     remaining.sort(key=lambda row: (
                         row["queued_at"] if row["queued_at"] is not None else row["created"], row["id"]))
+            duration = self._forecast_duration(lane, estimates)
+            projected_now += duration
             if policy is not None:
-                duration = self._forecast_duration(lane, estimates)
-                projected_now += duration
                 self._record_time_usage(cycle, lane, duration, batches, projected_now)
             if (PROFILES[picked["profile"]].min_interval_seconds
                     or (delayed is not None and projected_now >= delayed)):

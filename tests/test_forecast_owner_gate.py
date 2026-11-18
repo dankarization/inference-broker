@@ -537,6 +537,24 @@ class OwnerGateForecastTests(unittest.TestCase):
         self.assertTrue(self.b.dispatch_once(policy=self.p))
         self.assertEqual(self.b.status(first)["state"], "completed")
 
+    def test_duplicate_revision_keys_cannot_create_aba_observation(self):
+        self.prepare()
+        self.nc(tier=1, private=True)
+        earlier = self.nc(tier=1, private=True)
+        visible = self.nc(tier=1)
+        self.step()
+        revision = visibility_revision(self.b.db)
+        with self.b.db:
+            self.b.db.execute("UPDATE audit_events SET metadata_json=? WHERE sequence=0",
+                              ('{"revision":%d,"revision":%d}' % (revision-1, revision),))
+            self.b.db.execute("UPDATE jobs SET producer_attempt_id=NULL WHERE id=?", (earlier,))
+        for public in (False, True):
+            data, rows = self.projected(public=public)
+            self.assertEqual(rows, [])
+            self.assertIn(data["owner_gate"]["state"], ("queue_changed", "public_preview_changed"))
+        self.assertEqual(self.step()[0][0], earlier)
+        self.assertEqual(self.b.status(visible)["state"], "queued")
+
     def test_failed_tracker_initialization_is_nonfatal_and_fail_closed(self):
         self.prepare()
         self.nc(tier=1)
