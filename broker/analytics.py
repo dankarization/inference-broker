@@ -40,7 +40,9 @@ def audit_history(
     since: float | None = None,
     include_producer_storage: bool = True,
 ) -> list[dict[str, Any]]:
-    clauses: list[str] = []
+    # Sequence zero is reserved for an internal transactional revision, not an
+    # audit event. It must not consume the caller's result limit or be exposed.
+    clauses: list[str] = ["sequence>0"]
     values: list[Any] = []
     if job_id is not None:
         clauses.append("job_id=?")

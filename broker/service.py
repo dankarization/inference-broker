@@ -18,8 +18,8 @@ from pathlib import Path
 from typing import Any
 
 from .analytics import analytics_snapshot, attempt_history, audit_history
-from .forecast import (ForecastPolicy, ForecastSnapshotChanged, capture_owner_preview,
-                       revalidate_owner_preview)
+from .forecast import (ForecastPolicy, ForecastSnapshotChanged, VISIBILITY_EVENT,
+                       capture_owner_preview, revalidate_owner_preview, visibility_revision)
 from .dashboard import MODEL_IDENTITY_SQL, history_display, snapshot as dashboard_snapshot
 from .qwen_budget import (PROFILE as QWEN64_PROFILE, CONTRACT as QWEN64_CONTRACT,
                           snapshot as qwen64_snapshot, evidence as qwen64_evidence,
@@ -354,7 +354,7 @@ class Broker:
         self._init_db()
         with self.db:
             self.db.execute("CREATE TABLE IF NOT EXISTS queue_control (id INTEGER PRIMARY KEY CHECK(id=1), paused INTEGER NOT NULL)")
-            self.db.execute("INSERT OR IGNORE INTO queue_control VALUES(1,0)")
+            self.db.execute("INSERT OR IGNORE INTO queue_control(id,paused) VALUES(1,0)")
             self.db.execute("CREATE TABLE IF NOT EXISTS gpu_executor_fences "
                             "(resource TEXT PRIMARY KEY, request_id TEXT NOT NULL, job_id TEXT NOT NULL)")
             self.db.execute("CREATE TABLE IF NOT EXISTS asr_receipts "
@@ -366,6 +366,8 @@ class Broker:
                             "(SELECT external_id FROM job_retention_tombstones WHERE job_id=asr_receipts.job_id)) "
                             "WHERE external_id IS NULL")
             self.db.execute('CREATE UNIQUE INDEX IF NOT EXISTS asr_receipt_external_id ON asr_receipts(external_id) WHERE external_id IS NOT NULL')
+        if self._forecast_tracker_ready:
+            self._forecast_schema_version = self.db.execute("PRAGMA schema_version").fetchone()[0]
         self._gpu_fence = self.executor_fence()
         self.storage = StorageManager(
             self.db, self.database, self.lock, self.clock, self._audit,
@@ -473,6 +475,11 @@ class Broker:
                 wal_autocheckpoint_pages=self.wal_autocheckpoint_pages,
                 journal_size_limit_bytes=self.journal_size_limit_bytes,
             )
+            # Install the optional tracker in a savepoint: a damaged or
+            # incompatible marker must not block unrelated broker startup.
+            self._forecast_tracker_ready = False
+            if self.nextcloud_priority is not None:
+                self._setup_forecast_visibility()
             self.db.execute("""CREATE TABLE IF NOT EXISTS job_attempts (
                 job_id TEXT NOT NULL,
                 attempt_no INTEGER NOT NULL,
@@ -584,6 +591,51 @@ class Broker:
                 "ON jobs(source,external_id) WHERE source='nextcloud' "
                 "AND external_id IS NOT NULL"
             )
+
+    def _setup_forecast_visibility(self):
+        """Install additive, rollback-compatible generation tracking."""
+        self.db.execute("SAVEPOINT forecast_visibility_setup")
+        try:
+            self.db.execute("INSERT OR IGNORE INTO audit_events"
+                            "(sequence,occurred,event_type,metadata_json,producer_storage) "
+                            "VALUES(0,0,?,'{\"revision\":0}',1)", (VISIBILITY_EVENT,))
+            marker = self.db.execute("SELECT event_type,producer_storage FROM audit_events WHERE sequence=0").fetchone()
+            if (marker is None or marker[0] != VISIBILITY_EVENT or marker[1] != 1
+                    or visibility_revision(self.db) is None):
+                raise ValueError("forecast visibility revision slot unavailable")
+            for name, event, condition in (
+                ("insert", "INSERT", "NEW.source='nextcloud' AND NEW.state='queued'"),
+                ("delete", "DELETE", "OLD.source='nextcloud' AND OLD.state='queued'"),
+                ("update", "UPDATE OF source,state,producer_attempt_id,input_storage_mode,result_storage_mode,"
+                 "id,profile,payload,queued_at,created,attempt_count,external_id,source_item_id,nextcloud_priority",
+                 "(OLD.source='nextcloud' AND OLD.state='queued') OR "
+                 "(NEW.source='nextcloud' AND NEW.state='queued')"),
+            ):
+                sql = (f"CREATE TRIGGER forecast_visibility_{name} "
+                    f"AFTER {event} ON jobs WHEN {condition} BEGIN "
+                    "UPDATE audit_events SET metadata_json=CASE "
+                    "WHEN json_valid(metadata_json) THEN "
+                    "CASE WHEN json_type(metadata_json,'$.revision')='integer' "
+                    "AND json_extract(metadata_json,'$.revision')>=0 "
+                    "AND json_extract(metadata_json,'$.revision')<9223372036854775807 "
+                    "THEN json_object('revision',json_extract(metadata_json,'$.revision')+1) "
+                    "ELSE '{\"invalid\":true}' END ELSE '{\"invalid\":true}' END "
+                    "WHERE sequence=0 AND event_type='forecast.visibility_revision'; END")
+                key = "forecast_visibility_" + name
+                existing = self.db.execute(
+                    "SELECT sql FROM sqlite_master WHERE type='trigger' AND name=?", (key,)).fetchone()
+                if existing is None:
+                    self.db.execute(sql)
+                elif existing[0] != sql:
+                    raise ValueError("forecast visibility trigger drift")
+        except (sqlite3.Error, ValueError, TypeError):
+            self.db.execute("ROLLBACK TO forecast_visibility_setup")
+            self.db.execute("RELEASE forecast_visibility_setup")
+            self._forecast_tracker_ready = False
+        else:
+            self.db.execute("RELEASE forecast_visibility_setup")
+            self._forecast_tracker_ready = True
+            self._forecast_schema_version = self.db.execute("PRAGMA schema_version").fetchone()[0]
 
     def _retire_priority_column(self) -> None:
         """Remove a legacy priority column only when new inserts need it gone.
@@ -1564,7 +1616,7 @@ class Broker:
             lambda db: self._forecast(
                 db, policy, now, limit,
                 include_producer_storage=include_producer_storage,
-            )
+            ),
         )
         if data is None:
             return {
@@ -1627,7 +1679,8 @@ class Broker:
                 db, snapshot.get("nextcloud_forecast"),
                 self._policy_signature(policy) if policy else None,
                 now, include_producer_storage, QUEUED_MODEL_SQL, SOURCE_PRIORITY_SQL,
-                PUBLIC_JOB_PREDICATE)
+                PUBLIC_JOB_PREDICATE,
+                schema_version=getattr(self, "_forecast_schema_version", None))
             # Never call hold(), read its mutable value, or lazily fetch ungated
             # successors from the local queue in an observer transaction.
             candidates = [row for row in candidates if row["source"] != "nextcloud"]
@@ -2470,10 +2523,16 @@ class Broker:
         # Forecast evidence is optional. A malformed preview must not prevent
         # an otherwise valid durable claim or alter the real owner decision.
         try:
+            tracker_ok = (self._forecast_tracker_ready and
+                self.db.execute("PRAGMA schema_version").fetchone()[0] == self._forecast_schema_version)
+            revision = visibility_revision(self.db) if tracker_ok else None
+            if revision != self._forecast_candidates_revision:
+                revision = None
             self._pending_forecast_preview = capture_owner_preview(
                 candidates, self.nextcloud_priority, signature, self.clock(), selected_id,
-                db=self.db, public_predicate=PUBLIC_JOB_PREDICATE)
-        except (KeyError, TypeError, ValueError) as error:
+                db=self.db, public_predicate=PUBLIC_JOB_PREDICATE,
+                visibility_version=revision)
+        except (KeyError, TypeError, ValueError, sqlite3.Error) as error:
             self._pending_forecast_preview = {
                 "state": "capture_failed", "observed_at": self.clock(), "rows": ()}
             LOGGER.warning(json.dumps({"event": "forecast.owner_preview_failed",
@@ -2523,6 +2582,13 @@ class Broker:
         # turns, FIFO within each lane. Without policy global FIFO is unchanged.
         if policy is not None and allowed_sources is None:
             allowed_sources = policy.enabled_sources()
+        self._forecast_candidates_revision = None
+        if self.nextcloud_priority is not None and self._forecast_tracker_ready:
+            try:
+                if self.db.execute("PRAGMA schema_version").fetchone()[0] == self._forecast_schema_version:
+                    self._forecast_candidates_revision = visibility_revision(self.db)
+            except (sqlite3.Error, ValueError, TypeError):
+                pass
         candidates = self._candidates(allowed_sources)
         base_signature = self._policy_signature(policy) if policy else None
         if self.nextcloud_priority is not None:
@@ -2743,6 +2809,15 @@ class Broker:
                 "attempt_count=? WHERE id=?",
                 (now, lease_until, attempt_no, row["id"]),
             )
+            if self._pending_forecast_preview is not None:
+                try:
+                    captured = self._pending_forecast_preview.get("visibility_version")
+                    current = visibility_revision(self.db)
+                    expected = 1 if row["source"] == "nextcloud" else 0
+                    if captured is not None and current == captured + expected:
+                        self._pending_forecast_preview["visibility_version"] = current
+                except (sqlite3.Error, ValueError, TypeError):
+                    self._pending_forecast_preview["public_state"] = "public_preview_unavailable"
             self.db.execute(
                 "INSERT INTO job_attempts(job_id,attempt_no,source,queued_at,"
                 "selected_at,started,lease_until,scheduler_mode,selection_reason,"

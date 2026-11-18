@@ -4,6 +4,7 @@ This is not an owner gate, cache of authority, or alternate dispatch path.
 Only a successful claim transaction publishes its observation. Readers never
 contact the owner or take the dispatch mutex; every ranked row is revalidated.
 """
+import json
 import sqlite3
 
 
@@ -29,14 +30,28 @@ class ForecastPolicy:
 MAX_OWNER_PREVIEW_ROWS = 512
 OWNER_PREVIEW_PER_LANE = 20
 OWNER_OBSERVATION_STALE_SECONDS = 60.0
+MAX_PUBLIC_VISIBILITY_PROBES = 2048
+VISIBILITY_EVENT = "forecast.visibility_revision"
 
 
-def capture_owner_preview(candidates, gate, signature, now, selected_id, *, db=None,
-                          public_predicate=None):
+def visibility_revision(db):
+    """Transactional generation for queued Nextcloud membership/visibility."""
+    row = db.execute("SELECT metadata_json FROM audit_events "
+                     "WHERE sequence=0 AND event_type=? AND producer_storage=1", (VISIBILITY_EVENT,)).fetchone()
+    if row is None:
+        return None
+    value = json.loads(row[0])
+    revision = value.get("revision") if isinstance(value, dict) else None
+    return revision if type(revision) is int and revision >= 0 else None
+
+
+def capture_owner_preview(candidates, gate, signature, now, selected_id, *,
+                          db=None, public_predicate=None, visibility_version=None):
     """Capture the *filtered minimum owner tier*, not local FIFO heads."""
     preview = {"observed_at": now, "signature": signature, "rows": (),
                "state": "unavailable" if gate.value is None else "observed"}
     counts, public_counts, rows, public_rows = {}, {}, [], []
+    visibility_probes, public_complete = 0, True
     for candidate in candidates:
         if candidate["source"] != "nextcloud" or candidate["id"] == selected_id:
             continue
@@ -49,14 +64,17 @@ def capture_owner_preview(candidates, gate, signature, now, selected_id, *, db=N
             if len(rows) >= MAX_OWNER_PREVIEW_ROWS:
                 return dict(preview, state="preview_limit")  # Never rank a truncated lane set.
             rows.append(row)
-        # Capture public evidence independently *before* per-lane truncation.
-        # Visibility is read from the same broker transaction, without adding
-        # payload/storage identities to the captured row. Candidates were
-        # already filtered by the authoritative owner gate.
-        if db is not None and public_predicate is not None:
-            if public_counts.get(key, 0) < OWNER_PREVIEW_PER_LANE and db.execute(
-                    "SELECT 1 FROM jobs WHERE id=? AND " + public_predicate,
-                    (row["id"],)).fetchone():
+        # Exact primary-key probes avoid widening the dispatcher's covering
+        # scan to producer-storage fields for the entire eligible queue.
+        if db is not None and public_predicate is not None and public_complete:
+            if public_counts.get(key, 0) < OWNER_PREVIEW_PER_LANE:
+                if visibility_probes >= MAX_PUBLIC_VISIBILITY_PROBES:
+                    public_complete = False
+                    public_rows.clear()  # A partial competitor set is never ranked.
+                    continue
+                visibility_probes += 1
+                if not is_public_preview_job(db, row["id"], public_predicate):
+                    continue
                 if len(public_rows) >= MAX_OWNER_PREVIEW_ROWS:
                     return dict(preview, state="preview_limit")
                 public_rows.append(row)
@@ -65,13 +83,21 @@ def capture_owner_preview(candidates, gate, signature, now, selected_id, *, db=N
         tier = gate.value["jobs"][rows[0]["external_id"]]
         preview.update(weight=7 if tier == 1 else 10)
     preview["rows"] = tuple(rows)
-    if db is not None and public_predicate is not None:
+    preview["visibility_version"] = visibility_version
+    if db is not None and public_predicate is not None and public_complete:
         preview["public_rows"] = tuple(public_rows)
+    elif db is not None and public_predicate is not None:
+        preview["public_state"] = "public_preview_limit"
     return preview
 
 
+def is_public_preview_job(db, job_id, public_predicate):
+    return db.execute("SELECT 1 FROM jobs WHERE id=? AND " + public_predicate,
+                      (job_id,)).fetchone() is not None
+
+
 def revalidate_owner_preview(db, preview, signature, now, include_private,
-                             model_sql, priority_sql, public_predicate):
+                             model_sql, priority_sql, public_predicate, schema_version=None):
     """Exact indexed seeks; do not load payloads or silently adopt new jobs."""
     if preview is None:
         return [], {"state": "not_observed", "observed_at": None}
@@ -81,6 +107,29 @@ def revalidate_owner_preview(db, preview, signature, now, include_private,
         return [], info
     if signature != preview["signature"] or now < preview["observed_at"]:
         return [], dict(info, state="policy_or_clock_changed")
+    if not include_private and preview.get("public_state"):
+        return [], dict(info, state=preview["public_state"])
+    if include_private and "visibility_version" in preview:
+        if preview["visibility_version"] is None:
+            return [], dict(info, state="queue_changed")
+        try:
+            if (schema_version is None or
+                    db.execute("PRAGMA schema_version").fetchone()[0] != schema_version or
+                    visibility_revision(db) != preview["visibility_version"]):
+                return [], dict(info, state="queue_changed")
+        except (sqlite3.Error, ValueError, TypeError):
+            return [], dict(info, state="queue_changed")
+    if not include_private and "public_rows" in preview:
+        if preview.get("visibility_version") is None:
+            return [], dict(info, state="public_preview_unavailable")
+        try:
+            if (schema_version is None or
+                    db.execute("PRAGMA schema_version").fetchone()[0] != schema_version):
+                return [], dict(info, state="public_preview_unavailable")
+            if visibility_revision(db) != preview["visibility_version"]:
+                return [], dict(info, state="public_preview_changed")
+        except (sqlite3.Error, ValueError, TypeError):
+            return [], dict(info, state="public_preview_unavailable")
     rows = []
     # Older observations have no independently captured public preview.
     # Their visible prefix is only partial; never assert tier exhaustion.
@@ -104,7 +153,7 @@ def revalidate_owner_preview(db, preview, signature, now, include_private,
                 " AND " + public_predicate, values).fetchone() is None:
             continue
         rows.append(dict(row))
-    if not include_private and not public_complete and preview["rows"]:
+    if not include_private and not public_complete:
         return [], dict(info, state="public_preview_unavailable")
     if not rows:
         if not include_private and captured:

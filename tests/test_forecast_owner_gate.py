@@ -2,12 +2,14 @@
 from contextlib import contextmanager
 from copy import deepcopy
 import json
+import sqlite3
 import threading
+import time
 import unittest
 from unittest.mock import patch
 from urllib.request import urlopen
 
-from broker.forecast import capture_owner_preview, MAX_OWNER_PREVIEW_ROWS
+from broker.forecast import capture_owner_preview, MAX_OWNER_PREVIEW_ROWS, visibility_revision
 from broker.http import serve
 from broker.nextcloud_priority import NextcloudPriority
 import test_source_model_batches as fixtures
@@ -38,9 +40,30 @@ class OwnerGateForecastTests(unittest.TestCase):
     submit = fixtures.SourceModelBatchTests.submit
     step = fixtures.SourceModelBatchTests.step
 
+    def test_no_owner_gate_does_not_install_revision_or_change_schema(self):
+        self.assertFalse(self.b._forecast_tracker_ready)
+        self.assertIsNone(self.b.db.execute("SELECT 1 FROM audit_events WHERE sequence=0").fetchone())
+        self.assertEqual(self.b.db.execute(
+            "SELECT count(*) FROM sqlite_master WHERE type='trigger' AND name LIKE 'forecast_visibility_%'").fetchone()[0], 0)
+
+    def test_configured_gate_installs_tracker_idempotently(self):
+        from broker.service import Broker
+        policy = self.policy({"nextcloud": {"weight": 7}})
+        gated = Broker(self.path, self.ollama, fixtures.FakeWol(self.calls),
+                       clock=self.clock, source_policy=policy, nextcloud_priority=Gate())
+        self.addCleanup(gated.db.close)
+        self.assertTrue(gated._forecast_tracker_ready)
+        self.assertIsNotNone(gated.db.execute("SELECT 1 FROM audit_events WHERE sequence=0").fetchone())
+        with gated.db:
+            gated._setup_forecast_visibility()
+        self.assertTrue(gated._forecast_tracker_ready)
+
     def prepare(self):
         self.gate = Gate()
         self.b.nextcloud_priority = self.gate
+        if not self.b._forecast_tracker_ready:
+            with self.b.db:
+                self.b._setup_forecast_visibility()
         self.p = self.policy({"nextcloud": {"weight": 7}, "peer": {"weight": 20}})
 
     def nc(self, model=MODELS[0], tier=3, priority="historical", private=False):
@@ -236,7 +259,8 @@ class OwnerGateForecastTests(unittest.TestCase):
             self.b.db.execute("UPDATE jobs SET producer_attempt_id='new-private' WHERE id=?", (visible,))
         data, rows = self.projected(public=True)
         self.assertNotIn(visible, json.dumps(data))
-        self.assertEqual(len(rows), 1)
+        self.assertEqual(data["owner_gate"]["state"], "public_preview_changed")
+        self.assertEqual(rows, [])
         self.gate.fixture = None
         self.assertFalse(self.b.dispatch_once(policy=self.p))
         data, rows = self.projected(public=True)
@@ -325,6 +349,265 @@ class OwnerGateForecastTests(unittest.TestCase):
                 db=self.b.db, public_predicate="producer_attempt_id IS NULL")
         self.assertEqual(preview["state"], "preview_limit")
         self.assertEqual(preview["rows"], ())
+
+    def test_private_to_public_visibility_change_invalidates_old_observation(self):
+        self.prepare()
+        private = [self.nc(tier=1, private=True) for _ in range(22)]
+        self.nc(tier=1)
+        self.step()
+        with self.b.db:
+            self.b.db.execute("UPDATE jobs SET producer_attempt_id=NULL WHERE id=?", (private[1],))
+        data, rows = self.projected(public=True)
+        self.assertEqual(data["owner_gate"]["state"], "public_preview_changed")
+        self.assertEqual(rows, [])
+
+    def test_deep_private_prefix_is_bounded_and_never_delays_claim(self):
+        self.prepare()
+        private = [self.nc(tier=1, private=True) for _ in range(60)]
+        self.nc(tier=1)
+        with patch("broker.forecast.MAX_PUBLIC_VISIBILITY_PROBES", 10):
+            self.assertEqual(self.step()[0][0], private[0])
+        data, rows = self.projected(public=True)
+        self.assertEqual(data["owner_gate"]["state"], "public_preview_limit")
+        self.assertEqual(rows, [])
+
+    def test_visibility_probe_error_never_prevents_real_claim(self):
+        self.prepare()
+        first = self.nc(tier=1)
+        self.nc(tier=1)
+        with patch("broker.forecast.is_public_preview_job", side_effect=sqlite3.OperationalError("fixture")):
+            self.assertEqual(self.step()[0][0], first)
+        self.assertEqual(self.b.status(first)["state"], "completed")
+        data, rows = self.projected(public=True)
+        self.assertEqual(data["owner_gate"]["state"], "capture_failed")
+        self.assertEqual(rows, [])
+
+    def test_probe_budget_bounds_private_backlog_without_public_jobs(self):
+        self.prepare()
+        private = [self.nc(tier=1, private=True) for _ in range(80)]
+        self.nc(tier=3)
+        from broker.forecast import is_public_preview_job
+        started = time.monotonic()
+        with patch("broker.forecast.MAX_PUBLIC_VISIBILITY_PROBES", 10), \
+             patch("broker.forecast.is_public_preview_job", wraps=is_public_preview_job) as probe:
+            self.assertEqual(self.step()[0][0], private[0])
+        self.assertEqual(probe.call_count, 10)
+        self.assertLess(time.monotonic() - started, 2.0)
+        data, rows = self.projected(public=True)
+        self.assertEqual(data["owner_gate"]["state"], "public_preview_limit")
+        self.assertEqual(rows, [])
+        self.assertTrue(all(job not in json.dumps(data) for job in private))
+
+    def test_revision_detects_multiple_commits_without_audit_between_claim_and_finish(self):
+        self.prepare()
+        self.nc(tier=1, private=True)
+        earlier = self.nc(tier=1, private=True)
+        visible = self.nc(tier=1)
+        execute = self.b._execute
+        def mutate_then_execute(row):
+            other = sqlite3.connect(self.path)
+            try:
+                with other:
+                    other.execute("UPDATE jobs SET producer_attempt_id=NULL WHERE id=?", (earlier,))
+                with other:
+                    other.execute("UPDATE jobs SET producer_attempt_id='private' WHERE id=?", (visible,))
+            finally:
+                other.close()
+            execute(row)
+        with patch.object(self.b, "_execute", side_effect=mutate_then_execute):
+            self.step()
+        data, rows = self.projected(public=True)
+        self.assertEqual(data["owner_gate"]["state"], "public_preview_changed")
+        self.assertEqual(rows, [])
+        self.assertNotIn(visible, json.dumps(data))
+        self.assertEqual(self.step()[0][0], earlier)
+
+    def test_change_during_candidate_capture_cannot_be_adopted_as_snapshot(self):
+        self.prepare()
+        first = self.nc(tier=1)
+        private = self.nc(tier=1, private=True)
+        self.nc(tier=1)
+        candidates = self.b._candidates
+        mutated = False
+        def mutate_after_read(*args, **kwargs):
+            nonlocal mutated
+            result = candidates(*args, **kwargs)
+            if not mutated and kwargs.get("db") is None:
+                mutated = True
+                other = sqlite3.connect(self.path)
+                try:
+                    with other:
+                        other.execute("UPDATE jobs SET producer_attempt_id=NULL WHERE id=?", (private,))
+                finally:
+                    other.close()
+            return result
+        with patch.object(self.b, "_candidates", side_effect=mutate_after_read):
+            self.assertEqual(self.step()[0][0], first)
+        data, rows = self.projected(public=True)
+        self.assertEqual(data["owner_gate"]["state"], "public_preview_unavailable")
+        self.assertEqual(rows, [])
+
+    def test_old_wal_snapshot_does_not_adopt_later_preview_revision(self):
+        self.prepare()
+        self.nc(tier=1, private=True)
+        private = self.nc(tier=1, private=True)
+        visible = self.nc(tier=1)
+        self.step()
+        def old_reader(db):
+            db.execute("SELECT MAX(sequence) FROM audit_events").fetchone()
+            other = sqlite3.connect(self.path)
+            try:
+                with other:
+                    other.execute("UPDATE jobs SET producer_attempt_id=NULL WHERE id=?", (private,))
+            finally:
+                other.close()
+            return self.b._forecast(db, self.p, self.clock(), 20, include_producer_storage=False)
+        data, error = self.b._observer_read(old_reader)
+        self.assertIsNone(error)
+        self.assertEqual([r["job_id"] for r in data["conditional_scenario"]["next_selections"]], [visible])
+        current, rows = self.projected(public=True)
+        self.assertEqual(current["owner_gate"]["state"], "public_preview_changed")
+        self.assertEqual(rows, [])
+
+    def test_dropped_visibility_trigger_invalidates_forecast_without_breaking_claim(self):
+        self.prepare()
+        self.nc(tier=1)
+        self.nc(tier=1)
+        self.nc(tier=1)
+        self.step()
+        with self.b.db:
+            self.b.db.execute("DROP TRIGGER forecast_visibility_update")
+        data, rows = self.projected(public=True)
+        self.assertEqual(data["owner_gate"]["state"], "public_preview_unavailable")
+        self.assertEqual(rows, [])
+        self.assertTrue(self.b.dispatch_once(policy=self.p))
+
+    def test_promoting_uncaptured_deep_job_invalidates_both_views(self):
+        self.prepare()
+        jobs = [self.nc(tier=1) for _ in range(24)]
+        with self.b.db:
+            self.b.db.execute("UPDATE jobs SET source_item_id='item' WHERE id=?", (jobs[-1],))
+        self.step()
+        self.b.promote_nextcloud(jobs[-1], {"source": "nextcloud", "external_id": jobs[-1],
+            "source_item_id": "item", "nextcloud_priority": "new_upload"})
+        for public in (False, True):
+            data, rows = self.projected(public=public)
+            self.assertEqual(data["owner_gate"]["state"],
+                             "public_preview_changed" if public else "queue_changed")
+            self.assertEqual(rows, [])
+        self.assertEqual(self.step()[0][0], jobs[-1])
+
+    def test_malformed_tracker_never_aborts_claim_or_producer_admission(self):
+        self.prepare()
+        first = self.nc(tier=1)
+        self.nc(tier=1)
+        with self.b.db:
+            self.b.db.execute("UPDATE audit_events SET metadata_json='not-json' WHERE sequence=0")
+        self.assertEqual(self.step()[0][0], first)
+        self.assertEqual(self.b.status(first)["state"], "completed")
+        self.nc(tier=1)
+        private_data, private_rows = self.projected()
+        self.assertEqual(private_rows, [])
+        self.assertIn(private_data["owner_gate"]["state"], ("queue_changed", "capture_failed"))
+        data, rows = self.projected(public=True)
+        self.assertEqual(rows, [])
+        self.assertIn(data["owner_gate"]["state"], ("public_preview_unavailable", "capture_failed"))
+        marker = self.b.db.execute("SELECT metadata_json FROM audit_events WHERE sequence=0").fetchone()[0]
+        self.assertEqual(json.loads(marker), {"invalid": True})
+
+    def test_failed_tracker_initialization_is_nonfatal_and_fail_closed(self):
+        self.prepare()
+        self.nc(tier=1)
+        self.nc(tier=1)
+        with self.b.db:
+            self.b.db.execute("UPDATE audit_events SET event_type='occupied' WHERE sequence=0")
+        other = self.open()
+        with other.db:
+            other._setup_forecast_visibility()
+        self.assertFalse(other._forecast_tracker_ready)
+        self.b = other
+        self.b.nextcloud_priority = self.gate
+        self.assertTrue(self.b.dispatch_once(policy=self.p))
+        data, rows = self.projected(public=True)
+        self.assertEqual(data["owner_gate"]["state"], "public_preview_unavailable")
+        self.assertEqual(rows, [])
+
+    def test_noop_recover_does_not_take_writer_lock_or_change_snapshot(self):
+        self.prepare()
+        blocker = sqlite3.connect(self.path, timeout=0)
+        self.b.db.execute("PRAGMA busy_timeout=30")
+        try:
+            blocker.execute("BEGIN IMMEDIATE")
+            self.b.recover()
+            self.assertTrue(self.b._scheduler_snapshot["committed"])
+        finally:
+            blocker.rollback()
+            blocker.close()
+
+    def test_revision_is_atomic_with_queue_changes_and_survives_broker_restart(self):
+        from broker.forecast import visibility_revision
+        self.prepare()
+        job = self.nc(tier=1, private=True)
+        initial = visibility_revision(self.b.db)
+        with self.assertRaisesRegex(RuntimeError, "abort"):
+            with self.b.db:
+                self.b.db.execute("UPDATE jobs SET producer_attempt_id=NULL WHERE id=?", (job,))
+                raise RuntimeError("abort")
+        self.assertEqual(visibility_revision(self.b.db), initial)
+        with self.b.db:
+            self.b.db.execute("UPDATE jobs SET producer_attempt_id=NULL WHERE id=?", (job,))
+        self.assertEqual(visibility_revision(self.b.db), initial + 1)
+        other = self.open()
+        with other.db:
+            other._setup_forecast_visibility()
+        self.assertTrue(other._forecast_tracker_ready)
+        self.assertEqual(visibility_revision(other.db), initial + 1)
+        self.assertEqual(other.db.execute("PRAGMA integrity_check").fetchone()[0], "ok")
+
+    def test_tracker_schema_and_marker_absence_fail_closed(self):
+        self.prepare()
+        self.nc(tier=1)
+        self.nc(tier=1)
+        self.step()
+        with self.b.db:
+            self.b.db.execute("DELETE FROM audit_events WHERE sequence=0")
+        data, rows = self.projected(public=True)
+        self.assertEqual(data["owner_gate"]["state"], "public_preview_changed")
+        self.assertEqual(rows, [])
+        self.assertTrue(self.b.dispatch_once(policy=self.p))
+
+    def test_counter_before_and_after_claim_never_adopts_multiple_commits(self):
+        self.prepare()
+        first = self.nc(tier=1)
+        private = self.nc(tier=1, private=True)
+        self.nc(tier=1)
+        capture = self.b._prepare_owner_forecast
+        def mutate_after_capture(*args, **kwargs):
+            capture(*args, **kwargs)
+            other = sqlite3.connect(self.path)
+            try:
+                with other:
+                    other.execute("UPDATE jobs SET producer_attempt_id=NULL WHERE id=?", (private,))
+                with other:
+                    other.execute("UPDATE jobs SET producer_attempt_id='secret-owner' WHERE id=?", (private,))
+            finally:
+                other.close()
+        with patch.object(self.b, "_prepare_owner_forecast", side_effect=mutate_after_capture):
+            self.assertEqual(self.step()[0][0], first)
+        data, rows = self.projected(public=True)
+        self.assertEqual(data["owner_gate"]["state"], "public_preview_changed")
+        self.assertEqual(rows, [])
+
+    def test_internal_revision_never_exposes_history_or_counts(self):
+        self.prepare()
+        self.nc(tier=1, private=True)
+        self.nc(tier=1)
+        self.step()
+        self.assertTrue(self.b.db.execute("SELECT 1 FROM audit_events WHERE sequence=0").fetchone())
+        self.assertTrue(all(event["sequence"] > 0 for event in self.b.audit_events(limit=1000)))
+        self.assertTrue(all(event["sequence"] > 0 for event in self.b.audit_events(
+            limit=1000, include_producer_storage=False)))
+        self.assertNotIn("forecast.visibility_revision", json.dumps(self.b.dashboard(include_producer_storage=False)))
 
     def test_observer_is_readonly_payload_free_and_does_not_lock_or_call_owner(self):
         self.prepare()
@@ -464,14 +747,18 @@ class OwnerGateForecastTests(unittest.TestCase):
             self.b._scheduler_snapshot = current
         self.assertFalse(self.b.forecast(self.p).get("unavailable"))
 
-    def test_admission_does_not_invalidate_committed_accounting_or_adopt_new_owner_job(self):
+    def test_admission_invalidates_owner_prefix_but_preserves_committed_accounting(self):
         self.prepare()
         self.nc()
         pending = self.nc()
         self.step()
+        snapshot = deepcopy(self.b._scheduler_snapshot)
         new_job = self.nc(MODELS[1], tier=1)
         data, rows = self.projected()
-        self.assertEqual([r["job_id"] for r in rows], [pending])
+        self.assertEqual(data["owner_gate"]["state"], "queue_changed")
+        self.assertEqual(rows, [])
+        self.assertEqual(snapshot["time_cycle"], self.b._scheduler_snapshot["time_cycle"])
+        self.assertIn(pending, [r["job_id"] for r in data["unranked_candidates"]])
         self.assertNotIn(new_job, [r["job_id"] for r in rows])
         self.assertTrue(data["unranked_candidates"])
 
@@ -508,7 +795,8 @@ class OwnerGateForecastTests(unittest.TestCase):
         self.submit(MODELS[1], "peer")
         self.gate.value = self.gate.fixture
         self.b._nextcloud_forecast_preview = capture_owner_preview(
-            self.b._candidates(), self.gate, None, self.clock(), None)
+            self.b._candidates(), self.gate, None, self.clock(), None,
+            visibility_version=visibility_revision(self.b.db))
         self.gate.value = None
         self.b._publish_scheduler_snapshot()
         data = self.b.forecast()
@@ -521,7 +809,8 @@ class OwnerGateForecastTests(unittest.TestCase):
         newer = self.nc(priority="new_upload")
         self.gate.value = self.gate.fixture
         self.b._nextcloud_forecast_preview = capture_owner_preview(
-            self.b._candidates(), self.gate, None, self.clock(), None)
+            self.b._candidates(), self.gate, None, self.clock(), None,
+            visibility_version=visibility_revision(self.b.db))
         self.gate.value = None
         self.b._publish_scheduler_snapshot()
         rows = self.b.forecast()["conditional_scenario"]["next_selections"]

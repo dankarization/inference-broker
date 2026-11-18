@@ -45,18 +45,40 @@ The dispatcher now publishes a **payload-free forecast observation only after
 the claim transaction commits**. It contains the already owner-filtered minimum
 tier, effective weight (7 for primary, 10 for deferred), base-policy signature,
 read timestamp and a bounded candidate preview. It excludes the claimed job.
-No new table, persisted state, migration or owner-protocol change is needed.
+When the owner gate is configured at startup, the broker adds a private internal
+revision row in the existing `audit_events` table and three SQLite triggers;
+there is no new table, column or owner-protocol change. They transactionally
+track queued Nextcloud membership, ordering, identity and public visibility for
+all SQLite writers. The row is omitted from the new release's audit APIs. An
+old broker can start against this additive schema on code rollback; the
+triggers remain active, and its privileged audit API may expose the internal
+revision row (the public API still excludes it). Never restore an old database
+over newer work. With no owner gate configured, the tracker is not installed or
+written at startup.
 Optional evidence capture/publication errors cannot prevent a committed job
 from executing; the forecast is invalidated rather than repeating the claim.
 
 The preview keeps independently bounded all-job and public-job views: at most
 20 rows per raw profile/model/local-priority class and 512 rows in each view.
-Private rows cannot consume a public lane's quota. If either aggregate cap is
-exceeded, no truncated lane set is ranked. The observer revalidates each complete expression-index key, queued
+Private rows cannot consume a public lane's quota. At most 2048 indexed
+visibility probes occur on the claim path; a deeper private prefix yields
+`public_preview_limit` and no partial public ranking. If either aggregate cap
+is exceeded, no truncated lane set is ranked. The observer revalidates each
+complete expression-index key, queued
 state, attempt, external/item identity and priority. Public reads also use the
 public partial index; private job identifiers, payloads, owner credentials and
 aggregate details never enter the response. New admissions are never silently
 adopted into the observed tier, and successors come only from this preview.
+Public ranking additionally requires the saved visibility revision to match
+the observer's own consistent SQLite snapshot. A concurrent queue or visibility
+change gives `public_preview_changed`; a missing tracker or schema drift gives
+`public_preview_unavailable`. A successful claim advances the captured
+revision within its transaction only when the revision delta is exactly its
+own expected queued-state change. Tracker/probe failures cannot abort a claim.
+When a saved revision exists, private owner rankings also invalidate on a
+changed revision: a deep row might have been promoted ahead of the preview.
+Admissions preserve scheduler accounting, but invalidate the owner ranking
+until the next owner observation.
 
 When a Nextcloud candidate exists:
 
