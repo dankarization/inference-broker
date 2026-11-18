@@ -1640,11 +1640,13 @@ class Broker:
         # A currently delayed source can become eligible during projected
         # execution. It was excluded by _candidates; never predict past its
         # first possible arrival without rebuilding the eligible set.
-        public_delayed = "" if include_producer_storage else " AND " + PUBLIC_JOB_PREDICATE
-        delayed = db.execute(
+        # Source cooldowns do not identify the originating job's visibility.
+        # The public hypothetical must not depend on unidentifiable private work.
+        delayed = (db.execute(
             "SELECT MIN(s.next_allowed) FROM source_schedules s "
             "WHERE s.next_allowed>? AND EXISTS(SELECT 1 FROM jobs j "
-            "WHERE j.source=s.source AND j.state='queued'" + public_delayed + ")", (now,)).fetchone()[0]
+            "WHERE j.source=s.source AND j.state='queued')", (now,)).fetchone()[0]
+            if include_producer_storage else None)
         if delayed is not None and (projected_now >= delayed or
                 (running is not None and not active_batches)):
             schedule_boundary = True
@@ -1706,8 +1708,9 @@ class Broker:
         result = {
             "contingent": True,
             "contingency": (
-                "read-only time-batch projection; non-preemptive boundaries use recent "
-                "execution estimates and change as jobs are admitted, complete or policy reloads"
+                "read-only time-batch projection; non-preemptive boundaries use "
+                + ("recent execution estimates" if include_producer_storage else "default execution estimates")
+                + " and change as jobs are admitted, complete or policy reloads"
             ),
             "current_model": (running["target_model"] or PROFILES[running["profile"]].model) if running else None,
             "next_selections": selections,
@@ -1724,7 +1727,7 @@ class Broker:
         if not include_producer_storage:
             result["contingency"] += (
                 "; public-only hypothetical excludes private jobs and starts fresh scheduler "
-                "accounting; it cannot prove global order")
+                "accounting and cooldowns; it cannot prove global order")
         # One canonical scenario for all sources; the legacy field is the
         # same conditional projection, never a guaranteed dispatch order.
         result["conditional_scenario"] = {
@@ -1943,7 +1946,8 @@ class Broker:
             running = dict(connection.execute(
                 "SELECT source,count(*) FROM jobs WHERE state IN ('running','cancel_requested')" +
                 public + " GROUP BY source"))
-            schedules = dict(connection.execute("SELECT source,next_allowed FROM source_schedules"))
+            schedules = (dict(connection.execute("SELECT source,next_allowed FROM source_schedules"))
+                         if include_producer_storage else {})
             now = self.clock()
             return sorted((row for row in heads
                 if (release_running or running.get(row['source'], 0) < PROFILES[row['profile']].max_concurrency)
@@ -1972,7 +1976,8 @@ class Broker:
             running = dict(connection.execute(
                 "SELECT source,count(*) FROM jobs WHERE state IN ('running','cancel_requested')" +
                 public + " GROUP BY source"))
-            schedules = dict(connection.execute("SELECT source,next_allowed FROM source_schedules"))
+            schedules = (dict(connection.execute("SELECT source,next_allowed FROM source_schedules"))
+                         if include_producer_storage else {})
             now = self.clock()
             return sorted((row for row in heads
                 if (release_running or running.get(row['source'], 0) < PROFILES[row['profile']].max_concurrency)
@@ -2437,8 +2442,9 @@ class Broker:
         # Without policy, retain the durable global FIFO compatibility path.
         # With policy, one time budget per source, then bounded actual-model
         # turns, FIFO within each lane. Without policy global FIFO is unchanged.
-        if policy is not None and allowed_sources is None:
-            allowed_sources = policy.enabled_sources()
+        if policy is not None:
+            enabled = policy.enabled_sources()
+            allowed_sources = enabled if allowed_sources is None else enabled & allowed_sources
         candidates = self._candidates(allowed_sources)
         if not candidates:
             self._last_scheduler_decision = None
@@ -2548,8 +2554,8 @@ class Broker:
                 return False
             ready_sources = frozenset(row[0] for row in self.db.execute(
                 "SELECT DISTINCT source FROM jobs WHERE state='queued'"))
-        permitted = (allowed_sources if allowed_sources is not None else
-                     policy.enabled_sources() if policy is not None else ready_sources)
+        enabled = policy.enabled_sources() if policy is not None else ready_sources
+        permitted = enabled if allowed_sources is None else enabled & allowed_sources
         if not ready_sources.intersection(permitted):
             # No dispatch is possible. Do not poll an otherwise idle worker at
             # the scheduler tick rate; reconcile a real pending fence at most
@@ -2615,8 +2621,6 @@ class Broker:
                         # same backoff and let ready non-ASR lanes proceed.
                         LOGGER.warning("ASR wake attempt failed (%s)", type(error).__name__)
             if not asr_ready:
-                permitted = (allowed_sources if allowed_sources is not None else
-                             policy.enabled_sources() if policy is not None else queued_sources)
                 allowed_sources = permitted - {ASR_PROFILE}
         with self.lock, self._claim_transaction():
             if self.queue_paused():

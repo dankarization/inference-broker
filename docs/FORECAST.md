@@ -25,7 +25,9 @@ Unauthenticated HTTP and dashboard projections exclude producer-private jobs
 and explicitly say so. They are hypothetical without those competitors, not a
 prediction of global dispatch. To avoid leaking private activity through shared
 model turns, source budgets or execution estimates, they simulate fresh scheduler
-accounting, not the live global accounting. Separate public partial indexes
+accounting, not the live global accounting. Shared source cooldowns do not carry
+job visibility, so the public scenario also starts with no existing cooldowns;
+it still stops when a selected public job itself imposes an interval. Separate public partial indexes
 prevent a deep private backlog from consuming the public preview. Authenticated storage users
 may request the all-job view. Payloads and credentials are never forecast data.
 

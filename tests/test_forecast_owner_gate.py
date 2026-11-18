@@ -134,6 +134,67 @@ class QueueForecastTests(unittest.TestCase):
         self.assertEqual(other.status(upload)["state"], "completed")
         self.assertEqual(other.status(peer)["state"], "queued")
 
+    def test_explicit_allowlist_cannot_bypass_disabled_source(self):
+        self.prepare()
+        self.p = self.policy({"nextcloud": {"weight": 7},
+                              "peer": {"weight": 1, "enabled": False}})
+        peer = self.submit(MODELS[0], "peer")
+        allowed = frozenset({"peer"})
+        self.assertIsNone(self.b._next(allowed, self.p))
+        self.assertFalse(self.b.dispatch_once(allowed, self.p))
+        self.assertEqual(self.b.status(peer)["state"], "queued")
+        self.assertEqual(self.b.db.execute("SELECT count(*) FROM job_attempts").fetchone()[0], 0)
+        self.assertTrue(self.b.dispatch_once(allowed))  # No configured policy: legacy FIFO.
+
+    def test_allowlist_rechecks_policy_immediately_before_claim(self):
+        self.prepare()
+        peer = self.submit(MODELS[0], "peer")
+        original = self.b.reconcile_executor_fence
+        def disable_at_probe():
+            self.p.set_enabled("peer", False)
+            return original()
+        with patch.object(self.b, "reconcile_executor_fence", side_effect=disable_at_probe):
+            self.assertFalse(self.b.dispatch_once(frozenset({"peer"}), self.p))
+        self.assertEqual(self.b.status(peer)["state"], "queued")
+
+    def test_private_canary_claim_cannot_change_public_cooldown_forecast(self):
+        self.p = self.policy({"shutterstock-canary": {"weight": 7}})
+        payload = {"prompt": "synthetic", "images": ["aGVsbG8="],
+                   "format": {"type": "object"}}
+        private = self.b.submit("shutterstock-canary", "generate", payload)["id"]
+        self.clock.advance(.01)
+        public = self.b.submit("shutterstock-canary", "generate", payload)["id"]
+        with self.b.db:
+            self.b.db.execute("UPDATE jobs SET producer_attempt_id='private' WHERE id=?", (private,))
+        before = self.b.forecast(self.p, include_producer_storage=False)
+        self.assertTrue(self.b.dispatch_once(policy=self.p))
+        self.assertEqual(self.b.status(private)["state"], "completed")
+        after = self.b.forecast(self.p, include_producer_storage=False)
+        self.assertEqual([row["job_id"] for row in before["next_selections"]], [public])
+        self.assertEqual([row["job_id"] for row in after["next_selections"]], [public])
+        self.assertEqual(self.b.forecast(self.p)["next_selections"], [])
+        self.assertFalse(self.b.dispatch_once(policy=self.p))
+
+    def test_public_hypothetical_ignores_private_source_cooldown(self):
+        self.prepare()
+        private = self.nc(private=True)
+        public = self.nc()
+        for policy in (None, self.p):
+            before = self.b.forecast(policy, include_producer_storage=False)
+            with self.b.db:
+                self.b.db.execute("INSERT OR REPLACE INTO source_schedules(source,next_allowed) VALUES(?,?)",
+                                  ("nextcloud", self.clock() + 60))
+            after = self.b.forecast(policy, include_producer_storage=False)
+            self.assertEqual([r["job_id"] for r in before["next_selections"]], [public])
+            self.assertEqual([r["job_id"] for r in after["next_selections"]], [public])
+            self.assertEqual(before["conditional_scenario"], after["conditional_scenario"])
+            self.assertIn("cooldowns", after["contingency"])
+            full = self.b.forecast(policy)
+            self.assertEqual(full["next_selections"], [])
+            with self.b.db:
+                self.b.db.execute("DELETE FROM source_schedules WHERE source='nextcloud'")
+        self.assertEqual(self.b.status(private)["state"], "queued")
+
     def test_public_forecast_does_not_adopt_private_model_turns_or_budget(self):
         self.prepare()
         private = self.nc(MODELS[1], private=True)
