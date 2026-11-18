@@ -75,6 +75,9 @@ change gives `public_preview_changed`; a missing tracker or schema drift gives
 `public_preview_unavailable`. A successful claim advances the captured
 revision within its transaction only when the revision delta is exactly its
 own expected queued-state change. Tracker/probe failures cannot abort a claim.
+If the revision row is absent when a tracked queue mutation occurs, the
+trigger inserts an invalid sentinel rather than silently missing that change;
+forecast remains fail-closed until the tracker is repaired.
 When a saved revision exists, private owner rankings also invalidate on a
 changed revision: a deep row might have been promoted ahead of the preview.
 Admissions preserve scheduler accounting, but invalidate the owner ranking

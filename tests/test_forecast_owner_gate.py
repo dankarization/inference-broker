@@ -616,6 +616,28 @@ class OwnerGateForecastTests(unittest.TestCase):
         self.assertEqual(rows, [])
         self.assertTrue(self.b.dispatch_once(policy=self.p))
 
+    def test_marker_loss_mutation_and_stale_restore_cannot_forge_revision(self):
+        self.prepare()
+        self.nc(tier=1, private=True)
+        earlier = self.nc(tier=1, private=True)
+        visible = self.nc(tier=1)
+        self.step()
+        saved = self.b.db.execute("SELECT * FROM audit_events WHERE sequence=0").fetchone()
+        columns = [r[1] for r in self.b.db.execute("PRAGMA table_info(audit_events)")]
+        with self.b.db:
+            self.b.db.execute("DELETE FROM audit_events WHERE sequence=0")
+            self.b.db.execute("UPDATE jobs SET producer_attempt_id=NULL WHERE id=?", (earlier,))
+            # A normal restore attempt must not replace the invalid sentinel.
+            self.b.db.execute("INSERT OR IGNORE INTO audit_events(" + ",".join(columns) +
+                              ") VALUES(" + ",".join("?" for _ in columns) + ")", tuple(saved))
+        self.assertIsNone(visibility_revision(self.b.db))
+        for public in (False, True):
+            data, rows = self.projected(public=public)
+            self.assertEqual(rows, [])
+            self.assertIn(data["owner_gate"]["state"], ("queue_changed", "public_preview_changed"))
+        self.assertEqual(self.step()[0][0], earlier)
+        self.assertEqual(self.b.status(visible)["state"], "queued")
+
     def test_counter_before_and_after_claim_never_adopts_multiple_commits(self):
         self.prepare()
         first = self.nc(tier=1)

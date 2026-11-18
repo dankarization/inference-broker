@@ -613,6 +613,9 @@ class Broker:
             ):
                 sql = (f"CREATE TRIGGER forecast_visibility_{name} "
                     f"AFTER {event} ON jobs WHEN {condition} BEGIN "
+                    "INSERT OR IGNORE INTO audit_events"
+                    "(sequence,occurred,event_type,metadata_json,producer_storage) "
+                    "VALUES(0,0,'forecast.visibility_revision','{\"invalid\":true}',1); "
                     "UPDATE audit_events SET metadata_json=CASE "
                     "WHEN json_valid(metadata_json) THEN "
                     "CASE WHEN json_type(metadata_json,'$.revision')='integer' "
