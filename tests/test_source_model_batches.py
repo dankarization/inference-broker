@@ -436,6 +436,9 @@ class SourceModelBatchTests(unittest.TestCase):
         gate.fixture = {"jobs": {r["id"]: (1 if r["target_model"] == MODELS[1] else 3)
                                 for r in rows}, "floor": 3, "scope_complete": True}
         self.b.nextcloud_priority = gate
+        # The fixture installs the otherwise startup-configured owner gate late.
+        with self.b.db:
+            self.b._setup_forecast_visibility()
         self.p = self.policy({"nextcloud": {"weight": 3}})
         for _ in range(12):
             self.assertEqual(self.step()[0][1]["selected_model"], MODELS[1])
