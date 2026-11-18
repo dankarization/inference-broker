@@ -59,32 +59,16 @@ Producer-storage jobs retain their owner-token requirement. Legacy endpoints
 still require a trusted local network, not public exposure.
 `GET /v1/nextcloud/capabilities` describes this contract.
 
-## Optional external owner gate
+## Retired external priority contract
 
-`BROKER_NEXTCLOUD_PRIORITY_FILE` enables the restricted PostgreSQL owner gate.
-Without it there is no owner connection or `psycopg` dependency. Enabling it
-requires separately installing `psycopg`, provisioning the external
-`arch.priority_read(jsonb)` contract and supplying an owner-only regular JSON
-connection file (current UID, no group/other access, at most 4096 bytes).
-Remote connections require `sslmode=verify-full`; privileged/migration roles
-are rejected. Do not commit the connection file or credentials.
-
-The external schema identifier is `nextcloud-priority-55852-v2` (an exact
-protocol name, not a configurable job priority). The aggregate supplies the
-owner-wide tier/floor and completeness evidence; local FIFO alone cannot
-reconstruct it. The gate holds its read transaction through SQLite claim
-commit, never through inference. It fails closed for Nextcloud on owner error
-or queue-bound overflow, while leaving other eligible sources dispatchable.
-Primary/deferred eligible tiers use effective source weights 7/10, without
-rewriting the policy file. `GET /v1/nextcloud/priority` exposes enabled/contract
-state, not connection credentials or hidden owner rows.
-See [conditional forecast](FORECAST.md) for read-only projection limitations.
-
-Malformed/partial owner responses are rejected before publishing eligibility:
-all required keys, Boolean completeness, integer-or-null floor and positive
-integer job tiers must validate. The unavailable path clears authority so a
-broken owner response cannot stop otherwise eligible peer sources. This is a
-defensive code hardening, not a change to the external schema or live deployment.
+The broker queue is the sole scheduler. The former external owner-priority
+integration no longer reads a PostgreSQL aggregate, filters candidates or
+changes source weights. `BROKER_NEXTCLOUD_PRIORITY_FILE`, if left in an older
+unit environment, is ignored; remove it only through an authorized operator
+configuration change. `GET /v1/nextcloud/priority` remains available and
+returns `{"schema":"nextcloud-priority-55852-v2","enabled":false}`.
+Existing source-local new-upload promotion remains part of queue scheduling.
+See [forecast](FORECAST.md) for projection limitations.
 
 Correlation matching is not authentication. Inline jobs can be admitted or
 promoted by callers on the trusted broker interface, just like the legacy job

@@ -192,35 +192,24 @@ const durationCases = JSON.parse(
   assert.equal(id('contingency').textContent, '<contingent>');
   const conditional = await boot({...fixture, forecast: {
     current_model: 'current', next_selections: [], contingency: '<explicit uncertainty>',
-    owner_gate: {state: 'stale', age_seconds: 125.5, observed_at: stamp - 125.5},
-    conditional_scenario: {basis: 'last_owner_gate',
-      next_selections: fixture.forecast.next_selections, stop_reason: 'owner_recheck_required'},
-    dispatch_holds: ['Queue is paused', 'Executor fence exists'],
-    unranked_candidates: [{job_id: '<unknown>', source: 'nextcloud', profile: 'interactive',
-      model: '<script>model</script>', nextcloud_priority: 'historical'}]
+    conditional_scenario: {basis: 'all_eligible_sources',
+      next_selections: fixture.forecast.next_selections,
+      stop_reason: 'source_schedule_recheck_required'},
+    dispatch_holds: ['Queue is paused', 'Executor fence exists']
   }});
   assert.equal(conditional.id('forecast-live').hidden, false);
   assert.equal(conditional.id('forecast-error').hidden, true);
-  assert.match(conditional.id('forecast-basis').textContent, /not a live Nextcloud ranking/);
-  assert.match(conditional.id('forecast-basis').textContent, /stale, age 02:05/);
-  assert.match(conditional.id('forecast-basis').textContent, /owner recheck boundary/);
+  assert.match(conditional.id('forecast-basis').textContent, /all currently eligible sources/);
+  assert.match(conditional.id('forecast-basis').textContent, /source schedule boundary/);
   assert.match(conditional.id('forecast-holds').textContent, /Queue is paused/);
   assert.equal(conditional.id('forecast-holds').hidden, false);
   assert.equal(conditional.id('forecast-body').rows[0].cells[0].textContent, 'next');
-  assert.equal(conditional.id('forecast-unranked').hidden, false);
-  const unranked = conditional.id('forecast-unranked-body').rows[0];
-  assert.equal(unranked.cells[3].textContent, '<script>model</script>');
-  assert.equal(unranked.cells[3].children.length, 0);
   assert.equal(conditional.id('contingency').textContent, '<explicit uncertainty>');
 
-  const unknownOwner = await boot({...fixture, forecast: {
-    next_selections: [], owner_gate: {state: 'not_observed'},
-    conditional_scenario: {basis: 'nextcloud_excluded', next_selections: []},
-    unranked_candidates: [{job_id: 'pending', source: 'nextcloud'}]
+  const emptyForecast = await boot({...fixture, forecast: {
+    next_selections: [], conditional_scenario: {basis: 'all_eligible_sources', next_selections: []}
   }});
-  assert.match(unknownOwner.id('forecast-basis').textContent, /other sources only if Nextcloud is excluded/);
-  assert.match(unknownOwner.id('forecast-body').rows[0].cells[0].textContent, /No ranked selections/);
-  assert.equal(unknownOwner.id('forecast-unranked').hidden, false);
+  assert.match(emptyForecast.id('forecast-body').rows[0].cells[0].textContent, /No eligible selections/);
 
   const allSources = await boot({...fixture, forecast: {
     next_selections: fixture.forecast.next_selections,
@@ -273,7 +262,7 @@ const durationCases = JSON.parse(
   const box = document.querySelector('#sources-table').parentElement;
   assert.equal(box.className, 'table-scroll');
   assert.deepEqual(document.querySelectorAll('.table-scroll').map(node => node.tagName),
-    ['DIV', 'DIV', 'DIV', 'DIV', 'DIV']);
+    ['DIV', 'DIV', 'DIV', 'DIV']);
   box.scrollLeft = 640; context.scrollY = 2100; context.scrollX = 12;
   const before = page.requests.length;
   disturbScroll = () => { box.scrollLeft = 0; context.scrollY = 0; context.scrollX = 0; };

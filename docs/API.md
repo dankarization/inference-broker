@@ -268,10 +268,10 @@ curl --fail-with-body http://127.0.0.1:8088/v1/jobs/JOB_ID
 
 - [Source/model turns](SOURCE-MODEL-BATCHING.md): один reciprocal-time budget
   на source, ограниченные turns фактических моделей, non-preemptive исполнение.
-- [Forecast](FORECAST.md): при внешнем Nextcloud owner gate глобальный
-  `next_selections` не выдаёт условный сценарий за фактический порядок.
-  `conditional_scenario`, `owner_gate`, `unranked_candidates` и `dispatch_holds`
-  надо интерпретировать совместно.
+- [Forecast](FORECAST.md): `next_selections` и
+  `conditional_scenario.next_selections` — один условный прогноз брокера,
+  не гарантия порядка; `dispatch_holds` показывает наблюдаемые ограничения.
+  Публичный прогноз исключает приватные задания.
 - [Nextcloud priority](NEXTCLOUD.md): поле `nextcloud_priority` при admission,
   queued-only promotion, `GET /v1/nextcloud/capabilities` и
   `GET /v1/nextcloud/priority`. Это не глобальный caller-controlled priority.

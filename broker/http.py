@@ -595,9 +595,8 @@ def serve(broker, host="127.0.0.1", port=8088, policy=None, storage_token=None, 
                 except ValueError:
                     self._json(503, {"error": "CPU voice capability unavailable"})
             elif path == "/v1/nextcloud/priority":
-                gate = broker.nextcloud_priority
-                self._json(200, gate.contract() if gate is not None else
-                           dict(schema="nextcloud-priority-55852-v2", enabled=False))
+                # Legacy discovery endpoint; the external prioritizer is retired.
+                self._json(200, dict(schema="nextcloud-priority-55852-v2", enabled=False))
             elif path == "/healthz": self._json(200, broker.health())
             elif path == "/v1/metrics": self._json(200, broker.metrics())
             elif path == "/v1/storage/health": self._json(200, broker.storage_health())

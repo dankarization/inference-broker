@@ -40,7 +40,7 @@ or when the current lane becomes ineligible. Running jobs are never interrupted;
 these are rotation triggers, **not** per-job latency guarantees.
 At a model-turn boundary, an eligible, equal-weight source with unspent budget
 may continue the same model, reducing switches without borrowing another
-source's share or bypassing the owner gate.
+source's share or bypassing queue eligibility.
 See [source/model scheduling](docs/SOURCE-MODEL-BATCHING.md).
 
 **Pause queue** persists in SQLite, keeps admission open and stops new dispatch.
@@ -58,15 +58,11 @@ timeout or unavailable data is reported honestly, not as fabricated zeroes.
 Model columns distinguish requested, observed and profile-default identity.
 
 Forecast uses one conditional scenario for all sources, normally up to 10
-selections (maximum 20). When Nextcloud's
-external owner gate participates, a local queue snapshot cannot prove the live
-global order. The API instead labels a **conditional scenario** based on the
-last committed owner observation, or excludes Nextcloud explicitly. It stops
-when a fresh owner check is needed and lists local unranked candidates separately;
-those candidates are not guaranteed eligible. Source-interval boundaries also
-stop the scenario for a fresh eligibility check.
-Pause/fence holds and observation age remain visible; a scenario is neither a
-lease nor an ETA promise. See [forecast](docs/FORECAST.md) and
+selections (maximum 20), simulating the broker's own scheduler on a bounded
+read-only snapshot. It stops at source-interval boundaries when eligibility
+must be recomputed. The public view excludes private jobs and is a hypothetical,
+not the global order. Pause and executor-fence holds remain visible; a scenario
+is neither a lease nor an ETA promise. See [forecast](docs/FORECAST.md) and
 [dashboard](docs/DASHBOARD.md).
 
 Illustrative dashboard layout (older screenshot; labels may differ from current code):
@@ -146,9 +142,8 @@ and live control changes are separate operator actions, not effects of a Git upd
 - [OpenClaw native route](docs/OPENCLAW_ROUTE.md): opt-in queued synchronous
   chat with an Ollama-compatible final response, separate from legacy admission.
 - [Nextcloud](docs/NEXTCLOUD.md): source-local new-upload priority, queued-only
-  idempotent promotion and an optional restricted external owner gate. The gate
-  needs separately installed `psycopg` and an external PostgreSQL contract; core
-  startup without `BROKER_NEXTCLOUD_PRIORITY_FILE` does not require either.
+  idempotent promotion. The retired external priority endpoint remains a
+  disabled compatibility response; no external scheduler or PostgreSQL read is used.
 - [Native summaries](docs/syncopia-summary-native-v1.md): two opt-in, digest-pinned
   Gemma/Bolt profiles with explicit budgets and Boolean `think=false`.
   Legacy memory/daily/nightly contracts remain separate.
@@ -197,7 +192,7 @@ worker и не доказывает готовность его модели.
 друг друга на границе claim после 10 попыток, 300 секунд текущего turn либо
 600 секунд ожидания конкурента. Текущее задание не прерывается; это не SLA.
 На границе model turn другой source с тем же весом и остатком собственного
-бюджета может продолжить ту же модель, не обходя eligibility и owner gate.
+бюджета может продолжить ту же модель, не обходя eligibility очереди.
 Без policy действует глобальный FIFO.
 
 **Pause queue** сохраняется после рестарта, запрещает новые запуски, но не
@@ -206,12 +201,10 @@ worker и не доказывает готовность его модели.
 
 Dashboard показывает запрошенную и наблюдаемую модель, обновляется в фоне и
 подгружает History страницами. Forecast — единый условный сценарий всех source,
-не очередь leases:
-при участии внешнего Nextcloud owner gate отдельно показаны сценарий,
-давность наблюдения, неранжированные кандидаты и необходимость нового gate read.
-Неранжированный кандидат не считается допущенным к выполнению. На границе
-интервала source сценарий останавливается до следующей проверки eligibility.
-При паузе сценарий применим только после resume; точный ETA не обещается.
+не очередь leases. Он использует тот же scheduler и останавливается на границе
+интервала source до следующей проверки eligibility. Публичный прогноз исключает
+приватные задания и не доказывает глобальный порядок. При паузе сценарий
+применим только после resume; точный ETA не обещается.
 
 Для локального запуска используйте [admission-only пример](#local-start-admission-only),
 а для units — [systemd templates](#systemd-templates). Нужен Python 3.11+;

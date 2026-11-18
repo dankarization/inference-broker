@@ -3,7 +3,6 @@ PYTHONPATH=. python3 tests/browser_dashboard.py
 """
 import asyncio
 import base64
-from contextlib import contextmanager
 import os
 import json
 import shutil
@@ -15,7 +14,6 @@ from urllib.request import Request, urlopen
 
 import websockets
 from broker.service import Broker, SourcePolicy
-from broker.nextcloud_priority import NextcloudPriority
 from broker.http import serve
 
 class Ollama:
@@ -23,24 +21,13 @@ class Ollama:
     def is_ready(self, model): return True
     def run(self, kind, request): return {"done": True, "response": "synthetic"}
 
-class Gate(NextcloudPriority):
-    @contextmanager
-    def hold(self, db):
-        self.value = {"jobs": {f"q{i:04}": 3 for i in range(25)},
-                      "floor": 3, "scope_complete": True}
-        try:
-            yield
-        finally:
-            self.value = None
-
 async def run():
     with tempfile.TemporaryDirectory(prefix="broker-browser-") as temp:
         root = Path(temp)
         policy_file = root / "policy.json"
         policy_file.write_text(json.dumps({"sources": {"nextcloud": {"weight": 7}}}))
         policy = SourcePolicy(policy_file)
-        b = Broker(root/"test.db", Ollama(), object(), source_policy=policy,
-                   nextcloud_priority=Gate(lambda: None))
+        b = Broker(root/"test.db", Ollama(), object(), source_policy=policy)
         with b.db:
             b.db.executemany(
                 "INSERT INTO jobs(id,profile,kind,source,payload,state,created,queued_at,finished) "
@@ -86,11 +73,8 @@ async def run():
                     await asyncio.sleep(.1)
                 assert await evaluate("document.querySelectorAll('#history-body tr').length") >= 10, await evaluate("({url:location.href,ready:document.readyState,hidden:document.hidden,body:document.body.innerText})")
                 assert await evaluate("!document.querySelector('#forecast-live').hidden")
-                assert await evaluate("document.querySelector('#forecast-basis').textContent.includes('not a live Nextcloud ranking')")
+                assert await evaluate("document.querySelector('#forecast-basis').textContent.includes('all currently eligible sources')")
                 assert await evaluate("document.querySelector('#forecast-body').rows.length") == 10
-                # The one local head is already in the conditional scenario;
-                # do not duplicate it in the non-exhaustive unranked preview.
-                assert await evaluate("document.querySelector('#forecast-unranked').hidden")
                 assert await evaluate("document.querySelector('#contingency').offsetParent !== null")
                 proof = os.environ.get("BROKER_BROWSER_PROOF_DIR")
                 for width in (390, 1440):

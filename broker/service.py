@@ -18,8 +18,7 @@ from pathlib import Path
 from typing import Any
 
 from .analytics import analytics_snapshot, attempt_history, audit_history
-from .forecast import (ForecastPolicy, ForecastSnapshotChanged, VISIBILITY_EVENT,
-                       capture_owner_preview, revalidate_owner_preview, visibility_revision)
+from .forecast import ForecastPolicy, ForecastSnapshotChanged
 from .dashboard import MODEL_IDENTITY_SQL, history_display, snapshot as dashboard_snapshot
 from .qwen_budget import (PROFILE as QWEN64_PROFILE, CONTRACT as QWEN64_CONTRACT,
                           snapshot as qwen64_snapshot, evidence as qwen64_evidence,
@@ -307,9 +306,9 @@ class Broker:
                  min_free_space_bytes=DEFAULT_MIN_FREE_SPACE_BYTES,
                  source_policy: SourcePolicy | None = None, whisper_executor=None,
                  asr_release_on_llm_demand=False, nextcloud_priority=None):
-        if nextcloud_priority is not None and source_policy is None:
-            raise ValueError('Nextcloud priority requires existing source policy')
-        self.nextcloud_priority = nextcloud_priority
+        # Preserve the legacy implicit-policy contract without retaining or
+        # consulting the retired external priority object.
+        self._legacy_priority_policy = nextcloud_priority is not None
         self.ollama, self.wol, self.clock, self.lease_seconds = ollama, wol, clock, lease_seconds
         self.whisper_executor = whisper_executor
         self._asr_ready_after = 0.0
@@ -345,8 +344,6 @@ class Broker:
         self._active_time_batches: dict[str, dict[str, Any]] = {}
         # Immutable copy written under the lock for the lock-free forecast.
         self._scheduler_snapshot: dict[str, Any] | None = None
-        self._nextcloud_forecast_preview = None
-        self._pending_forecast_preview = None
         self._forecast_publication_pending = False
         self.source_policy = source_policy
         self.wal_autocheckpoint_pages = int(wal_autocheckpoint_pages)
@@ -366,8 +363,6 @@ class Broker:
                             "(SELECT external_id FROM job_retention_tombstones WHERE job_id=asr_receipts.job_id)) "
                             "WHERE external_id IS NULL")
             self.db.execute('CREATE UNIQUE INDEX IF NOT EXISTS asr_receipt_external_id ON asr_receipts(external_id) WHERE external_id IS NOT NULL')
-        if self._forecast_tracker_ready:
-            self._forecast_schema_version = self.db.execute("PRAGMA schema_version").fetchone()[0]
         self._gpu_fence = self.executor_fence()
         self.storage = StorageManager(
             self.db, self.database, self.lock, self.clock, self._audit,
@@ -475,11 +470,6 @@ class Broker:
                 wal_autocheckpoint_pages=self.wal_autocheckpoint_pages,
                 journal_size_limit_bytes=self.journal_size_limit_bytes,
             )
-            # Install the optional tracker in a savepoint: a damaged or
-            # incompatible marker must not block unrelated broker startup.
-            self._forecast_tracker_ready = False
-            if self.nextcloud_priority is not None:
-                self._setup_forecast_visibility()
             self.db.execute("""CREATE TABLE IF NOT EXISTS job_attempts (
                 job_id TEXT NOT NULL,
                 attempt_no INTEGER NOT NULL,
@@ -591,55 +581,6 @@ class Broker:
                 "ON jobs(source,external_id) WHERE source='nextcloud' "
                 "AND external_id IS NOT NULL"
             )
-
-    def _setup_forecast_visibility(self):
-        """Install additive, rollback-compatible generation tracking."""
-        self.db.execute("SAVEPOINT forecast_visibility_setup")
-        try:
-            self.db.execute("INSERT OR IGNORE INTO audit_events"
-                            "(sequence,occurred,event_type,metadata_json,producer_storage) "
-                            "VALUES(0,0,?,'{\"revision\":0}',1)", (VISIBILITY_EVENT,))
-            marker = self.db.execute("SELECT event_type,producer_storage FROM audit_events WHERE sequence=0").fetchone()
-            if (marker is None or marker[0] != VISIBILITY_EVENT or marker[1] != 1
-                    or visibility_revision(self.db) is None):
-                raise ValueError("forecast visibility revision slot unavailable")
-            for name, event, condition in (
-                ("insert", "INSERT", "NEW.source='nextcloud' AND NEW.state='queued'"),
-                ("delete", "DELETE", "OLD.source='nextcloud' AND OLD.state='queued'"),
-                ("update", "UPDATE OF source,state,producer_attempt_id,input_storage_mode,result_storage_mode,"
-                 "id,profile,payload,queued_at,created,attempt_count,external_id,source_item_id,nextcloud_priority",
-                 "(OLD.source='nextcloud' AND OLD.state='queued') OR "
-                 "(NEW.source='nextcloud' AND NEW.state='queued')"),
-            ):
-                sql = (f"CREATE TRIGGER forecast_visibility_{name} "
-                    f"AFTER {event} ON jobs WHEN {condition} BEGIN "
-                    "INSERT OR IGNORE INTO audit_events"
-                    "(sequence,occurred,event_type,metadata_json,producer_storage) "
-                    "VALUES(0,0,'forecast.visibility_revision','{\"invalid\":true}',1); "
-                    "UPDATE audit_events SET metadata_json=CASE "
-                    "WHEN json_valid(metadata_json) THEN "
-                    "CASE WHEN json_type(metadata_json,'$.revision')='integer' "
-                    "AND json_extract(metadata_json,'$.revision')>=0 "
-                    "AND json_extract(metadata_json,'$.revision')<9223372036854775807 "
-                    "AND metadata_json=json_object('revision',json_extract(metadata_json,'$.revision')) "
-                    "THEN json_object('revision',json_extract(metadata_json,'$.revision')+1) "
-                    "ELSE '{\"invalid\":true}' END ELSE '{\"invalid\":true}' END "
-                    "WHERE sequence=0 AND event_type='forecast.visibility_revision'; END")
-                key = "forecast_visibility_" + name
-                existing = self.db.execute(
-                    "SELECT sql FROM sqlite_master WHERE type='trigger' AND name=?", (key,)).fetchone()
-                if existing is None:
-                    self.db.execute(sql)
-                elif existing[0] != sql:
-                    raise ValueError("forecast visibility trigger drift")
-        except (sqlite3.Error, ValueError, TypeError):
-            self.db.execute("ROLLBACK TO forecast_visibility_setup")
-            self.db.execute("RELEASE forecast_visibility_setup")
-            self._forecast_tracker_ready = False
-        else:
-            self.db.execute("RELEASE forecast_visibility_setup")
-            self._forecast_tracker_ready = True
-            self._forecast_schema_version = self.db.execute("PRAGMA schema_version").fetchone()[0]
 
     def _retire_priority_column(self) -> None:
         """Remove a legacy priority column only when new inserts need it gone.
@@ -1635,8 +1576,8 @@ class Broker:
         include_producer_storage: bool = True,
     ) -> dict[str, Any]:
         """Projection body; reads only, never writes."""
-        if policy is None and self.nextcloud_priority is not None:
-            policy = self.source_policy  # Same default as dispatch_once.
+        if policy is None and self._legacy_priority_policy:
+            policy = self.source_policy
         if policy is not None:
             policy = ForecastPolicy(policy.snapshot())
         bounded = max(1, min(int(limit), 20))
@@ -1676,29 +1617,6 @@ class Broker:
                 "(event_type='scheduler.selected'" + terminal_clause + ") LIMIT 1", values).fetchone()
             if latest < anchor or changed:
                 raise ForecastSnapshotChanged("scheduler snapshot changed during observer read; retry")
-        local_nextcloud = [dict(row) for row in candidates if row["source"] == "nextcloud"]
-        owner_info, observed_nextcloud = None, []
-        if self.nextcloud_priority is not None and local_nextcloud:
-            observed_nextcloud, owner_info = revalidate_owner_preview(
-                db, snapshot.get("nextcloud_forecast"),
-                self._policy_signature(policy) if policy else None,
-                now, include_producer_storage, QUEUED_MODEL_SQL, SOURCE_PRIORITY_SQL,
-                PUBLIC_JOB_PREDICATE,
-                schema_version=getattr(self, "_forecast_schema_version", None))
-            # Never call hold(), read its mutable value, or lazily fetch ungated
-            # successors from the local queue in an observer transaction.
-            candidates = [row for row in candidates if row["source"] != "nextcloud"]
-            observed_nextcloud.sort(key=lambda row: (
-                0 if policy is not None and row["nextcloud_priority"] == "new_upload" else 1,
-                row["queued_at"] if row["queued_at"] is not None else row["created"], row["id"]))
-            seen = set()
-            for row in observed_nextcloud:
-                raw_lane = (row["profile"], row["target_model"])
-                if raw_lane not in seen:
-                    candidates.append(row)
-                    seen.add(raw_lane)
-            candidates.sort(key=lambda row: (
-                row["queued_at"] if row["queued_at"] is not None else row["created"], row["id"]))
         cycle = deepcopy(snapshot.get("time_cycle"))
         estimates = dict(snapshot.get("duration_estimates") or {})
         active_batches = snapshot.get("active_time_batches") or {}
@@ -1717,15 +1635,15 @@ class Broker:
                     self._record_time_usage(cycle, lane, duration, batches, projected_now)
         remaining = [dict(row) for row in candidates]
         selections: list[dict[str, Any]] = []
-        owner_tier_exhausted = False
         schedule_boundary = False
         # A currently delayed source can become eligible during projected
         # execution. It was excluded by _candidates; never predict past its
         # first possible arrival without rebuilding the eligible set.
+        public_delayed = "" if include_producer_storage else " AND " + PUBLIC_JOB_PREDICATE
         delayed = db.execute(
             "SELECT MIN(s.next_allowed) FROM source_schedules s "
             "WHERE s.next_allowed>? AND EXISTS(SELECT 1 FROM jobs j "
-            "WHERE j.source=s.source AND j.state='queued')", (now,)).fetchone()[0]
+            "WHERE j.source=s.source AND j.state='queued'" + public_delayed + ")", (now,)).fetchone()[0]
         if delayed is not None and (projected_now >= delayed or
                 (running is not None and not active_batches)):
             schedule_boundary = True
@@ -1741,9 +1659,6 @@ class Broker:
                 decision: dict[str, Any] = {}
             else:
                 projected_policy = policy
-                if owner_info and any(row["source"] == "nextcloud" for row in remaining):
-                    from .nextcloud_priority import EffectivePolicy
-                    projected_policy = EffectivePolicy(policy, owner_info["effective_weight"])
                 picked, cycle, decision = self._time_batch_pick(
                     remaining, projected_policy, projected_now, cycle, batches,
                     active_batches={}, reference_cycle=snapshot.get("time_cycle") or {},
@@ -1770,24 +1685,7 @@ class Broker:
                 selections[-1]["nextcloud_priority"] = picked["nextcloud_priority"]
             remaining = [row for row in remaining if row["id"] != picked["id"]]
             if len(selections) < bounded:
-                if owner_info and picked["source"] == "nextcloud":
-                    observed_nextcloud = [row for row in observed_nextcloud if row["id"] != picked["id"]]
-                    if policy is None:
-                        # _next uses global FIFO without a policy, not one
-                        # head per model lane. The committed preview is bounded
-                        # and already owner-filtered; never seek local successors.
-                        remaining = [row for row in remaining if row["source"] != "nextcloud"]
-                        remaining.extend(dict(row) for row in observed_nextcloud)
-                        remaining.sort(key=lambda row: (
-                            row["queued_at"] if row["queued_at"] is not None else row["created"],
-                            row["id"]))
-                        successor = None
-                    else:
-                        successor = next((row for row in observed_nextcloud
-                            if (row["profile"], row["target_model"]) ==
-                               (picked["profile"], picked["target_model"])), None)
-                    owner_tier_exhausted = not observed_nextcloud
-                elif policy is not None:
+                if policy is not None:
                     successor = self._forecast_lane_successor(db, picked, include_producer_storage)
                 else:
                     successor = None
@@ -1803,8 +1701,6 @@ class Broker:
                     or (delayed is not None and projected_now >= delayed)):
                 schedule_boundary = True
                 break  # Source eligibility must be recomputed at this boundary.
-            if owner_tier_exhausted:
-                break  # The next owner tier/weight cannot be inferred from this read.
         result = {
             "contingent": True,
             "contingency": (
@@ -1826,39 +1722,13 @@ class Broker:
         if not include_producer_storage:
             result["contingency"] += (
                 "; public-only hypothetical excludes private jobs and cannot prove global order")
-        if owner_info is not None:
-            result["next_selections"] = []  # A scenario is NOT the actual global order.
-            result["owner_gate"] = owner_info
-            result["conditional_scenario"] = {
-                "basis": "last_owner_gate" if observed_nextcloud or any(
-                    r["source"] == "nextcloud" for r in selections) else "nextcloud_excluded",
-                "next_selections": selections,
-                "stop_reason": ("owner_recheck_required" if owner_tier_exhausted else
-                                "source_schedule_recheck_required" if schedule_boundary else None),
-            }
-            ranked_ids = {r["job_id"] for r in selections}
-            result["unranked_candidates"] = [{
-                "job_id": r["id"], "source": r["source"], "profile": r["profile"],
-                "model": self._lane_key(r)[1], "nextcloud_priority": r["nextcloud_priority"],
-            } for r in local_nextcloud if r["id"] not in ranked_ids][:bounded]
-            result["contingency"] = (
-                "Conditional scenario, not the actual dispatch order. Based on the last committed "
-                "owner-gate read when available; otherwise other sources only if Nextcloud is excluded. "
-                "Owner eligibility, tier and weight must be rechecked at dispatch. Local Nextcloud "
-                "lane heads below are unranked, not a fallback order. New jobs, owner changes and "
-                "non-preemptive execution durations can change the scenario; no wall-clock ETA."
-            )
-            if not include_producer_storage:
-                result["contingency"] += (
-                    " Public-only hypothetical excludes private jobs and cannot prove global order.")
-        else:
-            # One canonical scenario for all sources.  Keep the legacy field
-            # as an identical conditional alias for existing API consumers.
-            result["conditional_scenario"] = {
-                "basis": "all_eligible_sources",
-                "next_selections": selections,
-                "stop_reason": "source_schedule_recheck_required" if schedule_boundary else None,
-            }
+        # One canonical scenario for all sources; the legacy field is the
+        # same conditional projection, never a guaranteed dispatch order.
+        result["conditional_scenario"] = {
+            "basis": "all_eligible_sources",
+            "next_selections": selections,
+            "stop_reason": "source_schedule_recheck_required" if schedule_boundary else None,
+        }
         return result
 
     def dashboard(
@@ -2064,7 +1934,8 @@ class Broker:
                         f" ORDER BY {SOURCE_PRIORITY_SQL},queued_at,id LIMIT ?",
                         (source, identity["profile"], identity["target_model"], limit_per_source)))
             running = dict(connection.execute(
-                "SELECT source,count(*) FROM jobs WHERE state IN ('running','cancel_requested') GROUP BY source"))
+                "SELECT source,count(*) FROM jobs WHERE state IN ('running','cancel_requested')" +
+                public + " GROUP BY source"))
             schedules = dict(connection.execute("SELECT source,next_allowed FROM source_schedules"))
             now = self.clock()
             return sorted((row for row in heads
@@ -2092,7 +1963,8 @@ class Broker:
                     f"FROM jobs INDEXED BY {index} WHERE state='queued' AND source=?" + public +
                     " ORDER BY " + priority + "queued_at,id LIMIT ?", (source, limit_per_source)))
             running = dict(connection.execute(
-                "SELECT source,count(*) FROM jobs WHERE state IN ('running','cancel_requested') GROUP BY source"))
+                "SELECT source,count(*) FROM jobs WHERE state IN ('running','cancel_requested')" +
+                public + " GROUP BY source"))
             schedules = dict(connection.execute("SELECT source,next_allowed FROM source_schedules"))
             now = self.clock()
             return sorted((row for row in heads
@@ -2199,8 +2071,7 @@ class Broker:
         """FIFO heads of all actual-model lanes, after source-local priority.
 
         Nextcloud's new-upload class is strict: historical lanes are invisible
-        while any eligible new upload remains. The external owner gate runs
-        before this routine on the dispatch path.
+        while any locally eligible new upload remains.
         """
         new_upload = any(row["source"] == "nextcloud"
                          and row["nextcloud_priority"] == "new_upload" for row in candidates)
@@ -2502,7 +2373,6 @@ class Broker:
                   if hasattr(self, "db") else None)
         self._scheduler_snapshot = {
             "committed": True, "audit_sequence": anchor,
-            "nextcloud_forecast": getattr(self, "_nextcloud_forecast_preview", None),
             "time_cycle": deepcopy(self._time_cycle),
             "duration_estimates": dict(self._duration_estimates),
             "model_batches": deepcopy(self._model_batches),
@@ -2525,33 +2395,13 @@ class Broker:
         )
         self._publish_scheduler_snapshot()
 
-    def _prepare_owner_forecast(self, candidates, signature, selected_id=None):
-        # Forecast evidence is optional. A malformed preview must not prevent
-        # an otherwise valid durable claim or alter the real owner decision.
-        try:
-            tracker_ok = (self._forecast_tracker_ready and
-                self.db.execute("PRAGMA schema_version").fetchone()[0] == self._forecast_schema_version)
-            revision = visibility_revision(self.db) if tracker_ok else None
-            if revision != self._forecast_candidates_revision:
-                revision = None
-            self._pending_forecast_preview = capture_owner_preview(
-                candidates, self.nextcloud_priority, signature, self.clock(), selected_id,
-                db=self.db, public_predicate=PUBLIC_JOB_PREDICATE,
-                visibility_version=revision)
-        except (KeyError, TypeError, ValueError, sqlite3.Error) as error:
-            self._pending_forecast_preview = {
-                "state": "capture_failed", "observed_at": self.clock(), "rows": ()}
-            LOGGER.warning(json.dumps({"event": "forecast.owner_preview_failed",
-                                       "error_type": type(error).__name__}, sort_keys=True))
-
     @contextmanager
     def _claim_transaction(self):
-        """Publish scheduler/owner evidence only after claim OR completion commits."""
+        """Publish scheduler evidence only after claim or completion commits."""
         previous = self._scheduler_snapshot
         rollback_state = deepcopy((self._time_cycle, self._model_batches,
             self._active_time_batches, self._duration_estimates,
             getattr(self, "_last_scheduler_decision", None)))
-        self._pending_forecast_preview = None
         self._forecast_publication_pending = True
         try:
             with self.db:
@@ -2561,14 +2411,9 @@ class Broker:
             # charges as committed, or spend a turn that never durably ran.
             (self._time_cycle, self._model_batches, self._active_time_batches,
              self._duration_estimates, self._last_scheduler_decision) = rollback_state
-            self._nextcloud_forecast_preview = {
-                "state": "transaction_failed", "observed_at": self.clock(), "rows": ()}
-            self._scheduler_snapshot = dict(previous or {}, committed=False,
-                nextcloud_forecast=self._nextcloud_forecast_preview)
+            self._scheduler_snapshot = dict(previous or {}, committed=False)
             raise
         else:
-            if self._pending_forecast_preview is not None:
-                self._nextcloud_forecast_preview = self._pending_forecast_preview
             self._forecast_publication_pending = False
             try:
                 self._publish_scheduler_snapshot()
@@ -2580,7 +2425,6 @@ class Broker:
                                            "error_type": type(error).__name__}, sort_keys=True))
         finally:
             self._forecast_publication_pending = False
-            self._pending_forecast_preview = None
 
     def _next(self, allowed_sources: frozenset[str] | None = None, policy: SourcePolicy | None = None):
         # Without policy, retain the durable global FIFO compatibility path.
@@ -2588,23 +2432,8 @@ class Broker:
         # turns, FIFO within each lane. Without policy global FIFO is unchanged.
         if policy is not None and allowed_sources is None:
             allowed_sources = policy.enabled_sources()
-        self._forecast_candidates_revision = None
-        if self.nextcloud_priority is not None and self._forecast_tracker_ready:
-            try:
-                if self.db.execute("PRAGMA schema_version").fetchone()[0] == self._forecast_schema_version:
-                    self._forecast_candidates_revision = visibility_revision(self.db)
-            except (sqlite3.Error, ValueError, TypeError):
-                pass
         candidates = self._candidates(allowed_sources)
-        base_signature = self._policy_signature(policy) if policy else None
-        if self.nextcloud_priority is not None:
-            from .nextcloud_priority import EffectivePolicy
-            candidates, weight = self.nextcloud_priority.candidates(candidates)
-            if policy is not None and weight is not None:
-                policy = EffectivePolicy(policy, weight)
         if not candidates:
-            if self.nextcloud_priority is not None:
-                self._prepare_owner_forecast([], base_signature)
             self._last_scheduler_decision = None
             self._publish_scheduler_snapshot()
             return None
@@ -2625,8 +2454,6 @@ class Broker:
                 return None
         if selected["source"] == "nextcloud":
             decision["nextcloud_priority"] = selected["nextcloud_priority"]
-        if self.nextcloud_priority is not None:
-            self._prepare_owner_forecast(candidates, base_signature, selected["id"])
         self._last_scheduler_decision = dict(decision)
         self._publish_scheduler_snapshot()
         return selected
@@ -2702,7 +2529,7 @@ class Broker:
         return False
 
     def dispatch_once(self, allowed_sources: frozenset[str] | None = None, policy: SourcePolicy | None = None, drain_check: bool = False) -> bool:
-        if self.nextcloud_priority is not None and policy is None:
+        if policy is None and self._legacy_priority_policy:
             policy = self.source_policy
         with self.lock:
             if drain_check:
@@ -2784,8 +2611,7 @@ class Broker:
                 permitted = (allowed_sources if allowed_sources is not None else
                              policy.enabled_sources() if policy is not None else queued_sources)
                 allowed_sources = permitted - {ASR_PROFILE}
-        from contextlib import nullcontext
-        with self.lock, (self.nextcloud_priority.hold(self.db) if self.nextcloud_priority is not None else nullcontext()), self._claim_transaction():
+        with self.lock, self._claim_transaction():
             if self.queue_paused():
                 return False
             if self.executor_fence() != fence:
@@ -2815,15 +2641,6 @@ class Broker:
                 "attempt_count=? WHERE id=?",
                 (now, lease_until, attempt_no, row["id"]),
             )
-            if self._pending_forecast_preview is not None:
-                try:
-                    captured = self._pending_forecast_preview.get("visibility_version")
-                    current = visibility_revision(self.db)
-                    expected = 1 if row["source"] == "nextcloud" else 0
-                    if captured is not None and current == captured + expected:
-                        self._pending_forecast_preview["visibility_version"] = current
-                except (sqlite3.Error, ValueError, TypeError):
-                    self._pending_forecast_preview["public_state"] = "public_preview_unavailable"
             self.db.execute(
                 "INSERT INTO job_attempts(job_id,attempt_no,source,queued_at,"
                 "selected_at,started,lease_until,scheduler_mode,selection_reason,"

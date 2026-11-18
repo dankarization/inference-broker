@@ -159,8 +159,8 @@ class DashboardTests(unittest.TestCase):
         self.assertLess(html.index('<h1>'), html.index('id="queue-pause"'))
         self.assertLess(html.index('id="queue-pause"'), html.index('<main'))
         # Wide tables scroll in their own box instead of stretching the page.
-        self.assertEqual(html.count('<div class="table-scroll">'), 5)
-        self.assertIn('id="forecast-unranked"', html)
+        self.assertEqual(html.count('<div class="table-scroll">'), 4)
+        self.assertNotIn('id="forecast-unranked"', html)
         self.assertIn('id="forecast-basis"', html)
         self.assertNotIn('class="note" hidden><small id="contingency"', html)
         for name in ('sources-table', 'active-table', 'forecast-table', 'history-table'):

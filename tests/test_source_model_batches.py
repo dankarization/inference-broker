@@ -1,5 +1,4 @@
 """Offline source-local model turns: real claims/attempts, fake executor only."""
-from contextlib import contextmanager
 from copy import deepcopy
 import json
 import logging
@@ -448,40 +447,6 @@ class SourceModelBatchTests(unittest.TestCase):
         self.b.retry(first[0][0])
         self.ollama.execution_seconds = 20
         self.assertNotEqual(self.step()[0][0], first[0][0])
-
-    def test_nextcloud_owner_tier_gate_precedes_model_lanes_and_forecast_is_conditional(self):
-        from broker.nextcloud_priority import NextcloudPriority
-        class Gate(NextcloudPriority):
-            @contextmanager
-            def hold(gate, db):
-                gate.value = gate.fixture
-                try:
-                    yield
-                finally:
-                    gate.value = None
-        gate = Gate(lambda: None)  # No owner DB/network access in this test.
-        self.enqueue(12)
-        rows = self.b._candidates()
-        with self.b.db:
-            self.b.db.execute("UPDATE jobs SET source='nextcloud',external_id=id")
-        gate.fixture = {"jobs": {r["id"]: (1 if r["target_model"] == MODELS[1] else 3)
-                                for r in rows}, "floor": 3, "scope_complete": True}
-        self.b.nextcloud_priority = gate
-        # The fixture installs the otherwise startup-configured owner gate late.
-        with self.b.db:
-            self.b._setup_forecast_visibility()
-        self.p = self.policy({"nextcloud": {"weight": 3}})
-        for _ in range(12):
-            self.assertEqual(self.step()[0][1]["selected_model"], MODELS[1])
-        self.assertIsNone(gate.value)
-        forecast = self.b.forecast(self.p)
-        self.assertFalse(forecast.get("unavailable"))
-        self.assertEqual(forecast["next_selections"], [])
-        self.assertEqual(forecast["owner_gate"]["state"], "observed_tier_exhausted")
-        self.assertTrue(forecast["unranked_candidates"])
-        self.assertEqual(forecast["conditional_scenario"]["basis"], "nextcloud_excluded")
-        gate.fixture = None
-        self.assertFalse(self.b.dispatch_once(policy=self.p))
 
     def test_unconfirmed_attempt_after_restart_cannot_buy_another_time_slice(self):
         self.enqueue()

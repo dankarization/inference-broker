@@ -28,10 +28,9 @@
   tighten padding/type and hide the least actionable columns (`lease`, `retry`,
   `delayed`, forecast `reason`, history `attempts`). The wide-screen layout is
   unchanged.
-- Forecast distinguishes a normal projection from a **conditional owner-gate
-  scenario**. Its basis, observation age/state, dispatch holds and uncertainties
-  are visible; local Nextcloud heads without a validated rank have a separate
-  unranked table. A missing owner observation no longer hides all useful data.
+- Forecast shows one conditional scenario produced by the broker scheduler,
+  with dispatch holds, source schedule boundaries and explicit uncertainty.
+  A public view excludes private jobs and cannot prove the global order.
   [Forecast contract and limitations](FORECAST.md).
 - The three-click table sorting cycle, source dispatch/admission controls, bulk
   confirmations and history scrolling are retained. No dispatcher, scheduler, policy

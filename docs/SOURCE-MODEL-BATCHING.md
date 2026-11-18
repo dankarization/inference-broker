@@ -7,9 +7,8 @@ budget in a recurring 3600-second horizon:
 
 Multiple actual models do not create additional source shares. Without policy,
 the scheduler uses global FIFO. Hard gates (pause, source eligibility, schedule,
-GPU custody and availability) apply before model affinity. An optional Nextcloud
-owner gate determines its authoritative eligible tier and effective weight
-before source/model selection.
+GPU custody and availability) apply before model affinity. The broker queue
+is the sole scheduling authority; source weights come from its source policy.
 
 Within each source, compatible profiles targeting the same actual model share
 a FIFO lane (`queued_at,id`). A finite FIFO of model turns prevents a third
@@ -37,7 +36,7 @@ extending source-local turns, multiplying shares or bypassing eligibility.
 Lower-weight arrivals retain their existing non-preemptive boundary behavior.
 
 These bounds do not establish a wall-clock per-job SLA: attempts are
-non-preemptive, other sources have their own shares, and gates can withhold a
+non-preemptive, other sources have their own shares, and an explicitly disabled source can withhold a
 lane indefinitely. For a fixed finite set of M continuously eligible models,
 a lane's next turn follows at most `10 * (M - 1)` claims of that source.
 
