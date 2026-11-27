@@ -1,5 +1,7 @@
 # Opt-in native-Boolean memory summaries
 
+> Idle-residency amendment: fixed TTL values below are normal defaults. With queued GPU voice, only the inference request uses a positive 30s cap; see [latency and evidence tradeoffs](VOICE-LATENCY.md).
+
 The existing syncopia-memory-qwen38 normalizer and daily/nightly contracts
 remain byte-unchanged. These two new profiles use the EXISTING source
 syncopia-telegram-memory and kind=chat, inline text only:

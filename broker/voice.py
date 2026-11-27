@@ -137,11 +137,13 @@ def execute(profile, payload, timeout, *, _contour_transport=False):
         try:
             transport_timeout=claim.remaining() if claim else timeout
             if claim:claim.upload_started=True
-            with open_worker(profile, request, transport_timeout) as response:
-                raw = response.read(2 * 1024 * 1024 + 1)
-                if len(raw) > 2 * 1024 * 1024:
-                    raise voice_contour.BackendRejected('voice worker response exceeds bound')
-                result = json.loads(raw)
+            if guard:guard.worker_calls+=1
+            with guard.span('worker_http') if guard else nullcontext():
+                with open_worker(profile, request, transport_timeout) as response:
+                    raw = response.read(2 * 1024 * 1024 + 1)
+                    if len(raw) > 2 * 1024 * 1024:
+                        raise voice_contour.BackendRejected('voice worker response exceeds bound')
+                    result = json.loads(raw)
         except urllib.error.HTTPError as exc:
             # Preserve only worker-owned enumerated diagnostics, not raw response
             # text, credentials, transcript content or arbitrary exception details.

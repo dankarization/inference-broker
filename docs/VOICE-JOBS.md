@@ -1,5 +1,7 @@
 # Sequential voice jobs (phase 1)
 
+> Idle-residency amendment: fixed TTL values below are normal defaults. With queued GPU voice, only the inference request uses a positive 30s cap; see [latency and evidence tradeoffs](VOICE-LATENCY.md).
+
 The broker admits `local-voice` at reciprocal weight 2, with the same one-slot, non-preemptive scheduler, lease, attempts, forecast and status as other jobs. Merge the `local-voice` entry from `config/sources.production.json` into the actual policy; do not replace other source settings. No caller has been switched.
 
 Profiles are server-owned: `voice-wyoming-v1`, `voice-gigaam-v1`,

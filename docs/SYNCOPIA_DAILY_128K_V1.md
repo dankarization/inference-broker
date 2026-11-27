@@ -1,5 +1,7 @@
 # Prospective full-day KP text capacity v1 (SOURCE ONLY)
 
+> Idle-residency amendment: fixed TTL values below are normal defaults. With queued GPU voice, only the inference request uses a positive 30s cap; see [latency and evidence tradeoffs](VOICE-LATENCY.md).
+
 This is separate from the frozen Astra16 comparison at65536. No inference,
 admission, rollout, source policy, scheduler, defaults or pilot runtime is changed
 by preparing this source. The existing64K profile/endpoint and queued payloads

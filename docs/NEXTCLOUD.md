@@ -1,5 +1,7 @@
 # Dedicated read-only Nextcloud media producer
 
+> Idle-residency amendment: fixed TTL values below are normal defaults. With queued GPU voice, only the inference request uses a positive 30s cap; see [latency and evidence tradeoffs](VOICE-LATENCY.md).
+
 `POST /v1/jobs` is the existing asynchronous admission API. New clients use:
 
 ```json
