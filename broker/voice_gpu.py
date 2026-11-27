@@ -6,12 +6,14 @@ A tracked worker request owns a durable existing GPU fence until release proof.
 from contextlib import contextmanager
 from contextvars import ContextVar
 import json
+import logging
 import time
 import urllib.request
 import uuid
 
 PREFIX = 'voice|'
 CURRENT = ContextVar('queued_voice_gpu', default=None)
+LOGGER = logging.getLogger('ollama_inference_broker.audit')
 
 
 def parse_fence(fence):
@@ -87,9 +89,29 @@ def reconcile(broker, fence):
 
 @contextmanager
 def queued(broker, row):
-    token=CURRENT.set(Guard(broker,row['id']))
-    try:yield
-    finally:CURRENT.reset(token)
+    guard=Guard(broker,row['id'])
+    token=CURRENT.set(guard)
+    started=time.perf_counter()
+    outcome='failed'
+    try:
+        yield
+        outcome='completed'
+    finally:
+        CURRENT.reset(token)
+        # Diagnostics must never mask an executor result or its original error.
+        try:
+            LOGGER.info(json.dumps({
+                'event':'voice.execution_timing', 'job_id':row['id'],
+                'profile':row['profile'], 'outcome':outcome,
+                'queue_wait_seconds':max(0.,row['started']-row['queued_at']),
+                'execution_seconds':round(time.perf_counter()-started,6),
+                'stages_seconds':{k:round(v,6) for k,v in guard.timings.items()},
+                'worker_calls':guard.worker_calls,
+                'fence_pending':broker.executor_fence() is not None,
+            },sort_keys=True))
+        except Exception:
+            pass
+
 
 
 class Claim:
@@ -103,13 +125,20 @@ class Claim:
 
 
 class Guard:
-    def __init__(self,broker,job_id):self.broker,self.job_id=broker,job_id
+    def __init__(self,broker,job_id):
+        self.broker,self.job_id=broker,job_id
+        self.timings={}
+        self.worker_calls=0
 
     @contextmanager
-    def claim(self,profile,timeout):
-        deadline=time.monotonic()+timeout
-        # Hold the current durable queue job while waiting for natural expiry.
-        # No unload/keep_alive request, cancellation or parallel Windows call.
+    def span(self,name):
+        started=time.perf_counter()
+        try:yield
+        finally:self.timings[name]=self.timings.get(name,0.)+time.perf_counter()-started
+
+    def wait_for_ollama(self,deadline):
+        # /api/ps cannot prove ownership. Never unload a resident model here.
+        # A prior shorter request TTL is a hint, not a GPU release proof.
         while True:
             residents=self.broker.ollama.ps(timeout_seconds=5)
             if not isinstance(residents,dict) or not isinstance(residents.get('models'),list):
@@ -118,11 +147,18 @@ class Guard:
             remaining=deadline-time.monotonic()
             if remaining<=0:raise TimeoutError('Ollama residency did not naturally release before voice deadline')
             time.sleep(min(1,remaining))
-        observed=status(profile)
-        if (observed['active_jobs']!=0 or observed['model_loaded']
-                or observed.get('gpu_release_confirmed') is not True
-                or self.broker.executor_fence() is not None):
-            raise RuntimeError('voice GPU not unambiguously idle')
+
+    @contextmanager
+    def claim(self,profile,timeout):
+        deadline=time.monotonic()+timeout
+        with self.span('ollama_residency_wait'):
+            self.wait_for_ollama(deadline)
+        with self.span('worker_preflight'):
+            observed=status(profile)
+            if (observed['active_jobs']!=0 or observed['model_loaded']
+                    or observed.get('gpu_release_confirmed') is not True
+                    or self.broker.executor_fence() is not None):
+                raise RuntimeError('voice GPU not unambiguously idle')
         request_id=str(uuid.uuid4())
         encoded=PREFIX+profile+'|'+request_id
         self.broker.set_executor_fence(encoded,self.job_id)
@@ -138,10 +174,11 @@ class Guard:
                 self.broker.clear_executor_fence(encoded)
             # HTTP response may arrive just before worker's finally clears
             # active_jobs/records last_request_id; allow that bounded race.
-            for _ in range(10 if claim.upload_started else 0):
-                if reconcile(self.broker,{'request_id':encoded,'job_id':self.job_id}):break
-                try:
-                    observed=status(profile)
-                    if observed['active_jobs']==0:break
-                except Exception:break
-                time.sleep(.1)
+            with self.span('worker_release'):
+                for _ in range(10 if claim.upload_started else 0):
+                    if reconcile(self.broker,{'request_id':encoded,'job_id':self.job_id}):break
+                    try:
+                        observed=status(profile)
+                        if observed['active_jobs']==0:break
+                    except Exception:break
+                    time.sleep(.1)

@@ -70,6 +70,32 @@ class Qwen64Tests(Worker004Tests):
             self.assertEqual(other.db.execute('SELECT count(*) FROM jobs').fetchone()[0],1)
         finally:other.db.close()
 
+    def test_qwen64_pending_voice_uses_finite_grace_and_retains_native_evidence(self):
+        from unittest.mock import patch
+        import base64
+        from broker import residency
+        self.runtime();job=self.admit64()
+        sources=json.loads(self.policy_path.read_text())
+        sources['sources']['local-voice']={'weight':2}
+        self.policy_path.write_text(json.dumps(sources))
+        self.broker.submit('voice-whisper-gpu-large-v3-v1','transcribe',
+            {'filename':'audio.ogg','audio_base64':base64.b64encode(b'synthetic').decode()},
+            source='local-voice')
+        # Execute the exact admitted row so priority order is not confused with
+        # this test of the LLM request/evidence path.
+        row=self.broker.db.execute('SELECT * FROM jobs WHERE id=?',(job['id'],)).fetchone()
+        self.broker._execute(row)
+        request=self.gpu.requests[-1][1]
+        self.assertEqual(request['keep_alive'],'30s')
+        projected=self.broker.nextcloud_projection(self.broker.status(job['id']))
+        self.assertEqual(projected['request_contract']['keep_alive'],30)
+        self.assertEqual(projected['execution_evidence']['after']['context_length'],65536)
+        self.assertEqual(C['keep_alive'],300)  # normal/default contract unchanged
+        # Receipts must remain true after a future runtime policy change.
+        with patch.object(residency,'VOICE_DEMAND_KEEP_ALIVE_SECONDS',10):
+            projected=self.broker.nextcloud_projection(self.broker.status(job['id']))
+        self.assertEqual(projected['request_contract']['keep_alive'],30)
+
     def test_qwen64_identity_or_clamped_runtime_fails_closed(self):
         for mode in ('digest','quantization','context'):
             with self.subTest(mode=mode):

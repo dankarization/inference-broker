@@ -38,6 +38,7 @@ compatible profiles. Competing model turns rotate at the next claim boundary
 after 10 attempts, 300 charged seconds, or a 600-second competitor wait,
 or when the current lane becomes ineligible. Running jobs are never interrupted;
 these are rotation triggers, **not** per-job latency guarantees.
+Pending GPU voice can shorten only a subsequent Ollama inference request's idle TTL to 30s; [residency/timing tradeoffs](docs/VOICE-LATENCY.md) apply.
 At a model-turn boundary, an eligible, equal-weight source with unspent budget
 may continue the same model, reducing switches without borrowing another
 source's share or bypassing queue eligibility.

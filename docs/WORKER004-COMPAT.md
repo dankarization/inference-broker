@@ -1,5 +1,7 @@
 # Worker004 compatibility on a07b359 (main-owned rollout only)
 
+> Idle-residency amendment: fixed TTL values below are normal defaults. With queued GPU voice, only the inference request uses a positive 30s cap; see [latency and evidence tradeoffs](VOICE-LATENCY.md).
+
 This additive adapter recovers the Qwen/projection portions of prior 7fe0d37 onto
 current a07b3594d4303c1b83b48fef3272a50c776d59c5. It does not revert isolated
 pilot evaluation, small VLM or Bolt. No policy/config/schema/service activation.

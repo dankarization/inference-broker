@@ -1,5 +1,7 @@
 # Telegram nightly text evaluation — source v1 / partial metadata v2 (prepare-only)
 
+> Idle-residency amendment: fixed TTL values below are normal defaults. With queued GPU voice, only the inference request uses a positive 30s cap; see [latency and evidence tradeoffs](VOICE-LATENCY.md).
+
 ## Ownership and immutable scope
 
 Main owns accepted real case bytes, matrix, source policy, activation, admissions,

@@ -33,6 +33,7 @@ from .compat import (CompatibilityError, UNCENSORED_EVAL_PROFILES, NEXTCLOUD_PRO
 from .profiles import EVALUATION_PROFILE_NAMES, OPENCLAW_EXECUTOR_PROFILE_NAMES, PROFILES
 from . import nightly_eval, syncopia_daily, syncopia_summary
 from .profiles import NIGHTLY_PROFILE_NAMES, VOICE_PROFILE_NAMES
+from . import residency
 from . import voice
 from .evaluation import normalize_request as normalize_evaluation_request
 from .evaluation import validate_result as validate_evaluation_result
@@ -1249,6 +1250,15 @@ class Broker:
                 "options": dict(GEMMA26_CONTRACT["options"])}
         raw = job.get("result")
         if isinstance(raw, dict):
+            policy = raw.get("_broker_residency")
+            if (isinstance(policy, dict) and policy.get("reason") == "queued_gpu_voice"
+                    and type(policy.get("effective_keep_alive_seconds")) is int
+                    and type(policy.get("configured_keep_alive_seconds")) is int
+                    and 0 < policy["effective_keep_alive_seconds"] <= policy["configured_keep_alive_seconds"]):
+                # Completed receipts report the actual TTL, not the default
+                # advertised before execution. No backend object is forwarded.
+                if "request_contract" in result:
+                    result["request_contract"]["keep_alive"] = policy["effective_keep_alive_seconds"]
             if job.get("profile") == QWEN64_PROFILE:
                 result["execution_evidence"] = project_qwen64_evidence(raw.get("_broker_execution_evidence"))
             # Scalars only: malformed nested values must never tunnel reasoning
@@ -2812,8 +2822,9 @@ class Broker:
             request.pop("native_thinking", None)
         if summary_evidence is not None:
             request.pop("summary_contract", None)
+        keep_alive, residency_policy = residency.inference_policy(self, profile)
         request.update({"model": profile.model, "stream": False, "options": options,
-                        "keep_alive": f"{profile.keep_alive_seconds}s"})
+                        "keep_alive": f"{keep_alive}s"})
         request["_broker_timeout_seconds"] = profile.request_timeout_seconds
         result = self.ollama.run(row["kind"], request)
         if not isinstance(result, dict):
@@ -2834,6 +2845,10 @@ class Broker:
         if summary_evidence is not None:
             result = dict(result, execution_evidence=syncopia_summary.execution_evidence(
                 self.ollama, row["profile"], payload, result))
+        # This receipt field is broker-owned, never backend-supplied.
+        result.pop("_broker_residency", None)
+        if residency_policy is not None:
+            result = dict(result, _broker_residency=residency_policy)
         self._finish_execution(row, result, reason)
 
     def _finish_execution(self, row, result, reason):
