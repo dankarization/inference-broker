@@ -66,7 +66,8 @@ TTL: residency wait changes **3600 -> 360 seconds**, native voice work remains
 **20 seconds**, and model loads remain twelve. This proves the mechanism, not a
 live performance result. No voice demand preserves defaults and hot reuse.
 With pending voice, an LLM reuse gap longer than 30s can cause an extra cold load
-versus the old TTL. Native GPU load/runtime impact requires an authorized live
+versus the old TTL (synthetic 31s-gap test: one load becomes two). Native GPU
+load/runtime impact requires an authorized live
 trial; no production inference or user recording replay belongs to unit tests.
 
 Ollama's documented `keep_alive` is request-scoped idle residency:

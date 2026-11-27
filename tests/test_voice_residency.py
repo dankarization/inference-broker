@@ -59,6 +59,35 @@ class ResidencyTests(unittest.TestCase):
         self.assertTrue(all(r["keep_alive"] == "180s" for r in requests))
         self.assertEqual(sum(r.get("prompt") == "" for r in requests), 1)
 
+    def test_pending_voice_can_cost_a_reload_after_a_thirty_one_second_llm_gap(self):
+        def loads(adaptive):
+            broker=self.make()
+            expires=[0.]
+            original_ps=self.ollama.ps
+            original_run=self.ollama.run
+            def ps():
+                if self.clock() >= expires[0]:
+                    self.ollama.loaded.clear()
+                return original_ps()
+            def run(kind,request):
+                result=original_run(kind,request)
+                expires[0]=self.clock()+float(request['keep_alive'].removesuffix('s'))
+                return result
+            self.ollama.ps=ps
+            self.ollama.run=run
+            for i in range(2):
+                broker.submit('interactive','generate',{'prompt':str(i)})
+                self.clock.advance(1)
+            broker.submit(PROFILE,'transcribe',AUDIO,source='local-voice')
+            policy=residency.inference_policy if adaptive else lambda b,p:(p.keep_alive_seconds,None)
+            with patch.object(residency,'inference_policy',side_effect=policy):
+                broker.dispatch_once()
+                self.clock.advance(31)
+                broker.dispatch_once()
+            return sum(isinstance(c,tuple) and c[0]=='run' and c[2].get('prompt')=='' for c in self.calls)
+        self.assertEqual(loads(False),1)
+        self.assertEqual(loads(True),2)
+
     def test_cpu_wyoming_cancelled_and_disabled_voice_do_not_change_ttl(self):
         for profile, state, enabled in (("voice-wyoming-v1", "queued", True),
                 ("voice-native-cpu-v1", "queued", True), (PROFILE, "cancelled", True),
